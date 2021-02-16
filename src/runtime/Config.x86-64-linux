@@ -58,6 +58,10 @@ ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
   USE_LIBSBCL = sbcl.o
 endif
 
+ifdef LISP_FEATURE_SB_CRYPTOLENS
+  OS_LIBS += -Wl,--whole-archive -L /usr/local/src/cryptolens-c/build/cryptolens-c/ -lcryptolens -lssl -lcrypto -lcurl -Wl,--no-whole-archive -lm
+endif
+
 # Nothing to do for after-grovel-headers.
 .PHONY: after-grovel-headers
 after-grovel-headers:

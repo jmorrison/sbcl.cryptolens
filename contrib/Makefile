@@ -42,3 +42,5 @@ sb-rotate-byte.fasl: asdf.fasl
 	sh ./build-contrib $(basename $(@F))
 sb-simple-streams.fasl: asdf.fasl sb-posix.fasl sb-bsd-sockets.fasl sb-rt.fasl
 	sh ./build-contrib $(basename $(@F))
+sb-cryptolens.fasl: asdf.fasl 
+	sh ./build-contrib $(basename $(@F))
