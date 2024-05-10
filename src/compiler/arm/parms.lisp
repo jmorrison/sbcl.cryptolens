@@ -24,15 +24,12 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 32)
@@ -40,34 +37,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 32)
-
-;;; Floating-point related constants, both format descriptions and FPU
-;;; control register descriptions.  These don't exactly match up with
-;;; what the machine manuals say because the Common Lisp standard
-;;; defines floating-point values somewhat differently than the IEEE
-;;; standard does.
-
-(defconstant float-sign-shift 31)
-
-(defconstant single-float-bias 126)
-(defconstant-eqx single-float-exponent-byte (byte 8 23) #'equalp)
-(defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-(defconstant single-float-normal-exponent-min 1)
-(defconstant single-float-normal-exponent-max 254)
-(defconstant single-float-hidden-bit (ash 1 23))
-
-(defconstant double-float-bias 1022)
-(defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
-(defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
-(defconstant double-float-normal-exponent-min 1)
-(defconstant double-float-normal-exponent-max #x7FE)
-(defconstant double-float-hidden-bit (ash 1 20))
-
-(defconstant single-float-digits
-  (+ (byte-size single-float-significand-byte) 1))
-
-(defconstant double-float-digits
-  (+ (byte-size double-float-significand-byte) n-word-bits 1))
 
 #+arm-vfp
 (progn
@@ -98,38 +67,20 @@
 
 ;;;; Where to put the different spaces.
 
-;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#-gencgc
-(progn
-  (defconstant read-only-space-start #x04000000)
-  (defconstant read-only-space-end   #x07ff8000)
-  (defconstant static-space-start    #x08000000)
-  (defconstant static-space-end      #x097fff00)
-
-  (defconstant linkage-table-space-start #x0a000000)
-  (defconstant linkage-table-space-end   #x0b000000))
-
-#+gencgc
 (progn
   #+(or linux netbsd)
-  (!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
+  (gc-space-setup #x04000000 :dynamic-space-start #x4f000000)
   #+openbsd
-  (!gencgc-space-setup #x04000000 :dynamic-space-start #x10000000))
+  (gc-space-setup #x04000000 :dynamic-space-start #x10000000))
 
-(defconstant linkage-table-growth-direction :down)
-(defconstant linkage-table-entry-size 16)
+(defconstant alien-linkage-table-growth-direction :down)
+(defconstant alien-linkage-table-entry-size 16)
 ;;; Link these as data entries so that we store only the address of the
-;;; handwritten assembly code in the linkage able, and not a trampoline
+;;; handwritten assembly code in the alien linkage table, and not a trampoline
 ;;; to the trampoline. The ALLOCATION macro just wants an address.
-(setq *linkage-space-predefined-entries* '(("alloc_tramp" t)
-                                           ("list_alloc_tramp" t)))
+(setq *alien-linkage-table-predefined-entries* '(("alloc_tramp" t)
+                                                 ("list_alloc_tramp" t)))
 
-#+(or linux netbsd openbsd)
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x4f000000)
-    (defparameter dynamic-0-space-end   #x66fff000)))
 
 ;;;; other miscellaneous constants
 
@@ -155,8 +106,6 @@
 ;;;
 (defconstant-eqx +static-symbols+
  `#(,@+common-static-symbols+
-    *allocation-pointer*
-
      *control-stack-pointer*
      *binding-stack-pointer*
      *interrupted-control-stack-pointer*
@@ -166,15 +115,7 @@
      *pseudo-atomic-interrupted*)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-  #(two-arg-gcd two-arg-lcm
-    two-arg-+ two-arg-- two-arg-* two-arg-/
-    two-arg-< two-arg-> two-arg-=
-    two-arg-and two-arg-ior two-arg-xor two-arg-eqv
-
-    eql
-    sb-kernel:%negate)
-  #'equalp)
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 
 ;;;; Assembler parameters:
@@ -182,5 +123,3 @@
 ;;; The number of bits per element in the assemblers code vector.
 ;;;
 (defparameter *assembly-unit-length* 8)
-
-(defvar *allocation-pointer*)

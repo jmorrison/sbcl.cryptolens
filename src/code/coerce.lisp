@@ -59,18 +59,11 @@
 (declaim (inline coerce-to-list))
 (declaim (inline coerce-to-vector))
 
-(defun coerce-symbol-to-fun (symbol)
-  ;; FIXME? I would think to use SYMBOL-FUNCTION here which does not strip off
-  ;; encapsulations. But Stas wrote FDEFINITION so ...
-  ;; [Also note, we won't encapsulate a macro or special-form, so this
-  ;; introspective technique to decide what kind something is works either way]
-  (let ((def (fdefinition symbol)))
-    (if (macro/special-guard-fun-p def)
-        (error (ecase (car (%fun-name def))
-                (:macro "~S names a macro.")
-                (:special "~S names a special operator."))
-               symbol)
-        def)))
+(defun coerce-to-extended-sequence (object class)
+  (let ((prototype (sb-mop:class-prototype
+                    (sb-pcl:ensure-class-finalized class))))
+    (sb-sequence:make-sequence-like
+     prototype (length object) :initial-contents object)))
 
 (defun coerce-to-fun (object)
   ;; (Unlike the other COERCE-TO-FOOs, this one isn't inline, because
@@ -118,7 +111,6 @@
   "Coerce the Object to an object of type Output-Type-Spec."
   (declare (explicit-check))
   (flet ((coerce-error ()
-           (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
                   :format-control "~S can't be converted to type ~
                                     ~/sb-impl:print-type-specifier/."
@@ -247,14 +239,12 @@
            (sequence (sequence-to-vector* object output-type-spec))
            (t
             (coerce-error))))
-        ((and (csubtypep type (specifier-type 'sequence))
-              (find-class output-type-spec nil))
-         (let ((prototype (sb-mop:class-prototype
-                           (sb-pcl:ensure-class-finalized
-                            (find-class output-type-spec)))))
-           (sb-sequence:make-sequence-like
-            prototype (length object) :initial-contents object)))
-        ((csubtypep type (specifier-type 'function))
+        ((csubtypep type (specifier-type 'sequence))
+         (let ((class (find-class output-type-spec nil)))
+           (if class
+               (coerce-to-extended-sequence object class)
+               (coerce-error))))
+        ((type= type (specifier-type 'function))
          (coerce-to-fun object))
         (t
          (coerce-error))))))

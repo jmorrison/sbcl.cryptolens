@@ -275,22 +275,16 @@
   (sb-alien:define-alien-routine bug-316075 void (result char :out)))
 (with-test (:name :bug-316075 :fails-on :win32)
   #+win32 (error "fail")
-  ;; The interpreter gives you a style-warning because the "undefined alien"
-  ;; first occurs here during compilation of the test case. But if compiling
-  ;; by default, then the warning already happened above at DEFINE-ALIEN-ROUTINE
-  ;; because when that got compiled, it warned, which inhibited further
-  ;; warnings for the same foreign symbol.
-  (checked-compile '(lambda () (multiple-value-list (bug-316075)))
-                   :allow-style-warnings t))
+  (checked-compile '(lambda () (multiple-value-list (bug-316075)))))
 
 ;;; Bug #316325: "return values of alien calls assumed truncated to
 ;;; correct width on x86"
 #+x86-64
-(sb-alien::define-alien-callback truncation-test (unsigned 64)
+(define-alien-callable truncation-test (unsigned 64)
     ((foo (unsigned 64)))
   foo)
 #+x86
-(sb-alien::define-alien-callback truncation-test (unsigned 32)
+(define-alien-callable truncation-test (unsigned 32)
     ((foo (unsigned 32)))
   foo)
 
@@ -304,7 +298,7 @@
                `(with-alien ((fun (* (function ,type
                                                #+x86-64 (unsigned 64)
                                                #+x86 (unsigned 32)))
-                                  :local (alien-sap truncation-test)))
+                                  :local (alien-sap (alien-callable-function 'truncation-test))))
                   (let ((result (alien-funcall fun ,input)))
                     (assert (= result ,output))))))
     #+x86-64
@@ -374,8 +368,21 @@
 
 ;;; Skip for MSAN. Instead of returning 0, the intercepted malloc is configured
 ;;; to cause process termination by default on failure to allocate memory.
-(with-test (:name :malloc-failure
-                  :skipped-on :msan)
+;;; Skip also for UBSAN which has a smaller ARRAY-TOTAL-SIZE-LIMIT
+;;; and so doesn't get ENOMEM.
+;;; Unfortunately, even without an intercepted malloc, and depending on SBCL build
+;;; parameters (notably GC card-size) you might not get a failure right away,
+;;; but instead suffer process death, or cause your kernel to churn for a while
+;;; as it looks for swap space and then decides to OOM-kill you. This will typically
+;;; occur when ARRAY-TOTAL-SIZE-LIMIT is "too small" to get instant failure.
+;;; Instead, your malloc() thinks the request is reasonable, and tries to fulfill it.
+;;; But we're constrained by the maximum BYTES argument to MAKE-%ALIEN which
+;;; is declared as INDEX even though we want to pass something ludicrously
+;;; big like half the maximum value of size_t.
+#+64-bit (unless (>= (integer-length array-total-size-limit) 45)
+           (push :skip-malloc-test *features*))
+(with-test (:name :malloc-failure ; for lp#891268
+                  :skipped-on (or :ubsan :msan :skip-malloc-test))
   (assert (eq :enomem
               (handler-case
                   (loop repeat 128
@@ -524,10 +531,47 @@
                 (sb-alien::coerce-to-interpreted-function form2)))))
 
 (with-test (:name :undefined-alien-name
-            :skipped-on (not (or :x86-64 :arm :arm64)))
-  (handler-case (funcall (checked-compile `(lambda ()
-                                             (alien-funcall (extern-alien "bar" (function (values)))))
-                                          :allow-style-warnings t))
-    (t (c)
-      (assert (typep c 'sb-kernel::undefined-alien-function-error))
-      (assert (equal (cell-error-name c) "bar")))))
+            :skipped-on (not (or :x86-64 :arm64)))
+  (dolist (memspace '(:dynamic #+immobile-space :immobile))
+    (let ((lispfun
+           (let ((sb-c::*compile-to-memory-space* memspace))
+             (checked-compile `(lambda ()
+                                 (alien-funcall (extern-alien "bar" (function (values)))))
+                              :allow-style-warnings t))))
+      (handler-case (funcall lispfun)
+        (t (c)
+          (assert (typep c 'sb-kernel::undefined-alien-function-error))
+          (assert (equal (cell-error-name c) "bar")))))))
+
+(with-test (:name :undefined-alien-name-via-linkage-table-trampoline
+            :skipped-on (not (or :x86-64 :arm64)))
+  (dolist (memspace '(:dynamic #+immobile-space :immobile))
+    (let ((lispfun
+           (let ((sb-c::*compile-to-memory-space* memspace))
+             (checked-compile
+              `(lambda ()
+                 (with-alien ((fn (* (function (values)))
+                                  (sb-sys:int-sap (sb-sys:foreign-symbol-address "baz"))))
+                   (alien-funcall fn)))))))
+      (handler-case (funcall lispfun)
+        (t (c)
+          (assert (typep c 'sb-kernel::undefined-alien-function-error))
+          (assert (equal (cell-error-name c) "baz")))))))
+
+(defconstant fleem 3)
+;; We used to expand into
+;; (SYMBOL-MACROLET ((FLEEM (SB-ALIEN-INTERNALS:%ALIEN-VALUE
+;; which conflicted with the symbol as global variable.
+(with-test (:name :def-alien-rtn-use-gensym)
+  (checked-compile '(lambda () (define-alien-routine "fleem" int (x int)))
+                   :allow-style-warnings (or #-(or :x86-64 :arm :arm64) t)))
+
+(with-test (:name :no-vector-sap-of-array-nil)
+  (assert-error (sb-sys:vector-sap (opaque-identity (make-array 5 :element-type nil)))))
+
+(cl:in-package "SB-KERNEL")
+(test-util:with-test (:name :hash-consing)
+  (assert (eq (parse-alien-type '(integer 9) nil)
+              (parse-alien-type '(integer 9) nil)))
+  (assert (eq (parse-alien-type '(* (struct nil (x int) (y int))) nil)
+              (parse-alien-type '(* (struct nil (x int) (y int))) nil))))

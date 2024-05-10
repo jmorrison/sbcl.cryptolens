@@ -33,15 +33,12 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
@@ -61,41 +58,12 @@
 ;;; address space)
 (defconstant n-machine-word-bits 32)
 
-(defconstant float-sign-shift 31)
-
-;;; comment from CMU CL:
-;;;   These values were taken from the alpha code. The values for
-;;;   bias and exponent min/max are not the same as shown in the 486 book.
-;;;   They may be correct for how Python uses them.
-(defconstant single-float-bias 126)    ; Intel says 127.
-(defconstant-eqx single-float-exponent-byte    (byte 8 23) #'equalp)
-(defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-;;; comment from CMU CL:
-;;;   The 486 book shows the exponent range -126 to +127. The Lisp
-;;;   code that uses these values seems to want already biased numbers.
-(defconstant single-float-normal-exponent-min 1)
-(defconstant single-float-normal-exponent-max 254)
-(defconstant single-float-hidden-bit (ash 1 23))
-
-(defconstant double-float-bias 1022)
-(defconstant-eqx double-float-exponent-byte    (byte 11 20) #'equalp)
-(defconstant-eqx double-float-significand-byte (byte 20 0)  #'equalp)
-(defconstant double-float-normal-exponent-min 1)
-(defconstant double-float-normal-exponent-max #x7FE)
-(defconstant double-float-hidden-bit (ash 1 20))
-
 (defconstant long-float-bias 16382)
 (defconstant-eqx long-float-exponent-byte    (byte 15 0) #'equalp)
 (defconstant-eqx long-float-significand-byte (byte 31 0) #'equalp)
 (defconstant long-float-normal-exponent-min 1)
 (defconstant long-float-normal-exponent-max #x7FFE)
 (defconstant long-float-hidden-bit (ash 1 31))         ; actually not hidden
-
-(defconstant single-float-digits
-  (+ (byte-size single-float-significand-byte) 1))
-
-(defconstant double-float-digits
-  (+ (byte-size double-float-significand-byte) n-word-bits 1))
 
 (defconstant long-float-digits
   (+ (byte-size long-float-significand-byte) n-word-bits 1))
@@ -192,7 +160,7 @@
 ;;; table: "In CMUCL: 0xB0000000->0xB1000000"
 
 (defmacro space-setup (arg &rest more)
-  `(!gencgc-space-setup ,arg #-win32 :read-only-space-size #-win32 0 ,@more))
+  `(gc-space-setup ,arg ,@more))
 
 #+win32     (space-setup #x22000000)
 #+linux     (space-setup #x01000000 :dynamic-space-start #x09000000)
@@ -203,9 +171,9 @@
 #+netbsd    (space-setup #x20000000 :dynamic-space-start #x60000000)
 #+darwin    (space-setup #x04000000 :dynamic-space-start #x10000000)
 
-;;; Size of one linkage-table entry in bytes.
-(defconstant linkage-table-entry-size 8)
-(defconstant linkage-table-growth-direction :up)
+;;; Size of one alien-linkage-table entry in bytes.
+(defconstant alien-linkage-table-entry-size 8)
+(defconstant alien-linkage-table-growth-direction :up)
 
 
 (defenum (:start 8)
@@ -259,24 +227,7 @@
      *fp-constant-ln2*)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-  #(length
-    two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    eql
-    %negate
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    two-arg-gcd
-    two-arg-lcm
-    %coerce-callable-to-fun)
-  #'equalp)
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 #+win32
 (defconstant +win32-tib-arbitrary-field-offset+ #.(+ #xE10 (* 4 63)))

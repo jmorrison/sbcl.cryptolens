@@ -46,61 +46,13 @@
     (inst movzx '(:byte :dword) result object)
     DONE))
 
-(macrolet ((read-depthoid ()
-             `(ea (- (+ 4 (ash (+ instance-slots-offset
-                                  (get-dsd-index layout sb-kernel::flags))
-                               word-shift))
-                     instance-pointer-lowtag)
-                  layout)))
-  (define-vop ()
-    (:translate layout-depthoid)
-    (:policy :fast-safe)
-    (:args (layout :scs (descriptor-reg)))
-    (:results (res :scs (any-reg)))
-    (:result-types fixnum)
-    (:generator 1 (inst movsx '(:dword :qword) res (read-depthoid))))
-  (define-vop ()
-    (:translate sb-c::layout-depthoid-ge)
-    (:policy :fast-safe)
-    (:args (layout :scs (descriptor-reg)))
-    (:info k)
-    (:arg-types * (:constant (unsigned-byte 16)))
-    (:conditional :ge)
-    (:generator 1 (inst cmp :dword (read-depthoid) (fixnumize k)))))
-
-(define-vop ()
-  (:translate sb-c::%structure-is-a)
-  (:args (x :scs (descriptor-reg)))
-  (:arg-types * (:constant t))
-  (:info test)
-  (:policy :fast-safe)
-  (:conditional :e)
-  (:generator 1
-    (inst cmp :dword
-          (ea (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                         instance-slots-offset)
-                      word-shift)
-                 (ash (- (layout-depthoid test) 2) 2)
-                 (- instance-pointer-lowtag))
-              x)
-          ;; Small layout-ids can only occur for layouts made in genesis.
-          ;; Therefore if the compile-time value of the ID is small,
-          ;; it is permanently assigned to that type.
-          ;; Otherwise, we allow for the possibility that the compile-time ID
-          ;; is not the same as the load-time ID.
-          ;; I don't think layout-id 0 can get here, but be sure to exclude it.
-          (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
-                  (not (sb-c::producing-fasl-file)))
-              (layout-id test)
-              (make-fixup test :layout-id)))))
-
 #+compact-instance-header
-;; ~20 instructions vs. 35
-(define-vop (layout-of) ; no translation
+(progn
+;; ~17 instructions vs. 35
+(define-vop ()
     (:policy :fast-safe)
     (:translate layout-of)
-    (:args (object :scs (descriptor-reg))
-           #+nil (layouts :scs (constant)))
+    (:args (object :scs (descriptor-reg)))
     (:temporary (:sc unsigned-reg :offset rax-offset) rax)
     (:results (result :scs (descriptor-reg)))
     (:generator 6
@@ -128,16 +80,8 @@
       (inst jmp  :eq NULL)
       (inst movzx '(:byte :dword) rax object)
       LOAD-FROM-VECTOR
-      #+nil ;; old way
-      (progn
-        (inst mov  result layouts)
-        (inst mov  :dword result
-              (ea (+ (ash vector-data-offset word-shift) (- other-pointer-lowtag))
-                  result rax 8)))
-      ;; new way
       (inst mov :dword result
-            (ea (make-fixup '**primitive-object-layouts**
-                           :symbol-value
+            (ea (make-fixup '**primitive-object-layouts** :symbol-value
                            (- (ash vector-data-offset word-shift)
                               other-pointer-lowtag))
                 nil rax 8)) ; no base register
@@ -145,6 +89,20 @@
       NULL
       (inst mov  result (make-fixup 'null :layout))
       DONE))
+(define-vop ()
+    (:policy :fast-safe)
+    (:translate %instanceoid-layout)
+    (:args (object :scs (descriptor-reg) :to :save))
+    (:temporary (:sc unsigned-reg) temp)
+    (:results (result :scs (descriptor-reg)))
+    (:generator 6
+      (inst lea temp (ea -3 object))
+      (inst and temp (lognot #b1000))
+      (inst mov :dword result (make-fixup 't :layout))
+      (inst test :byte temp 15)
+      (inst jmp :ne DONE)
+      (inst mov :dword result (ea 4 temp))
+      DONE)))
 
 (macrolet ((load-type (target source lowtag)
              `(inst movzx '(:byte :dword) ,target (ea (- ,lowtag) ,source))))
@@ -155,8 +113,8 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 1 (load-type result object other-pointer-lowtag)))
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -175,58 +133,71 @@
 
 ;;; This operation is racy with GC and therefore slightly dangerous, especially
 ;;; on objects in immobile space which reserve byte 3 of the header for GC.
-(define-vop (set-header-data)
+(define-vop ()
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res :to (:result 0))
+  (:args (x :scs (descriptor-reg) :to :eval)
          (data :scs (any-reg) :target temp))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :from (:argument 1) :to (:result 0)) temp)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) temp)
   (:generator 6
     (move temp data)
     (inst shl temp (- n-widetag-bits n-fixnum-tag-bits))
-    ;; merge in the widetag. We should really preserve bit 63 as well
-    ;; which could be a GC mark bit, but it's not concurrent at the moment.
+    ;; merge in the widetag
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
-    (storew temp x 0 other-pointer-lowtag)
+    (storew temp x 0 other-pointer-lowtag)))
+(define-vop (logior-header-bits)
+  (:translate logior-header-bits)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg))
+         (bits :scs (unsigned-reg immediate)))
+  (:arg-types * positive-fixnum)
+  (:results (res :scs (descriptor-reg)))
+  (:generator 1
+    (if (sc-is bits immediate)
+        (let ((bits (tn-value bits)))
+          (cond ((typep bits '(unsigned-byte 8))
+                 (inst or :byte (ea (- 1 other-pointer-lowtag) x) bits))
+                ((not (logtest bits #xff))
+                 (inst or :byte (ea (- 2 other-pointer-lowtag) x) (ash bits -8)))
+                (t
+                 (inst or :word (ea (- 1 other-pointer-lowtag) x) bits))))
+        (inst or :word (ea (- 1 other-pointer-lowtag) x) bits))
     (move res x)))
-
-;;; These next 3 vops are for manipulating and reading the flag bits of
-;;; arrays headers, or more generally any OTHER-POINTER object.
-(define-vop (set-header-bits)
-  (:translate set-header-bits)
+(define-vop ()
+  (:translate assign-vector-flags)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:arg-types t (:constant t))
   (:info bits)
+  (:arg-types t (:constant (unsigned-byte 8)))
   (:generator 1
-    (if (typep bits '(unsigned-byte 8))
-        (inst or :byte (ea (- 1 other-pointer-lowtag) x) bits)
-        (inst or :dword (ea (- other-pointer-lowtag) x) (ash bits n-widetag-bits)))))
-(define-vop (unset-header-bits)
-  (:translate unset-header-bits)
+    (inst mov :byte (ea (- (/ array-flags-position n-word-bytes) other-pointer-lowtag) x)
+      bits)))
+(define-vop ()
+  (:translate reset-header-bits)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:arg-types t (:constant t))
+  (:arg-types t (:constant (unsigned-byte 16)))
   (:info bits)
   (:generator 1
-    (if (typep bits '(unsigned-byte 8))
-        (inst and :byte (ea (- 1 other-pointer-lowtag) x) (logandc1 bits #xff))
-        (inst and :dword (ea (- other-pointer-lowtag) x)
-              (lognot (ash bits n-widetag-bits))))))
-(define-vop (test-header-bit)
-  (:translate test-header-bit)
+    (let ((byte 1))
+      (when (> bits #xff)
+        (setf bits (ash bits -8))
+        (setf byte 2))
+      (inst and :byte (ea (- byte other-pointer-lowtag) x) (logandc1 bits #xff)))))
+(define-vop (test-header-data-bit)
+  (:translate test-header-data-bit)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
-  (:arg-types t (:constant t))
   (:info mask)
+  (:arg-types t (:constant t))
   (:conditional :ne)
   (:generator 1
-    ;; Assert that the mask is in header-data byte index 0
-    ;; which is byte index 1 of the whole header word.
-    (aver (typep mask '(unsigned-byte 8)))
-    (inst test :byte (ea (- 1 other-pointer-lowtag) array) mask)))
+    (let ((byte 1))
+      (when (> mask #xff)
+        (setf mask (ash mask -8))
+        (setf byte 2))
+      (inst test :byte (ea (- byte other-pointer-lowtag) array) mask))))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)
@@ -310,44 +281,8 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
-    (inst lea result
-          (ea  (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes))
-               result))))
+    (inst sub result (- (* simple-fun-insts-offset n-word-bytes) fun-pointer-lowtag))))
 
-;;;; symbol frobbing
-(defun load-symbol-info-vector (result symbol)
-  (loadw result symbol symbol-info-slot other-pointer-lowtag)
-  ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-  ;; This CMOV safely reads from memory when it does not move, because if
-  ;; there is an info-vector in the slot, it has at least one element.
-  ;; This would compile to almost the same code without a VOP,
-  ;; but using a jmp around a mov instead.
-  (aver (= (logior list-pointer-lowtag #b1000) other-pointer-lowtag))
-  (inst test :byte result #b1000)
-  (inst cmov :e result
-        (object-slot-ea result cons-cdr-slot list-pointer-lowtag)))
-
-(define-vop (symbol-info-vector)
-  (:policy :fast-safe)
-  (:translate symbol-info-vector)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:generator 1 (load-symbol-info-vector res x)))
-
-(define-vop (symbol-plist)
-  (:policy :fast-safe)
-  (:translate symbol-plist)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; Instruction pun: (CAR x) is the same as (VECTOR-LENGTH x)
-    ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
-    (loadw res res cons-car-slot list-pointer-lowtag)
-    (inst mov temp nil-value)
-    (inst test :byte res fixnum-tag-mask)
-    (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -368,18 +303,20 @@
   (:arg-types (:constant signed-byte))
   (:policy :fast-safe)
   (:generator 1
-    (inst mov sap (thread-slot-ea n))))
+    #-gs-seg (inst mov sap (if (= n thread-this-slot) thread-tn (thread-slot-ea n)))
+    #+gs-seg (inst mov sap (thread-slot-ea n))))
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (n :scs (any-reg) :target sap))
+  (:args (index :scs (any-reg) :target sap))
   (:arg-types tagged-num)
   (:policy :fast-safe)
   (:generator 2
-    (inst mov sap
-          (ea thread-base-tn
-              n (ash 1 (- word-shift n-fixnum-tag-bits)))))))
+    (let (#+gs-seg (thread-tn nil))
+      (inst mov sap
+            (ea thread-segment-reg thread-tn
+                index (ash 1 (- word-shift n-fixnum-tag-bits))))))))
 
 (define-vop (halt)
   (:generator 1
@@ -538,24 +475,69 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
    (move c ecx)
    (move d edx)))
 
-(define-vop (set-fdefn-has-static-callers)
-  (:args (fdefn :scs (descriptor-reg)))
-  (:generator 1
-    ;; atomic because the immobile gen# is in the same byte
-    (inst or :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x80)))
-(define-vop (unset-fdefn-has-static-callers)
-  (:args (fdefn :scs (descriptor-reg)))
-  (:generator 1
-    ;; atomic because the immobile gen# is in the same byte
-    (inst and :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f)))
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:generator 1
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index)))
 
 (define-vop ()
-  (:translate update-object-layout)
-  (:args (obj :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
+  (:translate sb-lockless:get-next)
   (:policy :fast-safe)
+  (:args (node :scs (descriptor-reg)))
+  (:results (next-tagged :scs (descriptor-reg))
+            (next-bits :scs (descriptor-reg)))
+  (:generator 10
+    ;; Read the first user-data slot, which might be an untagged pointer
+    ;; to the next node. Conservative GC implicitly pins objects pointed to by untagged
+    ;; instance pointers now.
+    (loadw next-bits node (+ instance-slots-offset instance-data-start) instance-pointer-lowtag)
+    ;; Also returning the unadjusted bits as a secondary result.
+    ;; This can'be use the LEA instruction because _usually_ NEXT-BITS
+    ;; already hold a tagged pointer.
+    (inst mov next-tagged next-bits)
+    (inst or :byte next-tagged instance-pointer-lowtag)))
+
+(define-vop (switch-to-arena)
+  (:args (x :scs (descriptor-reg immediate)))
+  (:temporary (:sc unsigned-reg :offset rdi-offset :from (:argument 0)) rdi)
+  (:temporary (:sc unsigned-reg :offset rsi-offset) rsi)
+  (:vop-var vop)
+  (:ignore rsi)
+  (:generator 1
+    (inst mov rdi (if (sc-is x immediate) (tn-value x) x))
+    ;; We could have the vop declare that all C volatile regs are clobbered,
+    ;; but since this needs pseudo-atomic decoration anyway, it saves code size
+    ;; to make an assembly routine that preserves all registers.
+    (invoke-asm-routine 'call 'switch-to-arena vop)))
+
+;;; Caution: this vop potentially clobbers all registers, but it doesn't declare them.
+;;; It's safe to use only from DESTROY-ARENA which, being an ordinary full call,
+;;; is presumed not to preserve registers.
+#+sb-xc-host
+(define-vop (delete-arena)
+  (:args (x :scs (descriptor-reg)))
+  (:temporary (:sc unsigned-reg :offset rdi-offset :from (:argument 0)) rdi)
+  (:temporary (:sc unsigned-reg :offset rbx-offset) rsp-save)
   (:vop-var vop)
   (:generator 1
-    (inst push obj)
-    (invoke-asm-routine 'call 'invalid-layout-trap vop)
-    (inst pop res)))
+    (move rdi x)
+    (pseudo-atomic ()
+      (inst mov rsp-save rsp-tn)
+      (inst and rsp-tn -16) ; align as required by some ABIs
+      (call-c "sbcl_delete_arena" #+win32 rdi)
+      (inst mov rsp-tn rsp-save))))
+
+#+ultrafutex
+(define-vop (quick-try-mutex)
+  (:translate quick-try-mutex)
+  (:policy :fast-safe)
+  (:args (m :scs (descriptor-reg)))
+  (:temporary (:sc unsigned-reg :offset 0) old) ; RAX
+  (:temporary (:sc unsigned-reg) new)
+  (:conditional :z)
+  (:generator 1
+    (inst mov :byte new 1)
+    (zeroize old)
+    (inst cmpxchg :lock :byte (mutex-slot m state) new)))

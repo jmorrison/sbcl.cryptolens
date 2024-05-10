@@ -61,6 +61,10 @@
 (defmacro load-symbol (reg symbol)
   (once-only ((reg reg) (symbol symbol))
     `(progn
+       ;; TBH this looks suspicious to me - when we emit more than one ADD, the intermediate
+       ;; value is a random pointer. How do we know it won't harm GC?
+       ;; We could at least try to compute ADD operands that leave the register
+       ;; always pointing to the base of _something_ _valid_ in static space.
        (composite-immediate-instruction add ,reg null-tn (static-symbol-offset ,symbol)))))
 
 (defmacro load-symbol-value (reg symbol &optional (predicate :al))
@@ -207,9 +211,9 @@
   (inst word (logior #xe92d0000 ; PUSH {rN, lr}
                      (ash 1 (if (integerp size) (tn-offset alloc-tn) (tn-offset size)))
                      (ash 1 (tn-offset lr-tn))))
-  ;; select the C function index as per *LINKAGE-SPACE-PREDEFINED-ENTRIES*
+  ;; select the C function index as per *ALIEN-LINKAGE-TABLE-PREDEFINED-ENTRIES*
   (let ((index (if (eq type 'list) 1 0)))
-    (inst ldr alloc-tn (@ null-tn (- (linkage-table-entry-address index)
+    (inst ldr alloc-tn (@ null-tn (- (alien-linkage-table-entry-address index)
                                      nil-value))))
   (inst blx alloc-tn)
   (inst word (logior #xe8bd0000 ; POP {rN, lr}
@@ -231,17 +235,8 @@
          ;; stack pointer has been stored.
          (storew null-tn result-tn -1 0 :ne)
          (inst orr result-tn result-tn lowtag))
-        #-gencgc
         (t
-         (load-symbol-value flag-tn *allocation-pointer*)
-         (inst add result-tn flag-tn lowtag)
-         (if (integerp size)
-             (composite-immediate-instruction add flag-tn flag-tn size)
-             (inst add flag-tn flag-tn size))
-         (store-symbol-value flag-tn *allocation-pointer*))
-        #+gencgc
-        (t
-         (let ((region-disp (- boxed-region nil-value))
+         (let ((region-disp (- mixed-region-offset nil-value-offset))
                (alloc (gen-label))
                (back-from-alloc (gen-label)))
            (inst ldr result-tn (@ null-tn region-disp)) ; free ptr
@@ -280,9 +275,8 @@
        (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p)
-       (when ,type-code
-         (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
-         (storew ,flag-tn ,result-tn 0 ,lowtag))
+       (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
+       (storew ,flag-tn ,result-tn 0 ,lowtag)
        ,@body)))
 
 ;;;; Error Code
@@ -356,15 +350,12 @@
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg))
-            (value :scs ,scs :target result))
+            (value :scs ,scs))
      (:arg-types ,type tagged-num ,el-type)
      (:temporary (:scs (interior-reg)) lip)
-     (:results (result :scs ,scs))
-     (:result-types ,el-type)
      (:generator 2
        (inst add lip object index)
-       (storew value lip ,offset ,lowtag)
-       (move result value))))
+       (storew value lip ,offset ,lowtag))))
 
 (defmacro define-partial-reffer (name type size signed offset lowtag scs
                                  el-type &optional translate)
@@ -395,15 +386,12 @@
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (unsigned-reg))
-            (value :scs ,scs :target result))
+            (value :scs ,scs))
      (:arg-types ,type positive-fixnum ,el-type)
      (:temporary (:scs (interior-reg)) lip)
-     (:results (result :scs ,scs))
-     (:result-types ,el-type)
      (:generator 5
        ,(if (eq size :byte)
             '(inst add lip object index)
             '(inst add lip object (lsl index 1)))
        (inst ,(ecase size (:byte 'strb) (:short 'strh))
-             value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))
-       (move result value))))
+             value (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))

@@ -51,16 +51,17 @@
 
 (/show0 "primtype.lisp 53")
 (!def-primitive-type-alias tagged-num '(:or positive-fixnum fixnum))
-(multiple-value-bind (unsigned signed)
+(multiple-value-bind (unsigned signed untagged)
     (case sb-vm:n-machine-word-bits
       (64 (values '(unsigned-byte-64 unsigned-byte-63 positive-fixnum)
-                  '(signed-byte-64 fixnum unsigned-byte-63 positive-fixnum)))
+                  '(signed-byte-64 fixnum unsigned-byte-63 positive-fixnum)
+                  '(signed-byte-64 unsigned-byte-64 unsigned-byte-63 fixnum positive-fixnum)))
       (32 (values '(unsigned-byte-32 unsigned-byte-31 positive-fixnum)
-                  '(signed-byte-32 fixnum unsigned-byte-31 positive-fixnum))))
+                  '(signed-byte-32 fixnum unsigned-byte-31 positive-fixnum)
+                  '(signed-byte-32 unsigned-byte-32 unsigned-byte-31 fixnum positive-fixnum))))
   (!def-primitive-type-alias unsigned-num `(:or ,@unsigned))
   (!def-primitive-type-alias signed-num `(:or ,@signed))
-  (!def-primitive-type-alias untagged-num
-    `(:or ,@(sort (copy-list (union unsigned signed)) #'string<))))
+  (!def-primitive-type-alias untagged-num `(:or ,@untagged)))
 
 ;;; other primitive immediate types
 (/show0 "primtype.lisp 68")
@@ -99,20 +100,66 @@
     :type (simd-pack single-float))
   (!def-primitive-type simd-pack-double (double-sse-reg descriptor-reg)
     :type (simd-pack double-float))
-  (!def-primitive-type simd-pack-int (int-sse-reg descriptor-reg)
-   :type (simd-pack integer))
+  (!def-primitive-type simd-pack-ub8 (int-sse-reg descriptor-reg)
+    :type (simd-pack (unsigned-byte 8)))
+  (!def-primitive-type simd-pack-ub16 (int-sse-reg descriptor-reg)
+    :type (simd-pack (unsigned-byte 16)))
+  (!def-primitive-type simd-pack-ub32 (int-sse-reg descriptor-reg)
+    :type (simd-pack (unsigned-byte 32)))
+  (!def-primitive-type simd-pack-ub64 (int-sse-reg descriptor-reg)
+    :type (simd-pack (unsigned-byte 64)))
+  (!def-primitive-type simd-pack-sb8 (int-sse-reg descriptor-reg)
+    :type (simd-pack (signed-byte 8)))
+  (!def-primitive-type simd-pack-sb16 (int-sse-reg descriptor-reg)
+    :type (simd-pack (signed-byte 16)))
+  (!def-primitive-type simd-pack-sb32 (int-sse-reg descriptor-reg)
+    :type (simd-pack (signed-byte 32)))
+  (!def-primitive-type simd-pack-sb64 (int-sse-reg descriptor-reg)
+    :type (simd-pack (signed-byte 64)))
   (!def-primitive-type-alias simd-pack
-   '(:or simd-pack-single simd-pack-double simd-pack-int)))
+   '(:or simd-pack-single
+         simd-pack-double
+         simd-pack-ub8
+         simd-pack-ub16
+         simd-pack-ub32
+         simd-pack-ub64
+         simd-pack-sb8
+         simd-pack-sb16
+         simd-pack-sb32
+         simd-pack-sb64)))
 #+sb-simd-pack-256
 (progn
   (!def-primitive-type simd-pack-256-single (single-avx2-reg descriptor-reg)
     :type (simd-pack-256 single-float))
   (!def-primitive-type simd-pack-256-double (double-avx2-reg descriptor-reg)
     :type (simd-pack-256 double-float))
-  (!def-primitive-type simd-pack-256-int (int-avx2-reg descriptor-reg)
-   :type (simd-pack-256 integer))
+  (!def-primitive-type simd-pack-256-ub8 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (unsigned-byte 8)))
+  (!def-primitive-type simd-pack-256-ub16 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (unsigned-byte 16)))
+  (!def-primitive-type simd-pack-256-ub32 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (unsigned-byte 32)))
+  (!def-primitive-type simd-pack-256-ub64 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (unsigned-byte 64)))
+  (!def-primitive-type simd-pack-256-sb8 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (signed-byte 8)))
+  (!def-primitive-type simd-pack-256-sb16 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (signed-byte 16)))
+  (!def-primitive-type simd-pack-256-sb32 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (signed-byte 32)))
+  (!def-primitive-type simd-pack-256-sb64 (int-avx2-reg descriptor-reg)
+    :type (simd-pack-256 (signed-byte 64)))
   (!def-primitive-type-alias simd-pack-256
-   '(:or simd-pack-256-single simd-pack-256-double simd-pack-256-int)))
+   '(:or simd-pack-256-single
+         simd-pack-256-double
+         simd-pack-256-ub8
+         simd-pack-256-ub16
+         simd-pack-256-ub32
+         simd-pack-256-ub64
+         simd-pack-256-sb8
+         simd-pack-256-sb16
+         simd-pack-256-sb32
+         simd-pack-256-sb64)))
 
 ;;; primitive other-pointer array types
 (/show0 "primtype.lisp 96")
@@ -142,13 +189,18 @@
 ;;; Return the most restrictive primitive type that contains OBJECT.
 (/show0 "primtype.lisp 147")
 (defun primitive-type-of (object)
-  (let ((type (ctype-of object)))
-    (cond ((not (member-type-p type)) (primitive-type type))
-          ((and (eql 1 (member-type-size type))
-                (equal (member-type-members type) '(nil)))
-           (primitive-type-or-lose 'list))
-          (t
-           *backend-t-primitive-type*))))
+  (if (null object)
+      (load-time-value (primitive-type-or-lose 'list) t)
+      (let ((type (ctype-of object)))
+        (if (member-type-p type)
+            *backend-t-primitive-type*
+            (primitive-type type)))))
+
+#+sb-simd-pack
+(defun simd-pack-mask->tag (mask)
+  (aver (= (logcount mask) 1))
+  (the (integer 0 (#.(length +simd-pack-element-types+)))
+       (1- (integer-length mask))))
 
 ;;; Return the primitive type corresponding to a type descriptor
 ;;; structure. The second value is true when the primitive type is
@@ -166,7 +218,7 @@
   (primitive-type-aux type))
 (/show0 "primtype.lisp 191")
 (defun-cached (primitive-type-aux
-               :hash-function #'type-hash-value
+               :hash-function #'sb-kernel::type-%bits
                :hash-bits 9
                :values 2)
               ((type eq))
@@ -223,7 +275,17 @@
                             (ecase n-machine-word-bits
                               (32 'unsigned-byte-32)
                               (64 'unsigned-byte-64)))
-                        t2))))))
+                        t2))
+                 ((bignum integer)
+                  (cond ((and (eq t1-name 'bignum)
+                              (eq t2-name 'bignum))
+                         t1)
+                        ((memq t2-name '(positive-fixnum fixnum
+                                         integer bignum
+                                         . #.(ecase n-machine-word-bits
+                                               (32 '(unsigned-byte-31 unsigned-byte-32 signed-byte-32))
+                                               (64 '(unsigned-byte-63 unsigned-byte-64 signed-byte-64)))))
+                         (primitive-type-or-lose 'integer))))))))
       (etypecase type
         (numeric-type
          (let ((lo (numeric-type-low type))
@@ -390,33 +452,24 @@
              (part-of character)))
         #+sb-simd-pack
         (simd-pack-type
-         (let ((eltypes (simd-pack-type-element-type type)))
-           (cond ((member 'integer eltypes)
-                  (exactly simd-pack-int))
-                 ((member 'single-float eltypes)
-                  (exactly simd-pack-single))
-                 ((member 'double-float eltypes)
-                  (exactly simd-pack-double)))))
+         (let ((mask (simd-pack-type-tag-mask type)))
+           (if (= (logcount mask) 1)
+               (values (primitive-type-or-lose
+                        (svref +simd-pack-128-primtypes+ (simd-pack-mask->tag mask)))
+                       t)
+               (any))))
         #+sb-simd-pack-256
         (simd-pack-256-type
-         (let ((eltypes (simd-pack-256-type-element-type type)))
-           (cond ((member 'integer eltypes)
-                  (exactly simd-pack-256-int))
-                 ((member 'single-float eltypes)
-                  (exactly simd-pack-256-single))
-                 ((member 'double-float eltypes)
-                  (exactly simd-pack-256-double)))))
+         (let ((mask (simd-pack-256-type-tag-mask type)))
+           (if (= (logcount mask) 1)
+               (values (primitive-type-or-lose
+                        (svref +simd-pack-256-primtypes+ (simd-pack-mask->tag mask)))
+                       t)
+               (any))))
         (cons-type
          (part-of list))
         (built-in-classoid
          (case (classoid-name type)
-           #+sb-simd-pack
-           ;; Can't tell what specific type; assume integers.
-           (simd-pack
-            (exactly simd-pack-int))
-           #+sb-simd-pack-256
-           (simd-pack-256
-            (exactly simd-pack-256-int))
            ((complex function system-area-pointer weak-pointer)
             (values (primitive-type-or-lose (classoid-name type)) t))
            ((pathname logical-pathname)

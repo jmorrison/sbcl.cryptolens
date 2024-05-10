@@ -175,15 +175,17 @@
   ;; Only need one word, fix the header.
   (inst li temp (logior (ash 1 n-widetag-bits) bignum-widetag))
 
-  (pseudo-atomic (pa-flag :extra (pad-data-block (+ 1 bignum-digits-offset)))
-    (inst or res alloc-tn other-pointer-lowtag)
+  (pseudo-atomic (pa-flag)
+    (allocation bignum-widetag (pad-data-block (+ 1 bignum-digits-offset))
+                res other-pointer-lowtag `(,nargs ,pa-flag))
     (storew temp res 0 other-pointer-lowtag))
   (storew lo res bignum-digits-offset other-pointer-lowtag)
   (lisp-return lra lip :offset 2)
 
   TWO-WORDS
-  (pseudo-atomic (pa-flag :extra (pad-data-block (+ 2 bignum-digits-offset)))
-    (inst or res alloc-tn other-pointer-lowtag)
+  (pseudo-atomic (pa-flag)
+    (allocation bignum-widetag (pad-data-block (+ 2 bignum-digits-offset))
+                res other-pointer-lowtag `(,nargs ,pa-flag))
     (storew temp res 0 other-pointer-lowtag))
 
   (storew lo res bignum-digits-offset other-pointer-lowtag)
@@ -235,8 +237,7 @@
 
                           (:res quo any-reg nl2-offset)
                           (:res rem any-reg nl3-offset))
-  (let ((error (generate-error-code nil 'division-by-zero-error
-                                    dividend divisor)))
+  (let ((error (generate-error-code nil 'division-by-zero-error dividend)))
     (inst beq divisor error)
     (inst nop))
 
@@ -258,8 +259,7 @@
 
                           (:res quo any-reg nl2-offset)
                           (:res rem any-reg nl3-offset))
-  (let ((error (generate-error-code nil 'division-by-zero-error
-                                    dividend divisor)))
+  (let ((error (generate-error-code nil 'division-by-zero-error dividend)))
     (inst beq divisor error)
     (inst nop))
 
@@ -282,8 +282,7 @@
 
                           (:res quo signed-reg nl2-offset)
                           (:res rem signed-reg nl3-offset))
-  (let ((error (generate-error-code nil 'division-by-zero-error
-                                    dividend divisor)))
+  (let ((error (generate-error-code nil 'division-by-zero-error dividend)))
     (inst beq divisor error)
     (inst nop))
 
@@ -296,7 +295,7 @@
 ;;;; Comparison routines.
 
 (macrolet
-    ((define-cond-assem-rtn (name translate static-fn cmp not-p)
+    ((define-cond-assem-rtn (name translate static-fn cmp branch)
        `(define-assembly-routine (,name
                                   (:cost 10)
                                   (:return-style :full-call)
@@ -318,7 +317,7 @@
           (inst bne temp DO-STATIC-FUN)
           ,cmp
 
-          (inst ,(if not-p 'beq 'bne) temp DONE)
+          (inst ,branch temp DONE)
           (inst move res null-tn)
           (load-symbol res t)
 
@@ -332,10 +331,10 @@
           (inst j lip)
           (inst move cfp-tn csp-tn))))
 
-  (define-cond-assem-rtn generic-< < two-arg-< (inst slt temp x y) t)
-  (define-cond-assem-rtn generic-<= <= two-arg-<= (inst slt temp x y) nil)
-  (define-cond-assem-rtn generic-> > two-arg-> (inst slt temp y x) t)
-  (define-cond-assem-rtn generic->= >= two-arg->= (inst slt temp y x) nil))
+  (define-cond-assem-rtn generic-< < two-arg-< (inst slt temp x y) beq)
+  (define-cond-assem-rtn generic-> > two-arg-> (inst slt temp y x) beq)
+  (define-cond-assem-rtn generic-<= <= two-arg-<= (inst slt temp y x) bne)
+  (define-cond-assem-rtn generic->= >= two-arg->= (inst slt temp x y) bne))
 
 
 (define-assembly-routine (generic-eql

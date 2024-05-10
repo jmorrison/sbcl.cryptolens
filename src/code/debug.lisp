@@ -62,7 +62,7 @@ provide bindings for printer control variables.")
 ;;; If this is bound before the debugger is invoked, it is used as the stack
 ;;; top by the debugger. It can either be the first interesting frame, or the
 ;;; name of the last uninteresting frame.
-(defparameter *stack-top-hint* nil) ; initialized by genesis
+(defvar *stack-top-hint* nil)
 (defvar *current-frame* nil)
 (declaim (always-bound *stack-top-hint* *current-frame*))
 
@@ -147,7 +147,7 @@ Other commands:
     deeply nested input syntax, and now the reader is confused.)")
 
 (defmacro with-debug-io-syntax (() &body body)
-  (let ((thunk (sb-xc:gensym "THUNK")))
+  (let ((thunk (gensym "THUNK")))
     `(dx-flet ((,thunk ()
                        ,@body))
        (funcall-with-debug-io-syntax #',thunk))))
@@ -172,6 +172,11 @@ Other commands:
 (declaim (unsigned-byte *backtrace-frame-count*))
 (defvar *backtrace-frame-count* 1000
   "Default number of frames to backtrace. Defaults to 1000.")
+
+(declaim (boolean *backtrace-print-pc*))
+(defvar *backtrace-print-pc* nil)
+(declaim (unsigned-byte *default-argument-limit*))
+(defvar *default-argument-limit* call-arguments-limit)
 
 (declaim (type (member :minimal :normal :full) *method-frame-style*))
 (defvar *method-frame-style* :normal
@@ -283,6 +288,8 @@ is :DEBUGGER-FRAME.
                         (from :debugger-frame)
                         (count *backtrace-frame-count*)
                         (print-thread t)
+                        (print-pc *backtrace-print-pc*)
+                        (argument-limit *default-argument-limit*)
                         (print-frame-source nil)
                         (method-frame-style *method-frame-style*)
                         (emergency-best-effort (> *debug-command-level* 1)))
@@ -337,6 +344,7 @@ possible while navigating and ignoring possible errors."
             ((print-frame (frame stream)
                (print-frame-call frame stream
                                  :number frame-index
+                                 :print-pc print-pc :argument-limit argument-limit
                                  :method-frame-style method-frame-style
                                  :print-frame-source print-frame-source
                                  :emergency-best-effort emergency-best-effort))
@@ -376,6 +384,7 @@ possible while navigating and ignoring possible errors."
 
 (defun list-backtrace (&key
                        (count *backtrace-frame-count*)
+                       (argument-limit *default-argument-limit*)
                        (start 0)
                        (from :debugger-frame)
                        (method-frame-style *method-frame-style*))
@@ -420,16 +429,17 @@ information."
   (let (rbacktrace)
      (map-backtrace
       (lambda (frame)
-        (push (frame-call-as-list frame :method-frame-style method-frame-style)
+        (push (frame-call-as-list frame argument-limit :method-frame-style method-frame-style)
               rbacktrace))
       :count count
       :start start
       :from (backtrace-start-frame from))
      (nreverse rbacktrace)))
 
-(defun frame-call-as-list (frame &key (method-frame-style *method-frame-style*))
+(defun frame-call-as-list (frame argument-limit &key (method-frame-style *method-frame-style*))
   (multiple-value-bind (name args info)
       (frame-call frame :method-frame-style method-frame-style
+                        :argument-limit argument-limit
                         :replace-dynamic-extent-objects t)
     (values (cons name args) info)))
 
@@ -517,10 +527,13 @@ information."
 ) ; EVAL-WHEN
 
 ;;; Extract the function argument values for a debug frame.
-(defun map-frame-args (thunk frame)
-  (let ((debug-fun (frame-debug-fun frame)))
-    (dolist (element (debug-fun-lambda-list debug-fun))
-      (funcall thunk element))))
+(defun map-frame-args (thunk frame limit)
+  (unless (zerop limit)
+    (let ((debug-fun (frame-debug-fun frame)))
+      (dolist (element (debug-fun-lambda-list debug-fun))
+        (funcall thunk element)
+        (when (zerop (decf limit))
+          (return))))))
 
 ;;; When the frame is interrupted before any of the function code is called
 ;;; we can recover all the arguments, include the extra ones.
@@ -539,21 +552,28 @@ information."
          escaped)
         (error "Index ~a out of bounds for ~a supplied argument~:p." n arg-count))))
 
-(defun early-frame-args (frame)
-  (let* ((escaped (sb-di::compiled-frame-escaped frame))
-         (pointer (sb-di::frame-pointer frame))
-         (arg-count (sb-di::sub-access-debug-var-slot
-                     pointer sb-c:arg-count-sc escaped)))
-    (loop for i below arg-count
-          collect (sb-di::sub-access-debug-var-slot
-                   pointer
-                   (sb-c:standard-arg-location-sc i)
-                   escaped))))
+;;; Return no more than LIMIT args. Aside from the default value of "no limit",
+;;; the other most useful possibility is 0, if you're just going to discard the args.
+;;; Any smaller value is OK too, but "be careful what you wish for" if you're going
+;;; to use the argument list to restart the frame.
+(defun early-frame-args (frame limit)
+  (unless (zerop limit)
+    (let* ((escaped (sb-di::compiled-frame-escaped frame))
+           (pointer (sb-di::frame-pointer frame))
+           (arg-count (sb-di::sub-access-debug-var-slot
+                       pointer sb-c:arg-count-sc escaped)))
+      (loop for i below (min arg-count limit)
+            collect (sb-di::sub-access-debug-var-slot
+                     pointer
+                     (sb-c:standard-arg-location-sc i)
+                     escaped)))))
 
-(defun frame-args-as-list (frame)
+(defun frame-args-as-list (frame limit)
+  (declare (type frame frame) (type (and unsigned-byte fixnum) limit))
+  ;;; All args are available if the function has not proceeded beyond its external
+  ;;; entry point, so every imcoming value is in its argument-passing location.
   (when (sb-di::all-args-available-p frame)
-    (return-from frame-args-as-list
-      (early-frame-args frame)))
+    (return-from frame-args-as-list (early-frame-args frame limit)))
   (handler-case
       (let ((location (frame-code-location frame))
             (reversed-result nil))
@@ -591,7 +611,7 @@ information."
                         (return-from enumerating))
                       (push (make-unprintable-object "unavailable &MORE argument")
                             reversed-result)))))
-           frame))
+           frame limit))
         (nreverse reversed-result))
     (lambda-list-unavailable ()
       (make-unprintable-object "unavailable lambda list"))))
@@ -639,8 +659,10 @@ information."
                 (values (cons :method (cdr name)) real-args))))
     (values cname cargs (cons :fast-method info))))
 
-(defun clean-frame-call (frame name method-frame-style info)
-  (let ((args (frame-args-as-list frame)))
+(defun clean-frame-call (frame argument-limit name method-frame-style info)
+  (let ((args (frame-args-as-list frame argument-limit)))
+    (when (typep name '(cons (eql sb-pcl::gf-dispatch)))
+      (setf name (cadr name)))
     (cond ((typep name '(cons (eql sb-pcl::fast-method)))
            (clean-fast-method name args method-frame-style info))
           ((memq :external info)
@@ -650,7 +672,11 @@ information."
           (t
            (values name args info)))))
 
+;;; This is an *internal* symbol of SB-DI. Tell me people don't use it directly???
+;;; Otherwise why have such a verbose docstring. And why take &KEY args?
+;;; We should pass in the parameters positionally. But I fear people must be using it.
 (defun frame-call (frame &key (method-frame-style *method-frame-style*)
+                              (argument-limit call-arguments-limit)
                               replace-dynamic-extent-objects)
   "Returns as multiple values a descriptive name for the function responsible
 for FRAME, arguments that that function, and a list providing additional
@@ -670,6 +696,7 @@ the current thread are replaced with dummy objects which can safely escape."
          (kind (debug-fun-kind debug-fun)))
     (multiple-value-bind (name args info)
         (clean-frame-call frame
+                          argument-limit
                           (or (debug-fun-closure-name debug-fun frame)
                               (debug-fun-name debug-fun))
                           method-frame-style
@@ -708,14 +735,25 @@ the current thread are replaced with dummy objects which can safely escape."
 (defun print-frame-call (frame stream
                          &key print-frame-source
                               number
+                              (print-pc *backtrace-print-pc*)
+                              (argument-limit *default-argument-limit*)
                               (method-frame-style *method-frame-style*)
                               (emergency-best-effort (> *debug-command-level* 1)))
   (when number
     (format stream "~&~S: " (if (integerp number)
                                 number
                                 (frame-number frame))))
+  (when print-pc
+    (let ((debug-fun (frame-debug-fun frame)))
+      (when (typep debug-fun 'sb-di::compiled-debug-fun)
+        (format stream "#x~x "
+                (sap-int (sap+ (code-instructions
+                                (sb-di::compiled-debug-fun-component debug-fun))
+                               (sb-di::compiled-code-location-pc
+                                (frame-code-location frame))))))))
   (multiple-value-bind (name args info)
-      (frame-call frame :method-frame-style method-frame-style)
+      (frame-call frame :argument-limit argument-limit
+                        :method-frame-style method-frame-style)
     (pprint-logical-block (stream nil :prefix "(" :suffix ")")
       (let ((*print-pretty* nil)
             (*print-circle* t))
@@ -918,11 +956,19 @@ the current thread are replaced with dummy objects which can safely escape."
   ;; until bug 403 is fixed, PPRINT-LOGICAL-BLOCK (STREAM NIL) is
   ;; definitely preferred, because the FORMAT alternative was acting odd.
   (pprint-logical-block (stream nil)
+    #-sb-thread
+    (format stream "debugger invoked on a ~S: ~2I~_~A" (type-of condition) condition)
+    #+sb-thread
     (format stream
-            "debugger invoked on a ~S~@[ in thread ~_~A~]: ~2I~_~A"
+            "debugger invoked on a ~S~@[ @~x~] in thread ~_~A: ~2I~_~A"
             (type-of condition)
-            #+sb-thread sb-thread:*current-thread*
-            #-sb-thread nil
+            (when (boundp '*current-internal-error-context*)
+              (if (system-area-pointer-p *current-internal-error-context*)
+                  (sb-alien:with-alien ((context (* os-context-t)
+                                                 sb-kernel:*current-internal-error-context*))
+                    (sap-int (sb-vm:context-pc context)))
+                  (sap-int (sb-vm:context-pc *current-internal-error-context*))))
+            sb-thread:*current-thread*
             condition))
   (terpri stream))
 
@@ -1319,10 +1365,8 @@ forms that explicitly control this kind of evaluation.")
             (let* ((name (etypecase name
                            (symbol (symbol-name name))
                            (simple-string name)))
-                   ;; FIXME: REMOVE-IF-NOT is deprecated, use STRING/=
-                   ;; instead.
                    (exact (remove-if-not (lambda (v)
-                                           (string= (debug-var-symbol-name v)
+                                           (string= (debug-var-name v)
                                                     name))
                                          vars))
                    (vars (or exact vars)))
@@ -1343,14 +1387,14 @@ forms that explicitly control this kind of evaluation.")
                ((and (not exact)
                      (find-if-not
                       (lambda (v)
-                        (string= (debug-var-symbol-name v)
-                                 (debug-var-symbol-name (car vars))))
+                        (string= (debug-var-name v)
+                                 (debug-var-name (car vars))))
                       (cdr vars)))
                 (error "specification ambiguous:~%~{   ~A~%~}"
-                       (mapcar #'debug-var-symbol-name
+                       (mapcar #'debug-var-name
                                (delete-duplicates
                                 vars :test #'string=
-                                :key #'debug-var-symbol-name))))
+                                :key #'debug-var-name))))
                ;; All names are the same, so see whether the user
                ;; ID'ed one of them.
                (id-supplied
@@ -1665,30 +1709,30 @@ forms that explicitly control this kind of evaluation.")
               (location (frame-code-location *current-frame*))
               (prefix (read-if-available nil))
               (any-p nil)
-              (any-valid-p nil)
-              (more-context nil)
-              (more-count nil))
-          (dolist (v (ambiguous-debug-vars
-                      d-fun
-                      (if prefix (string prefix) "")))
-            (setf any-p t)
-            (when (var-valid-in-frame-p v location)
-              (setf any-valid-p t)
-              (case (sb-di::debug-var-info v)
-                (:more-context
-                 (setf more-context (debug-var-value v *current-frame*)))
-                (:more-count
-                 (setf more-count (debug-var-value v *current-frame*)))
-                (t
-                 (format *debug-io* "~S~:[#~W~;~*~]  =  ~S~%"
-                         (debug-var-symbol v)
-                         (zerop (debug-var-id v))
-                         (debug-var-id v)
-                         (debug-var-value v *current-frame*))))))
-          (when (and more-context more-count)
-            (format *debug-io* "~S  =  ~S~%"
-                    'more
-                    (multiple-value-list (sb-c:%more-arg-values more-context 0 more-count))))
+              (any-valid-p nil))
+          (multiple-value-bind (more-context more-count)
+              (debug-fun-more-args d-fun)
+            (dolist (v (ambiguous-debug-vars
+                        d-fun
+                        (if prefix (string prefix) "")))
+              (setf any-p t)
+              (when (var-valid-in-frame-p v location)
+                (setf any-valid-p t)
+                (unless (or (eq v more-context)
+                            (eq v more-count))
+                  (format *debug-io* "~S~:[#~W~;~*~]  =  ~S~%"
+                          (debug-var-symbol v)
+                          (zerop (debug-var-id v))
+                          (debug-var-id v)
+                          (debug-var-value v *current-frame*)))))
+            (when (and more-context more-count)
+              (format *debug-io* "~S  =  ~S~%"
+                      'more
+                      (multiple-value-list
+                       (sb-c:%more-arg-values
+                        (debug-var-value more-context *current-frame*)
+                        0
+                        (debug-var-value more-count *current-frame*))))))
           (cond
            ((not any-p)
             (format *debug-io*
@@ -1810,6 +1854,8 @@ forms that explicitly control this kind of evaluation.")
                            (funcall thunk))
                          #+unbind-in-unwind thunk
                          #+unbind-in-unwind unbind-to
+                         #+(and unbind-in-unwind (not c-stack-is-control-stack))
+                         (%primitive sb-c:current-nsp)
                          #+unbind-in-unwind catch-block)))
   #-unwind-to-frame-and-call-vop
   (let ((tag (gensym)))
@@ -1894,7 +1940,7 @@ forms that explicitly control this kind of evaluation.")
             (if (and (legal-fun-name-p fname) (fboundp fname))
                 (values (fdefinition fname) args t)
                 (values (debug-fun-fun (frame-debug-fun *current-frame*))
-                        (frame-args-as-list *current-frame*)
+                        (frame-args-as-list *current-frame* call-arguments-limit)
                         nil))
           (when (and fun
                      (or ok
@@ -1977,3 +2023,93 @@ forms that explicitly control this kind of evaluation.")
                         pc)))
                 list)
         list)))
+
+;; Yet another stack unwinder, this one via libunwind, if present.
+;; Calls lose() if runtime was not built with -lunwind.
+#+(and x86-64 sb-thread)
+(progn
+;; get_proc_name can slow down the unwind by 100x. Depending on whether you need
+;; every stack trace with C symbols many times quickly, or not so many times but
+;; more informatively, you'd set this off or on respectively.
+(defglobal *use-libunwind-get-proc-name* nil)
+(defun libunwind-backtrace (thread thread-sap context stream)
+  (declare (ignorable thread thread-sap))
+  (sb-alien:with-alien
+      ((get-sizeof-unw-cursor (function sb-alien:int) :extern)
+       (sb-unw-init (function sb-alien:int system-area-pointer system-area-pointer) :extern)
+       (sb-unw-get-pc (function sb-alien:int system-area-pointer (* sb-alien:unsigned)) :extern)
+       (sb-unw-get-proc-name (function sb-alien:int system-area-pointer system-area-pointer
+                                       sb-alien:int
+                                       (* sb-alien:unsigned))
+                             :extern)
+       (sb-unw-step (function sb-alien:int system-area-pointer) :extern)
+       (word sb-alien:unsigned))
+    (let* ((cursor-size (the (mod 2048) (sb-alien:alien-funcall get-sizeof-unw-cursor)))
+           (cursor (make-array cursor-size :element-type '(unsigned-byte 8)))
+           (string (make-array 127 :element-type 'base-char))
+           (n 0)
+           code)
+      (declare (dynamic-extent cursor string))
+      (aver (zerop
+             (sb-alien:alien-funcall sb-unw-init
+                                     (vector-sap cursor) (sb-alien:alien-sap context))))
+      (loop
+       (aver (zerop
+              (sb-alien:alien-funcall sb-unw-get-pc (vector-sap cursor) (sb-alien:addr word))))
+       (format stream "~D: #x~12,'0X " n word)
+       (incf n)
+       (cond ((setq code (sb-di::code-header-from-pc word))
+              (let ((pc (sap- (int-sap word) (code-instructions code))))
+                (format stream "~A"
+                        (sb-di:debug-fun-name (sb-di::debug-fun-from-pc code pc nil)))))
+             ((not *use-libunwind-get-proc-name*))
+             ((= (sb-alien:alien-funcall sb-unw-get-proc-name (vector-sap cursor)
+                                         (vector-sap string) (1+ (length string))
+                                         (sb-alien:addr word)) 0)
+              (format stream "~s + #x~x"
+                      (sb-alien::%naturalize-c-string (vector-sap string)) word))
+             (t
+              (format stream "???")))
+       (terpri stream)
+       ;; nonzero = success, 0 = failure / end-of-walk
+       (when (= (sb-alien:alien-funcall sb-unw-step (vector-sap cursor)) 0)
+         (return))))))
+
+(defun vmthread-state (vmthread)
+  ;; Refer to the definition of thread_state_word in src/runtime/genesis/thread.h
+  ;; and 'enum threadstate' in src/runtime/thread.h
+  (ecase (sap-ref-8 vmthread (+ (ash sb-vm:thread-state-word-slot sb-vm:word-shift) 2))
+    (1 :running)
+    (2 :stopped)
+    (3 :dead)))
+
+(export 'backtrace-all-threads)
+(defun backtrace-all-threads (&aux (stream (make-string-output-stream))
+                                   results)
+  (without-gcing
+      (when (sb-kernel::try-acquire-gc-lock
+             (sb-kernel::gc-stop-the-world))
+        ;; The GC's thread list is exactly what we want to traverse here
+        ;; since that is the set of threads responding to the stop signal.
+        (do ((vmthread (sb-alien:extern-alien "all_threads" system-area-pointer)
+                       (sap-ref-sap vmthread (ash sb-vm::thread-next-slot sb-vm:word-shift))))
+            ((zerop (sap-int vmthread)))
+          (let ((tls-size (sb-alien:extern-alien "dynamic_values_bytes" (sb-alien:unsigned 32)))
+                (thread-instance
+                 (sap-ref-lispobj vmthread
+                                  (ash sb-vm::thread-lisp-thread-slot sb-vm:word-shift))))
+            (cond ((eq thread-instance sb-thread:*current-thread*)
+                   (print-backtrace :stream stream))
+                  ((eq (vmthread-state vmthread) :stopped)
+                   (format stream "Backtrace for: ~S~%" thread-instance)
+                   (let* ((ici (sb-sys:sap-ref-lispobj
+                                vmthread (symbol-tls-index '*free-interrupt-context-index*)))
+                          (context-sap
+                           (sap-ref-sap vmthread
+                                        (+ tls-size (ash (1- ici) sb-vm:word-shift))))
+                          (context (sb-alien:sap-alien context-sap (* os-context-t))))
+                     (libunwind-backtrace thread-instance vmthread context stream)))))
+          (push (get-output-stream-string stream) results))
+        (sb-kernel::gc-start-the-world)))
+  results)
+) ; end PROGN

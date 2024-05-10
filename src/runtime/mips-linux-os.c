@@ -20,7 +20,7 @@
 /* for cacheflush() */
 #include <sys/cachectl.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 
@@ -58,15 +58,6 @@ os_context_fpregister_addr(os_context_t *context, int offset)
     mcontext_t *mctx = &context->uc_mcontext;
     struct sigcontext *ctx = (struct sigcontext *)mctx;
     return &ctx->sc_fpregs[offset];
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    /* Why do I get all the silly ports? -- CSR, 2002-08-11 */
-    mcontext_t *mctx = &context->uc_mcontext;
-    struct sigcontext *ctx = (struct sigcontext *)mctx;
-    return &ctx->sc_pc;
 }
 
 sigset_t *
@@ -110,10 +101,10 @@ os_context_bd_cause(os_context_t *context)
        os_context_bd_cause is also used to find out if a branch
        emulation is needed.  We work around that by checking if the
        current instruction is a jump or a branch.  */
-    extern boolean arch_insn_with_bdelay_p(unsigned int insn);
+    extern bool arch_insn_with_bdelay_p(unsigned int insn);
 
     os_vm_address_t addr
-        = (os_vm_address_t)(unsigned int)*os_context_pc_addr(context);
+        = (os_vm_address_t)(unsigned int)OS_CONTEXT_PC(context);
     unsigned int insn = *(unsigned int *)addr;
 
     if (arch_insn_with_bdelay_p(insn))

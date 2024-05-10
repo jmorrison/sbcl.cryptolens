@@ -13,13 +13,82 @@
 
 ;;;; register specs
 
+;;; Observe that [R12 + displacement] needs an extra byte of encoding in
+;;; certain addressing modes, as does [R13 + index]
+;;;     49895B08         MOV [R11+8], RBX
+;;;     49895C2408       MOV [R12+8], RBX
+;;;     49895D08         MOV [R13+8], RBX
+;;;     49891C03         MOV [R11+RAX], RBX
+;;;     49891C04         MOV [R12+RAX], RBX
+;;;     49895C0500       MOV [R13+RAX], RBX
+;;; This is because 12 and 13 are equal-mod-8 to 4 and 5, the indices of RSP
+;;; and RBP respectively, which have different behaviors in the ModRegR/M byte.
+;;; So due to lack of perfectly orthogonal encodings, it would be slightly
+;;; beneficial to hint to the register allocator that it should pick registers
+;;; 12 and 13 only when all other registers are unavailable.
+;;; And you might think that it should "work" simply to list the usable offsets
+;;; in the SC in the order in which they should be chosen when the register
+;;; allocator needs to pick the next available register, but unfortunately
+;;; it does not work to do that, because it uses bitmaps from which to pick,
+;;; and not an ordered list.
+
+;;; A register that's never used by the code generator, and can therefore
+;;; be used as an assembly temporary in cases where a VOP :TEMPORARY can't
+;;; be used.
+;;; This is only enabled for certain build configurations that need
+;;; a scratch register in various random places.
+#-ubsan (defconstant global-temp-reg nil)
+#+ubsan (progn (define-symbol-macro temp-reg-tn r11-tn)
+               (defconstant global-temp-reg 11))
+
+#+gs-seg
+(progn
+  ;; There is no permanent THREAD-TN. There are a few problems in trying
+  ;; cleverly to make PSEUDO-ATOMIC agnostic of whether you're using a global
+  ;; THREAD-TN or a local one (a global symbol macro vs. a let binding)
+  ;; 1) ECL seems to think that it is an error to LET bind a global symbol macro.
+  ;;    > (define-symbol-macro thread-tn 'wat)
+  ;;    > (defun f (&optional (thread-tn thread-tn)) (format t "Hi: ~a~%" thread-tn))
+  ;;    > (compile'f)
+  ;;    ;;; Error:
+  ;;    ;;;   * The constant THREAD-TN is being bound.
+  ;; 2) It actually doesn't completely work completely anyway,
+  ;;    because pseudo-atomic needs to know not to use a segment override,
+  ;;    and TNs don't indicate a memory segment.
+  ;; While the second problem could be solved, the first can't,
+  ;; and it's not clear to me whether ECL is wrong to say it's an error,
+  ;; or SBCL is remiss in choosing not to style-warn (which would annoy me
+  ;; for that reason).
+  ;; So we wire the thread structure to r15 within some vops when convenient.
+  ;; Wiring to r15 is not strictly necessary, but I want to see if sb-aprof
+  ;; can be made to work slightly easier regardless of #+gs-seg.
+  ;; And with 15 being the highest register number, it is the least likely
+  ;; to be picked by the register allocator for anything else.
+  ;; Additionally I'd like to have an optimization pass that avoids reloading
+  ;; r15 when consecutive allocation sequences occur in straight-line code.
+  (define-symbol-macro thread-segment-reg :gs)
+  (define-symbol-macro thread-reg nil))
+#-gs-seg
+(progn
+  (define-symbol-macro thread-segment-reg :cs)
+  ;; r13 is preferable to r12 because 12 is an alias of 4 in ModRegRM, which
+  ;; implies use of a SIB byte with no index register for fixed displacement.
+  (define-symbol-macro thread-reg 13)
+  (define-symbol-macro thread-tn r13-tn))
+
+;;; Kludge needed for decoding internal error args - we assume that the
+;;; shadow memory is pointed to by this register (RAX).
+(defconstant msan-temp-reg-number 0)
+
+;;; The encoding anomaly for r12 makes it a perfect choice for the card table base.
+;;; It will seldom be used with a constant displacement.
+(define-symbol-macro card-table-reg 12)
+(define-symbol-macro gc-card-table-reg-tn r12-tn)
+(define-symbol-macro card-index-mask (make-fixup nil :card-table-index-mask))
+
 (macrolet ((defreg (name offset size)
              (declare (ignore size))
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                    ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
-                    ;; (in the same file) depends on compile-time evaluation
-                    ;; of the DEFCONSTANT. -- AL 20010224
-                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
+             `(defconstant ,(symbolicate name "-OFFSET") ,offset))
            (defregset (name &rest regs)
              ;; FIXME: this would be DEFCONSTANT-EQX were it not
              ;; for all the style-warnings about earmuffs on a constant.
@@ -34,9 +103,7 @@
            (define-gprs (want-offsets offsets-list names array)
              `(progn
                 (defconstant-eqx ,names ,array #'equalp)
-                ;; We need the constants evaluable because of the DEFGLOBAL
-                ;; which is needed because of forms such as #.*qword-regs*
-                (eval-when (:compile-toplevel :load-toplevel :execute)
+                (progn
                   ,@(when want-offsets
                       (let ((i -1))
                         (map 'list
@@ -45,8 +112,9 @@
                              array))))
                 (defglobal ,offsets-list
                     (remove-if (lambda (x)
-                                 (member x `(,r11-offset ; temp reg
-                                             ,r13-offset ; thread base
+                                 (member x `(,global-temp-reg ; if there is one
+                                             ,thread-reg      ; if using a GPR
+                                             ,card-table-reg
                                              ,rsp-offset
                                              ,rbp-offset)))
                                (loop for i below 16 collect i))))))
@@ -99,7 +167,8 @@
   #-win32
   (defregset    *c-call-register-arg-offsets* rdi rsi rdx rcx r8 r9)
   #+win32
-  (defregset    *c-call-register-arg-offsets* rcx rdx r8 r9))
+  (defregset    *c-call-register-arg-offsets* rcx rdx r8 r9)
+  (defregset *descriptor-args* rdx rdi rsi rbx rcx r8 r9 r10 r14 r15))
 
 ;;;; SB definitions
 
@@ -111,9 +180,7 @@
 ;;; Start from 2, for the old RBP (aka OCFP) and return address
 (define-storage-base stack :unbounded :size 2 :size-increment 1)
 (define-storage-base constant :non-packed)
-(define-storage-base immediate-constant :non-packed)
-(define-storage-base noise :unbounded :size 2)
-)
+(define-storage-base immediate-constant :non-packed))
 
 ;;;; SC definitions
 
@@ -168,12 +235,6 @@
   (double-avx2-stack stack :element-size 4)
   #+sb-simd-pack-256
   (single-avx2-stack stack :element-size 4)
-
-  ;;
-  ;; magic SCs
-  ;;
-
-  (ignore-me noise)
 
   ;;
   ;; things that can go in the integer registers
@@ -274,9 +335,9 @@
                   :constant-scs (single-sse-immediate)
                   :save-p t
                   :alternate-scs (single-sse-stack))
-  #+avx2
-  (avx2-reg float-registers
-   :locations #.*float-regs*)
+  (ymm-reg float-registers :locations #.*float-regs*)
+  ;; These next 3 should probably be named to YMM-{INT,SINGLE,DOUBLE}-REG
+  ;; but I think there are 3rd-party libraries that expect these names.
   #+sb-simd-pack-256
   (int-avx2-reg float-registers
                :locations #.*float-regs*
@@ -315,7 +376,7 @@
 (defparameter *oword-sc-names* '(sse-reg int-sse-reg single-sse-reg double-sse-reg
                                  int-sse-stack single-sse-stack double-sse-stack))
 #+sb-simd-pack-256
-(defparameter *hword-sc-names* '(avx2-reg int-avx2-reg single-avx2-reg double-avx2-reg
+(defparameter *hword-sc-names* '(ymm-reg int-avx2-reg single-avx2-reg double-avx2-reg
                                    int-avx2-stack single-avx2-stack double-avx2-stack))
 ) ; EVAL-WHEN
 (!define-storage-classes
@@ -377,11 +438,6 @@
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'stack)))
 
-;; A register that's never used by the code generator, and can therefore
-;; be used as an assembly temporary in cases where a VOP :TEMPORARY can't
-;; be used.
-(define-symbol-macro temp-reg-tn r11-tn)
-
 ;;; TNs for registers used to pass arguments
 ;;; This can't be a DEFCONSTANT-EQX, for a similar reason to above, but worse.
 ;;; Among the problems, RECEIVE-UNKNOWN-VALUES uses (FIRST *REGISTER-ARG-TNS*)
@@ -393,10 +449,6 @@
             (symbol-value (symbolicate register-arg-name "-TN")))
           *register-arg-names*))
 
-;; r13 is preferable to r12 because 12 is an alias of 4 in ModRegRM, which
-;; implies use of a SIB byte with no index register for fixed displacement.
-(define-symbol-macro thread-base-tn r13-tn)
-
 ;;; If value can be represented as an immediate constant, then return
 ;;; the appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
@@ -405,28 +457,19 @@
          character)
      immediate-sc-number)
     (symbol ; Symbols in static and immobile space are immediate
-     (when (or ;; With #+immobile-symbols, all symbols are in immobile-space.
-               ;; And the cross-compiler always uses immobile-space if enabled.
-               #+(or immobile-symbols (and immobile-space sb-xc-host)) t
-
-               ;; Otherwise, if #-immobile-symbols, and the symbol was present
-               ;; in the initial core image as indicated by the symbol header, then
-               ;; it's in immobile-space. There is a way in which the bit can be wrong,
-               ;; but it's highly unlikely - the symbol would have to be uninterned from
-               ;; the loading SBCL, reallocated in dynamic space and re-interned into its
-               ;; initial package. All without breaking anything. Hence, unlikely.
-               ;; Also note that if compiling to memory, the symbol's current address
-               ;; is used to determine whether it's immediate.
-               #+(and (not sb-xc-host) immobile-space (not immobile-symbols))
-               (or (logbitp +initial-core-symbol-bit+ (get-header-data value))
-                   (and (sb-c::core-object-p sb-c::*compile-object*)
-                        (immobile-space-obj-p value)))
-
-               (static-symbol-p value))
+     (when (or (static-symbol-p value)
+               ;; The cross-compiler always uses immobile-space if it exists.
+               #+(and immobile-space sb-xc-host) t
+               ;; With #+immobile-symbols, all interned symbols are in immobile-space.
+               #+immobile-symbols (sb-xc:symbol-package value)
+               #-sb-xc-host
+               (if (immobile-space-obj-p value)
+                   (or (= (generation-of value) +pseudo-static-generation+)
+                       ;; If compiling to memory, the symbol's address alone suffices.
+                       (locally (declare (notinline sb-c::producing-fasl-file))
+                         (not (sb-c::producing-fasl-file))))))
        immediate-sc-number))
-    #+immobile-space
-    (layout
-       immediate-sc-number)
+    #+compact-instance-header (layout immediate-sc-number)
     (single-float
        (if (eql value $0f0) fp-single-zero-sc-number fp-single-immediate-sc-number))
     (double-float
@@ -439,18 +482,23 @@
        (if (eql value (complex $0d0 $0d0))
             fp-complex-double-zero-sc-number
             fp-complex-double-immediate-sc-number))
+    ;; This case has to follow the numeric cases because proxy floating-point numbers
+    ;; are host structs. Or we could implement and use something like SB-XC:TYPECASE
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))
     #+(and sb-simd-pack (not sb-xc-host))
-    ((simd-pack double-float) double-sse-immediate-sc-number)
-    #+(and sb-simd-pack (not sb-xc-host))
-    ((simd-pack single-float) single-sse-immediate-sc-number)
-    #+(and sb-simd-pack (not sb-xc-host))
-    (simd-pack int-sse-immediate-sc-number)
+    (simd-pack
+     (typecase value
+       ((simd-pack double-float) double-sse-immediate-sc-number)
+       ((simd-pack single-float) single-sse-immediate-sc-number)
+       (t int-sse-immediate-sc-number)))
     #+(and sb-simd-pack-256 (not sb-xc-host))
-    ((simd-pack-256 double-float) double-avx2-immediate-sc-number)
-    #+(and sb-simd-pack-256 (not sb-xc-host))
-    ((simd-pack-256 single-float) single-avx2-immediate-sc-number)
-    #+(and sb-simd-pack-256 (not sb-xc-host))
-    (simd-pack-256 int-avx2-immediate-sc-number)))
+    (simd-pack-256
+     (typecase value
+       ((simd-pack-256 double-float) double-avx2-immediate-sc-number)
+       ((simd-pack-256 single-float) single-avx2-immediate-sc-number)
+       (t int-avx2-immediate-sc-number)))))
 
 (defun boxed-immediate-sc-p (sc)
   (eql sc immediate-sc-number))
@@ -463,13 +511,22 @@
           (symbol   (if (static-symbol-p val)
                         (+ nil-value (static-symbol-offset val))
                         (make-fixup val :immobile-symbol)))
-          #+immobile-space
+          #+(or immobile-space permgen)
           (layout
            (make-fixup val :layout))
           (character (if tag
                          (logior (ash (char-code val) n-widetag-bits)
                                  character-widetag)
-                         (char-code val)))))
+                         (char-code val)))
+          (single-float
+           (let ((bits (single-float-bits val)))
+             (if tag
+                 (dpb bits (byte 32 32) single-float-widetag)
+                 bits)))
+          (structure-object
+           (if (eq val sb-lockless:+tail+)
+               (progn (aver tag) (+ static-space-start lockfree-list-tail-value-offset))
+               (bug "immediate structure-object ~S" val)))))
       tn))
 
 ;;;; miscellaneous function call parameters
@@ -506,7 +563,16 @@
          (sb (sb-name (sc-sb sc)))
          (offset (tn-offset tn)))
     (ecase sb
-      (registers (reg-name (tn-reg tn)))
+      (registers
+       (concatenate 'string
+                    (reg-name (tn-reg tn))
+                    (case (sc-name (tn-sc tn))
+                      (descriptor-reg "(d)")
+                      (any-reg "(a)")
+                      (unsigned-reg "(u)")
+                      (signed-reg "(s)")
+                      (sap-reg "(p)")
+                      (t "(?)"))))
       (float-registers (format nil "FLOAT~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))
@@ -516,30 +582,28 @@
 (defconstant nargs-offset rcx-offset)
 (defconstant cfp-offset rbp-offset) ; pfw - needed by stuff in /code
 
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node))
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((or (valid-funtype '(fixnum fixnum) '*)
-              ;; todo: nothing prevents this from testing an unsigned word against
-              ;; a signed word, except for the mess of VOPs it would demand
-              (valid-funtype '((signed-byte 64) (signed-byte 64)) '*)
-              (valid-funtype '((unsigned-byte 64) (unsigned-byte 64)) '*))
-          (values :maybe nil))
-         (t
-          (values :default nil))))
-      (logbitp
-       (if (or
-            (valid-funtype '((mod 64) word) '*)
-            (valid-funtype '((mod 64) signed-word) '*))
-           (values :transform '(lambda (index integer) (%logbitp index integer)))
-           (values :default nil)))
-      (t
-       (values :default nil)))))
+(defvar *register-names* +qword-register-names+)
 
-(defparameter *register-names* +qword-register-names+)
+;;; See WRITE-FUNINSTANCE-PROLOGUE in x86-64-vm.
+;;; There are 4 bytes available in the imm32 operand of a dummy MOV instruction.
+;;; (It's a valid instruction on the theory that illegal opcodes might cause
+;;; the decode stage in the CPU to behave suboptimally)
+(defmacro compact-fsc-instance-hash (fin)
+  `(sap-ref-32 (int-sap (get-lisp-obj-address ,fin))
+               (+ (ash 3 word-shift) 4 (- fun-pointer-lowtag))))
+
+(eval-when (:compile-toplevel)
+  (let ((locs (sb-c::sc-locations (gethash 'any-reg sb-c:*backend-sc-names*))))
+    ;; These locations are not saved by WITH-REGISTERS-PRESERVED
+    ;; because Lisp can't treat them as general purpose.
+    ;; By design they are also (i.e. must be) nonvolatile aross C call.
+    (aver (not (logbitp 12 locs)))
+    #-gs-seg (aver (not (logbitp 13 locs)))))
+
+#+sb-xc-host
+(setq *backend-cross-foldable-predicates*
+      '(power-of-two-p))
+
+#+nil
+(define-cond-sc 32-bit-immediate immediate
+  (typep (tn-value tn) '(signed-byte 32)))

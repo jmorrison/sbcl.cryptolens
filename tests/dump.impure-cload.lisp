@@ -15,6 +15,7 @@
   (load "compiler-test-util.lisp"))
 
 (declaim (optimize (debug 3) (speed 2) (space 1)))
+(declaim (muffle-conditions compiler-note))
 
 ;;; this would fail an AVER in NOTE-POTENTIAL-CIRCULARITY
 (defparameter *circular-2d-array* #1=#2A((a b) (#1# x)))
@@ -222,11 +223,19 @@
         (setf (s1-kids b) (list k1 (make-s2 :id 'b-kid2 :parent b))
               (s1-kids c) (list k2)
               (s1-friends a) (list* b c (circular-list a))
-              (s1-friends b) (list a c)
+              (s1-friends b) (list c a)
               (s1-friends c) (list a b))
         (list a b c))))
 
 )) ; end EVAL-WHEN
+
+(defun load-form-is-default-mlfss-p (object)
+  (multiple-value-bind (creation-form init-form)
+      (make-load-form object)
+    (multiple-value-bind (ss-creation-form ss-init-form)
+        (make-load-form-saving-slots object)
+      (and (equal creation-form ss-creation-form)
+           (equal init-form ss-init-form)))))
 
 ;; Redefine the MAKE-LOAD-FORM method on FOO.
 (remove-method #'make-load-form (find-method #'make-load-form nil (list 'foo)))
@@ -240,13 +249,13 @@
   (let ((foo (make-foo :x 'x :y 'y)))
     (flet ((assert-canonical (slots)
              (let ((*foo-save-slots* slots))
-               (assert (sb-fasl:load-form-is-default-mlfss-p foo)))))
+               (assert (load-form-is-default-mlfss-p foo)))))
       (assert-canonical :all)
       (assert-canonical '(x y)) ; specifying all slots explicitly is still canonical
       (assert-canonical '(y x)))
     ;; specifying only one slot is not canonical
-    (assert (equal (let ((*foo-save-slots* '(x))) (sb-c::%make-load-form foo))
-                   '(sb-kernel::new-struct foo)))))
+    (let ((*foo-save-slots* '(x)))
+      (assert (not (load-form-is-default-mlfss-p foo))))))
 
 ;; A huge constant vector. This took 9 seconds to compile (on a MacBook Pro)
 ;; prior to the optimization for using fops to dump.
@@ -335,7 +344,7 @@
 
 ;; Track the make-load-form FOPs as they fly by at load-time.
 (defvar *call-tracker* nil)
-(dolist (fop-name 'sb-fasl::(fop-allocate-instance fop-set-slot-values))
+(dolist (fop-name '(sb-fasl::fop-instance))
   (let* ((index (position fop-name sb-fasl::**fop-funs**
                           :key
                           (lambda (x) (and (functionp x) (sb-kernel:%fun-name x)))))
@@ -354,8 +363,7 @@
         (b p q r s)
         (c d e g))))
 
-(assert (= 14 (count 'sb-fasl::fop-allocate-instance *call-tracker*)))
-(assert (= 14 (count 'sb-fasl::fop-set-slot-values *call-tracker*)))
+(assert (= 14 (count 'sb-fasl::fop-instance *call-tracker*)))
 
 (with-test (:name :tree-with-parent-m-l-f-s-s)
   (verify-tree *y*))
@@ -422,6 +430,17 @@
     (assert (eq (aref pairs 2) 'first))
     (assert (eq (aref pairs 4) 'second))))
 
+(defun int= (a b) (= (the integer a) (the integer b)))
+(define-hash-table-test int= sb-impl::number-sxhash)
+(defun get-sync-hash-table () #.(make-hash-table :synchronized t))
+(with-test (:name :dump-hash-tables)
+  ;; Don't lose the :synchronized option.
+  (assert (hash-table-synchronized-p (get-sync-hash-table)))
+  ;; Disallow nonstandard hash that disagrees with test.
+  (assert-error (make-load-form (make-hash-table :test 'int= :hash-function 'sxhash)))
+  ;; Allow nonstandard test as long as it was registered
+  (assert (make-load-form (make-hash-table :test 'int=))))
+
 (defun list-coalescing-test-fun-1 ()
   (declare (optimize (debug 1)))
   ;; base coalesces with base, non-base coalesces with non-base
@@ -474,6 +493,7 @@
     (assert (cadr z))))
 
 (macrolet ((expand ()
+             (declare (muffle-conditions compiler-note)) ; why is DECLAIM not enough?
              `(progn
                 ,@(loop for i from 0 below sb-vm:n-word-bits
                         collect
@@ -514,3 +534,44 @@
 
 (with-test (:name :coalesce-numeric-arrays)
   (assert (eq (use-numeric-vector-a) (use-numeric-vector-b))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defstruct person id)
+(defstruct (spy (:include person (id "   " :type (simple-string 2)))) gadgetry)
+(defmethod make-load-form ((self spy) &optional environment)
+  (declare (ignore environment))
+  (make-load-form-saving-slots self)))
+
+(defvar *agent* #.(let ((s (make-spy :id "86" :gadgetry '(shoe-phone))))
+                    (setf (person-id s) "max")
+                    s))
+
+;;; If lp#1969318 is fixed, then *AGENT* should not be reconstructed
+;;; from its load form, let alone dumped in the first place.
+;;; But thankfully we trap the read of the ID slot.
+(with-test (:name :illegal-typed-slot-value)
+  (assert-error (spy-id *agent*)))
+
+(defun eq-cdr-constants-coalescing ()
+  (values
+   '(a (x . #1=(c)) #1# a)
+   '(b (x . #2=(c)) #2# b)))
+
+(with-test (:name :eq-cdr-constants-coalescing)
+  (multiple-value-bind (a b)
+      (funcall 'eq-cdr-constants-coalescing)
+    (assert (eq (cdadr a) (caddr a)))
+    (assert (eq (cdadr b) (caddr b)))))
+
+(with-test (:name :circularity-within-non-simple-array)
+  (let ((a #.(make-array 2 :adjustable t
+                           :initial-element '#1=(#1#))))
+    (assert (eq (aref (opaque-identity a) 0)
+                (car (aref (opaque-identity a) 0))))
+    (assert (eq (aref (opaque-identity a) 0)
+                (aref (opaque-identity a) 1)))))
+
+(with-test (:name :non-simple-array-constant-folding)
+  (let ((x #.(make-array 10 :fill-pointer 5)))
+    (assert (= (array-total-size x)
+               (array-total-size (opaque-identity x))))))

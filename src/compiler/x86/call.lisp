@@ -14,28 +14,8 @@
 (defconstant arg-count-sc (make-sc+offset any-reg-sc-number ecx-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number eax-offset))
 
-;;; Make a passing location TN for a local call return PC.
-;;;
-;;; Always wire the return PC location to the stack in its standard
-;;; location.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
-                 sap-stack-sc-number return-pc-save-offset))
-
 (defconstant return-pc-passing-offset
   (make-sc+offset sap-stack-sc-number return-pc-save-offset))
-
-;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
-;;; location to pass OLD-FP in.
-;;;
-;;; This is wired in both the standard and the local-call conventions,
-;;; because we want to be able to assume it's always there. Besides,
-;;; the x86 doesn't have enough registers to really make it profitable
-;;; to pass it in a register.
-(defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
-                 ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset control-stack-sc-number ocfp-save-offset))
@@ -46,16 +26,17 @@
 ;;;
 ;;; Without using a save-tn - which does not make much sense if it is
 ;;; wired to the stack?
-(defun make-old-fp-save-location (physenv)
-  (physenv-debug-live-tn (make-wired-tn *fixnum-primitive-type*
-                                        control-stack-sc-number
-                                        ocfp-save-offset)
-                         physenv))
-(defun make-return-pc-save-location (physenv)
-  (physenv-debug-live-tn
-   (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
-                  sap-stack-sc-number return-pc-save-offset)
-   physenv))
+(defun make-old-fp-save-location ()
+  (let ((tn (make-wired-tn *fixnum-primitive-type*
+                           control-stack-sc-number
+                           ocfp-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
+(defun make-return-pc-save-location ()
+  (let ((tn (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
+                           sap-stack-sc-number return-pc-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
 
 ;;; Make a TN for the standard argument count passing location. We only
 ;;; need to make the standard location, since a count is never passed when we
@@ -725,13 +706,10 @@
 ;;; In tail call with fixed arguments, the passing locations are
 ;;; passed as a more arg, but there is no new-FP, since the arguments
 ;;; have been set up in the current frame.
-(macrolet ((define-full-call (name named return variable)
-            (aver (not (and variable (eq return :tail))))
-            `(define-vop (,name
-                          ,@(when (eq return :unknown)
-                              '(unknown-values-receiver)))
-               (:args
-               ,@(unless (eq return :tail)
+(defmacro define-full-call (name named return variable)
+  (aver (not (and variable (eq return :tail))))
+  `(define-vop (,name ,@(when (eq return :unknown) '(unknown-values-receiver)))
+     (:args    ,@(unless (eq return :tail)
                    '((new-fp :scs (any-reg) :to (:argument 1))))
                ,@(unless (eq named :direct)
                    '((fun :scs (descriptor-reg control-stack)
@@ -741,26 +719,24 @@
                    '((old-fp)
                      (return-pc)))
 
-               ,@(unless variable '((args :more t :scs (descriptor-reg)))))
+               ,@(unless variable '((args :more t :scs (descriptor-reg control-stack)))))
 
                ,@(when (eq return :fixed)
                '((:results (values :more t))))
 
-               (:save-p ,(if (eq return :tail) :compute-only t))
+     (:save-p ,(if (eq return :tail) :compute-only t))
 
-               ,@(unless (or (eq return :tail) variable)
-               '((:move-args :full-call)))
+     ,@(unless (or (eq return :tail) variable)
+         '((:move-args :full-call)))
 
-               (:vop-var vop)
-               (:info
-               ,@(unless (or variable (eq return :tail)) '(arg-locs))
+     (:vop-var vop)
+     (:info    ,@(unless (or variable (eq return :tail)) '(arg-locs))
                ,@(unless variable '(nargs))
                ,@(when (eq named :direct) '(fun))
                ,@(when (eq return :fixed) '(nvals))
                step-instrumenting)
 
-               (:ignore
-               ,@(unless (or variable (eq return :tail)) '(arg-locs))
+     (:ignore  ,@(unless (or variable (eq return :tail)) '(arg-locs))
                ,@(unless variable '(args))
                ,@(when (eq named :direct) '(step-instrumenting)))
 
@@ -770,69 +746,58 @@
                ;; with the real function and invoke the real function
                ;; for closures. Non-closures do not need this value,
                ;; so don't care what shows up in it.
-               ,@(unless (eq named :direct)
-                   '((:temporary
-                      (:sc descriptor-reg
-                       :offset eax-offset
-                       :from (:argument 0)
-                       :to :eval)
-                      eax)))
+     ,@(unless (eq named :direct)
+         '((:temporary
+            (:sc descriptor-reg :offset eax-offset :from (:argument 0) :to :eval) eax)))
 
-               ;; We pass the number of arguments in ECX.
-               (:temporary (:sc unsigned-reg :offset ecx-offset :to :eval) ecx)
+     ;; We pass the number of arguments in ECX.
+     (:temporary (:sc unsigned-reg :offset ecx-offset :to :eval) ecx)
 
                ;; With variable call, we have to load the
                ;; register-args out of the (new) stack frame before
                ;; doing the call. Therefore, we have to tell the
                ;; lifetime stuff that we need to use them.
-               ,@(when variable
-                   (mapcar (lambda (name offset)
-                             `(:temporary (:sc descriptor-reg
-                                               :offset ,offset
-                                               :from (:argument 0)
-                                               :to :eval)
-                                          ,name))
-                           *register-arg-names* *register-arg-offsets*))
+     ,@(when variable
+         (mapcar (lambda (name offset)
+                   `(:temporary (:sc descriptor-reg
+                                 :offset ,offset
+                                 :from (:argument 0)
+                                 :to :eval)
+                                ,name))
+                 *register-arg-names* *register-arg-offsets*))
 
-               ,@(when (eq return :tail)
-                   '((:temporary (:sc unsigned-reg
-                                      :from (:argument 1)
-                                      :to (:argument 2))
-                                 old-fp-tmp)))
-               ,@(unless (eq return :tail)
-                   '((:node-var node)))
+     ,@(when (eq return :tail)
+         '((:temporary (:sc unsigned-reg :from (:argument 1) :to (:argument 2))
+            old-fp-tmp)))
+     ,@(unless (eq return :tail) '((:node-var node)))
 
-               (:generator ,(+ (if named 5 0)
-                               (if variable 19 1)
-                               (if (eq return :tail) 0 10)
-                               15
-                               (if (eq return :unknown) 25 0))
+     (:generator ,(+ (if named 5 0)
+                     (if variable 19 1)
+                     (if (eq return :tail) 0 10)
+                     15
+                     (if (eq return :unknown) 25 0))
 
                ;; This has to be done before the frame pointer is
                ;; changed! EAX stores the 'lexical environment' needed
                ;; for closures.
-               ,@(unless (eq named :direct)
-                   '((move eax fun)))
-               ,@(if variable
+       ,@(unless (eq named :direct) '((move eax fun)))
+
+       ,@(if variable
                      ;; For variable call, compute the number of
                      ;; arguments and move some of the arguments to
                      ;; registers.
-                     (collect ((noise))
-                              ;; Compute the number of arguments.
-                              (noise '(inst mov ecx new-fp))
-                              (noise '(inst sub ecx esp-tn))
+             `((inst mov ecx new-fp)
+               (inst sub ecx esp-tn)
                               ;; Move the necessary args to registers,
                               ;; this moves them all even if they are
                               ;; not all needed.
-                              (loop
-                               for name in *register-arg-names*
-                               for index downfrom -1
-                               do (noise `(loadw ,name new-fp ,index)))
-                              (noise))
-                   '((if (zerop nargs)
-                         (inst xor ecx ecx)
-                       (inst mov ecx (fixnumize nargs)))))
-               ,@(cond ((eq return :tail)
+               ,@(loop for name in *register-arg-names*
+                       for index downfrom -1
+                       collect `(loadw ,name new-fp ,index)))
+             '((if (zerop nargs)
+                   (inst xor ecx ecx)
+                   (inst mov ecx (fixnumize nargs)))))
+       ,@(cond ((eq return :tail)
                         '(;; Python has figured out what frame we should
                           ;; return to so might as well use that clue.
                           ;; This seems really important to the
@@ -868,7 +833,7 @@
                           ;; return-pc so that it looks like we CALLed
                           ;; despite the fact that we are going to JMP.
                           (inst push return-pc)))
-                       (t
+               (t
                         ;; For non-tail call, we have to save our
                         ;; frame pointer and install the new frame
                         ;; pointer. We can't load stack tns after this
@@ -895,47 +860,42 @@
                                   (frame-word-offset ocfp-save-offset))
 
                           (move ebp-tn new-fp))))  ; NB - now on new stack frame.
-               ,@(unless (eq named :direct)  ;; handle-single-step-around-trap can't handle it
-                   `((when step-instrumenting
-                       (emit-single-step-test)
-                       (inst jmp :eq DONE)
-                       (inst break single-step-around-trap))))
-               DONE
+       ,@(unless (eq named :direct)  ;; handle-single-step-around-trap can't handle it
+           `((when step-instrumenting
+               (emit-single-step-test)
+               (inst jmp :eq DONE)
+               (inst break single-step-around-trap))))
+       DONE
 
-               (note-this-location vop :call-site)
+       (note-this-location vop :call-site)
 
-               (inst ,(if (eq return :tail) 'jmp 'call)
-                     ,(case named
-                        (:direct
-                         '(make-ea :dword :disp
-                           (+ nil-value (static-fun-offset fun))))
-                        ((t)
-                         '(object-slot-ea eax fdefn-raw-addr-slot
-                           other-pointer-lowtag))
-                        ((nil)
-                         '(object-slot-ea eax closure-fun-slot
-                           fun-pointer-lowtag))))
-               ,@(ecase return
-                   (:fixed
-                    '((default-unknown-values vop values nvals node)))
-                   (:unknown
-                    '((note-this-location vop :unknown-return)
-                      (receive-unknown-values values-start nvals start count
-                                              node)))
-                   (:tail))))))
+       (inst ,(if (eq return :tail) 'jmp 'call)
+         ,(case named
+            (:direct
+             '(make-ea :dword :disp (+ nil-value (static-fun-offset fun))))
+            ((t)
+             '(object-slot-ea eax fdefn-raw-addr-slot other-pointer-lowtag))
+            ((nil)
+             '(object-slot-ea eax closure-fun-slot fun-pointer-lowtag))))
+       ,@(ecase return
+           (:fixed '((default-unknown-values vop values nvals node)))
+           (:unknown
+            '((note-this-location vop :unknown-return)
+              (receive-unknown-values values-start nvals start count node)))
+           (:tail)))))
 
-  (define-full-call call nil :fixed nil)
-  (define-full-call call-named t :fixed nil)
-  (define-full-call static-call-named :direct :fixed nil)
-  (define-full-call multiple-call nil :unknown nil)
-  (define-full-call multiple-call-named t :unknown nil)
-  (define-full-call static-multiple-call-named :direct :unknown nil)
-  (define-full-call tail-call nil :tail nil)
-  (define-full-call tail-call-named t :tail nil)
-  (define-full-call static-tail-call-named :direct :tail nil)
+(define-full-call call nil :fixed nil)
+(define-full-call call-named t :fixed nil)
+(define-full-call static-call-named :direct :fixed nil)
+(define-full-call multiple-call nil :unknown nil)
+(define-full-call multiple-call-named t :unknown nil)
+(define-full-call static-multiple-call-named :direct :unknown nil)
+(define-full-call tail-call nil :tail nil)
+(define-full-call tail-call-named t :tail nil)
+(define-full-call static-tail-call-named :direct :tail nil)
 
-  (define-full-call call-variable nil :fixed t)
-  (define-full-call multiple-call-variable nil :unknown t))
+(define-full-call call-variable nil :fixed t)
+(define-full-call multiple-call-variable nil :unknown t)
 
 ;;; This is defined separately, since it needs special code that BLT's
 ;;; the arguments down. All the real work is done in the assembly
@@ -1337,49 +1297,56 @@
 (define-vop ()
   (:translate %listify-rest-args)
   (:policy :safe)
-  (:args (context :scs (descriptor-reg) :target src)
+  ;; CONTEXT is used throughout the copying loop
+  (:args (context :scs (descriptor-reg) :to :save)
          (count :scs (any-reg) :target ecx))
   (:arg-types * tagged-num)
-  (:temporary (:sc unsigned-reg :offset esi-offset :from (:argument 0)) src)
+  ;; The only advantage to specifying ECX here is that JECXZ can be used
+  ;; in one place, and then only in the unlikely scenario that CONTEXT is not
+  ;; in ECX. If it was, SHL sets/clears the Z flag, but LEA doesn't.
+  ;; Not much of an advantage, but why not.
   (:temporary (:sc unsigned-reg :offset ecx-offset :from (:argument 1)) ecx)
-  (:temporary (:sc unsigned-reg :offset eax-offset) eax)
-  (:temporary (:sc unsigned-reg) dst)
+  ;; Note that DST conflicts with RESULT because we use both as temps
+  (:temporary (:sc unsigned-reg ) value dst)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 20
-    (let ((enter (gen-label))
-          (loop (gen-label))
+    (let ((loop (gen-label))
           (done (gen-label))
           (stack-allocate-p (node-stack-allocate-p node)))
-      (move src context)
-      (move ecx count)
-      ;; Check to see whether there are no args, and just return NIL if so.
+      ;; Compute the number of bytes to allocate
+      (let ((shift (- (1+ word-shift) n-fixnum-tag-bits)))
+        (if (location= count ecx)
+            (inst shl ecx shift)
+            (inst lea ecx (make-ea :dword :index count :scale (ash 1 shift)))))
+      ;; Setup for the CDR of the last cons (or the entire result) being NIL.
       (inst mov result nil-value)
-      (inst test ecx ecx)
-      (inst jmp :z done)
-      (inst lea dst (make-ea :dword :base ecx :index ecx))
+      (inst jecxz DONE)
       (pseudo-atomic (:elide-if stack-allocate-p)
-        (allocation 'list dst list-pointer-lowtag node stack-allocate-p dst)
-        ;; Set up the result.
-        (move result dst)
-        ;; Jump into the middle of the loop, 'cause that's where we want
-        ;; to start.
-        (inst jmp enter)
-        (emit-label loop)
-        ;; Compute a pointer to the next cons.
-        (inst add dst (* cons-size n-word-bytes))
-        ;; Store a pointer to this cons in the CDR of the previous cons.
-        (storew dst dst -1 list-pointer-lowtag)
-        (emit-label enter)
-        ;; Grab one value and stash it in the car of this cons.
-        (inst mov eax (make-ea :dword :base src))
-        (inst sub src n-word-bytes)
-        (storew eax dst 0 list-pointer-lowtag)
-        ;; Go back for more.
-        (inst sub ecx n-word-bytes)
-        (inst jmp :nz loop)
-        ;; NIL out the last cons.
-        (storew nil-value dst 1 list-pointer-lowtag))
+       ;; Produce an untagged pointer into DST
+       (allocation 'list ecx 0 node stack-allocate-p dst)
+       ;; Recalculate DST as a tagged pointer to the last cons
+       (inst lea dst (make-ea :dword :disp (- list-pointer-lowtag (* cons-size n-word-bytes))
+                              :base dst :index ecx))
+       (inst shr ecx (1+ word-shift)) ; convert bytes to number of cells
+       ;; The rightmost arguments are at lower addresses.
+       ;; Start by indexing the last argument
+       (inst neg ecx)
+       (emit-label LOOP)
+       ;; Grab one value and store into this cons. Use ECX as an index into the
+       ;; vector of values in CONTEXT, but add 4 because CONTEXT points exactly at
+       ;; the 0th value, which means that the index is 1 word too low.
+       ;; (It's -1 if there is exactly 1 value, instead of 0, and so on)
+       (inst mov value (make-ea :dword :disp 4 :base context :index ecx :scale 4))
+       ;; RESULT began as NIL which gives the correct value for the CDR in the final cons.
+       ;; Subsequently it points to each cons just populated, which is correct all the way
+       ;; up to and including the final result.
+       (storew result dst cons-cdr-slot list-pointer-lowtag)
+       (storew value dst cons-car-slot list-pointer-lowtag)
+       (inst mov result dst) ; preserve the value to put in the CDR of the preceding cons
+       (inst sub dst (* cons-size n-word-bytes)) ; get the preceding cons
+       (inst inc ecx)
+       (inst jmp :nz loop))
       (emit-label done))))
 
 ;;; Return the location and size of the &MORE arg glob created by

@@ -64,6 +64,7 @@
 ;;;; Subsequences of the cache vector are called cache lines.
 ;;;;
 
+(declaim (inline %copy-cache))
 (defstruct (cache (:constructor %make-cache)
                   (:copier %copy-cache))
   ;; Number of keys the cache uses.
@@ -90,6 +91,15 @@
   (depth 0 :type index)
   ;; Maximum allowed probe-depth before the cache needs to expand.
   (limit 0 :type index))
+;;; There is no syntax to freeze a type before the copier function
+;;; is defined. That's sad, because it means that the global defun
+;;; for %COPY-CACHE does *not* inline its allocator, for two different reasons:
+;;; 1. the DEFSTRUCT-DESCRIPTION doesn't exist yet
+;;; 2. the classoid isn't in sealed state when the DEFUN occurs
+;;; (i.e. those are generally true of any defstruct form)
+;;; However, all other uses of %COPY-CACHE aside from the global one
+;;; _are_ inlined. So we're ok- we get the desired result, unless
+;;; somebody funcalls #'%copy-cache, which nobody does.
 (declaim (freeze-type cache))
 
 (defun compute-cache-mask (vector-length line-size)
@@ -124,7 +134,7 @@
 
 ;;; Return VALUE if it is not the unbound marker, otherwise executes ELSE:
 (defmacro non-empty-or (value else)
-  (with-unique-names (n-value)
+  (let ((n-value '#:val))
     `(let ((,n-value ,value))
        (if (unbound-marker-p ,n-value)
            ,else
@@ -171,6 +181,7 @@
 
 ;;; The hash values are specifically designed so that LOGAND of all hash
 ;;; inputs is zero if and only if at least one hash is invalid.
+(eval-when (:compile-toplevel :load-toplevel :execute)
 (defun cache-mixer-expression (operator operands associativep)
   (named-let recurse ((operands operands))
     (let ((n (length operands)))
@@ -187,7 +198,7 @@
                            ,(recurse (subseq operands half-n)))))
             (t
              (recurse (cons `(,operator ,(first operands) ,(second operands))
-                            (cddr operands))))))))
+                            (cddr operands)))))))))
 
 ;;; Emit code that does lookup in cache bound to CACHE-VAR using
 ;;; layouts bound to LAYOUT-VARS. Go to MISS-TAG on event of a miss or
@@ -197,12 +208,18 @@
 ;;; In other words, produces inlined code for COMPUTE-CACHE-INDEX when
 ;;; number of keys and presence of values in the cache is known
 ;;; beforehand.
+(eval-when (:compile-toplevel :load-toplevel :execute)
 (defun emit-cache-lookup (cache-var layout-vars miss-tag value-var)
-  (declare (muffle-conditions code-deletion-note))
-  (with-unique-names (probe n-vector n-depth n-mask
+  (multiple-value-bind (probe n-vector n-depth n-mask
                       MATCH-WRAPPERS EXIT-WITH-HIT)
+      (values '#:probe '#:vect '#:depth '#:mask '#:try '#:hit)
     (let* ((num-keys (length layout-vars))
-           (hash-vars (make-gensym-list num-keys))
+           ;; just to avoid always freshly gensym'ing everything
+           (premade-hash-vars #(#:H0 #:H1 #:H2 #:H3 #:H4 #:H5))
+           (hash-vars (loop for i from 0 below num-keys
+                            collect (if (< i (length premade-hash-vars))
+                                        (aref premade-hash-vars i)
+                                        (make-symbol (format nil "H~D" i)))))
            (pointer
             ;; We don't need POINTER if the cache has 1 key and no value,
             ;; or if FOLD-INDEX-ADDRESSING is supported, in which case adding
@@ -247,7 +264,7 @@
             (setf ,probe (next-cache-index ,n-mask ,probe ,line-size))
             ,@(if pointer `((setf ,pointer ,probe)))
             (go ,MATCH-WRAPPERS)
-            ,EXIT-WITH-HIT)))))
+            ,EXIT-WITH-HIT))))))
 
 ;;; Probes CACHE for LAYOUTS.
 ;;;
@@ -359,6 +376,36 @@
         ;; Make a smaller one, then
         (make-cache :key-count key-count :value value :size (ceiling size 2)))))
 
+(defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
+  `(dotimes (,var (the fixnum ,count) ,result)
+     (declare (fixnum ,var))
+     ,@body))
+
+(define-load-time-global *pcl-misc-random-state* (make-random-state))
+
+(declaim (inline random-fixnum))
+(defun random-fixnum ()
+  (random (1+ most-positive-fixnum)
+          (load-time-value *pcl-misc-random-state*)))
+
+;;; Lambda which executes its body (or not) randomly. Used to drop
+;;; random cache entries.
+;;; This formerly punted with slightly greater than 50% probability,
+;;; and there was a periodicity to the nonrandomess.
+;;; If that was intentional, it should have been commented to that effect.
+(defmacro randomly-punting-lambda (lambda-list &body body)
+  (with-unique-names (drops drop-pos)
+    `(let ((,drops (random-fixnum)) ; means a POSITIVE fixnum
+           (,drop-pos sb-vm:n-positive-fixnum-bits))
+       (declare (fixnum ,drops)
+                (type (mod #.sb-vm:n-fixnum-bits) ,drop-pos))
+       (lambda ,lambda-list
+         (when (logbitp (the unsigned-byte (decf ,drop-pos)) ,drops)
+           (locally ,@body))
+         (when (zerop ,drop-pos)
+           (setf ,drops (random-fixnum)
+                 ,drop-pos sb-vm:n-positive-fixnum-bits))))))
+
 ;;;; Copies and expands the cache, dropping any invalidated or
 ;;;; incomplete lines.
 (defun copy-and-expand-cache (cache layouts value)
@@ -370,10 +417,7 @@
       (setf length (* 2 length)))
     (tagbody
      :again
-       ;; Blow way the old vector first, so a GC potentially triggered by
-       ;; MAKE-ARRAY can collect it.
-       (setf (cache-vector copy) #()
-             (cache-vector copy) (make-cache-storage length)
+       (setf (cache-vector copy) (make-cache-storage length)
              (cache-depth copy) 0
              (cache-mask copy) (compute-cache-mask length (cache-line-size cache))
              (cache-limit copy) (compute-limit (/ length (cache-line-size cache))))
@@ -488,7 +532,7 @@
   cache)
 
 ;;; Copying a cache without expanding it is very much like mapping it:
-;;; we need to be carefull because there may be updates while we are
+;;; we need to be careful because there may be updates while we are
 ;;; copying it, and we don't want to copy incomplete entries or invalid
 ;;; ones.
 (defun copy-cache (cache)
@@ -535,6 +579,34 @@
                  :mask mask
                  :limit (cache-limit cache))))
 
+(defun %struct-typecase-miss (object cache-cell)
+  ;; If the layout of OBJECT is already in the cache, then returned the value
+  ;; from the cache. Otherwise try to compute and memoize the index.
+  (when (%instancep object)
+    (let ((layout (%instance-layout object))
+          (cache (car cache-cell))
+          (clause-index 0))
+      (macrolet ((lookup () (emit-cache-lookup 'cache '(layout) 'miss 'clause-index)))
+        (tagbody
+           (lookup)
+           (return-from %struct-typecase-miss clause-index)
+         MISS))
+      (setq clause-index 1)
+      (dovector (layouts (cdr cache-cell))
+        (dolist (test-layout layouts)
+          (when (sb-c::%structure-is-a layout test-layout) ; success, to try memoize it
+            (let ((key (list layout)))  ; insert this object's layout
+              (unless (try-update-cache cache key clause-index)
+                (setf (car cache-cell)
+                      (copy-and-expand-cache cache key clause-index))))
+            (return-from %struct-typecase-miss clause-index)))
+        (incf clause-index))
+      (let ((key (list layout)))
+       (unless (try-update-cache cache key 0)
+         (setf (car cache-cell)
+               (copy-and-expand-cache cache key 0))))
+      0)))
+
 ;;;; For debugging & collecting statistics.
 
 (defun map-all-caches (function)
@@ -545,11 +617,12 @@
                             `(setf ,s)
                             (slot-reader-name s)
                             (slot-writer-name s)
-                            (slot-boundp-name s)))
+                            (slot-boundp-name s)
+                            (slot-makunbound-name s)))
           (when (fboundp name)
             (let ((fun (fdefinition name)))
               (when (typep fun 'generic-function)
-                (let ((cache (gf-dfun-cache fun)))
+                (let ((cache (funcall 'gf-dfun-cache fun)))
                   (when cache
                     (funcall function name cache)))))))))))
 
@@ -608,7 +681,7 @@
                      (multiple-value-bind (count capacity n-dirty n-obsolete histogram)
                          (cache-statistics cache t)
                        (list histogram count capacity n-dirty n-obsolete cache)))
-                   (sb-vm::list-allocated-objects :all :test #'cache-p)))
+                   (sb-vm:list-allocated-objects :all :test #'cache-p)))
          (n 0)
          (n-shown 0)
          (histogram-column-width

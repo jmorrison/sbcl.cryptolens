@@ -11,7 +11,8 @@
 
 (in-package "SB-VM")
 
-(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l) #'equalp)
+(defconstant-eqx +fixup-kinds+ #(:absolute :layout-id :b :ba :ha :l :rldic-m)
+  #'equalp)
 
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
@@ -55,7 +56,7 @@
   (defreg bsp 14)
   (defreg cfp 15)
   (defreg csp 16)
-  (defreg alloc 17)
+  (defreg gc-card-table 17)
   (defreg null 18)
   ;; Use of a tagged pointer in reg_CODE on PPC64 is expensive, adding an extra
   ;; instruction to each load of a boxed constant. We should allow this register
@@ -225,6 +226,13 @@
 
 ;;;; Make some random tns for important registers.
 
+(defparameter thread-base-tn
+  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
+                  :offset thread-offset))
+(defparameter card-table-base-tn
+  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
+                  :offset gc-card-table-offset))
+
 (macrolet ((defregtn (name sc)
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
@@ -236,7 +244,6 @@
   (defregtn lip interior-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
-  (defregtn alloc any-reg)
   (defregtn lra descriptor-reg)
   (defregtn lexenv descriptor-reg)
 
@@ -259,7 +266,10 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc null-sc-number)
@@ -296,10 +306,6 @@
                               :offset n))
           *register-arg-offsets*))
 
-(defparameter thread-base-tn
-  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
-                  :offset thread-offset))
-
 (export 'single-value-return-byte-offset)
 
 ;;; This is used by the debugger.
@@ -319,55 +325,6 @@
       (non-descriptor-stack (format nil "NS~D" offset))
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed"))))
-
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node) (ignore node))
-  (values :default nil))
-
-;;; The 32-bit constants below are obviously wrong.
-#+nil
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node))
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((or (valid-funtype '(fixnum fixnum) '*)
-              (valid-funtype '((signed-byte 32) (signed-byte 32)) '*)
-              (valid-funtype '((unsigned-byte 32) (unsigned-byte 32)) '*))
-          (values :maybe nil))
-         (t (values :default nil))))
-      (logbitp
-       (cond
-         ((or (valid-funtype '((constant-arg (integer 0 29)) fixnum) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (signed-byte 32)) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (unsigned-byte 32)) '*))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         (t (values :default nil))))
-      ;; FIXME: can handle MIN and MAX here
-      (%ldb
-       (flet ((validp (type width)
-                (and (valid-funtype `((constant-arg (integer 1 29))
-                                      (constant-arg (mod ,width))
-                                      ,type)
-                                    'fixnum)
-                     (destructuring-bind (size posn integer)
-                         (sb-c::basic-combination-args node)
-                       (declare (ignore integer))
-                       (<= (+ (sb-c::lvar-value size)
-                              (sb-c::lvar-value posn))
-                           width)))))
-         (if (or (validp 'fixnum 29)
-                 (validp '(signed-byte 32) 32)
-                 (validp '(unsigned-byte 32) 32))
-             (values :transform '(lambda (size posn integer)
-                                  (%%ldb integer size posn)))
-             (values :default nil))))
-      (t (values :default nil)))))
 
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))

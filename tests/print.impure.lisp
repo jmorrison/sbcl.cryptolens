@@ -33,7 +33,7 @@
 (defun f (x) (lambda (y) (+ (incf x) y)))
 (compile 'f)
 (with-test (:name :output-value-cell)
-  (assert (search "#<value cell"
+  (assert (search "#<value-cell"
                   (write-to-string (sb-kernel:%closure-index-ref (f 3) 0)))))
 
 ;;; Nathan Froyd reported that sbcl-0.6.11.34 screwed up output of
@@ -156,10 +156,10 @@
                  '(1 2 0))))
 
 (with-test (:name (print array *print-readably* :element-type))
-  (dolist (array (list (make-array '(1 0 1))
+  (dolist (array (list (make-array '(1 0 1) :initial-element 0)
                        (make-array 0 :element-type nil)
-                       (make-array 1 :element-type 'base-char)
-                       (make-array 1 :element-type 'character)))
+                       (make-array 1 :element-type 'base-char :initial-element #\nul)
+                       (make-array 1 :element-type 'character :initial-element #\nul)))
     (assert (multiple-value-bind (result error)
                 (read-from-string
                  (write-to-string array :readably t))
@@ -396,7 +396,7 @@
 ;;; CSR inserted a bug into Burger & Dybvig's float printer.  Caught
 ;;; by Raymond Toy
 (with-test (:name (format :exponential-floating-point-directive :smoke))
-  (assert (string= (format nil "~E" 1d23) "1.d+23")))
+  (assert (string= (format nil "~E" 1d23) "1.0d+23")))
 
 ;;; Fixed-format bugs from CLISP's test suite (reported by Bruno
 ;;; Haible, bug 317)
@@ -593,7 +593,7 @@
 (with-test (:name (format :bug-308961))
   (assert (string= (format nil "~4,1F" 0.001) " 0.0"))
   (assert (string= (format nil "~4,1@F" 0.001) "+0.0"))
-  (assert (string= (format nil "~E" 0.01) "1.e-2"))
+  (assert (string= (format nil "~E" 0.01) "1.0e-2"))
   (assert (string= (format nil "~G" 0.01) "1.00e-2")))
 
 (with-test (:name (:fp-print-read-consistency single-float))
@@ -601,15 +601,15 @@
         (oops))
     (loop for f = most-positive-single-float then (/ f 2.0)
           while (> f 0.0)
-          do (loop repeat 10
-                   for fr = (random f)
+          do (loop for fr = (random f)
+                   repeat 10
                    do (unless (eql fr (read-from-string (prin1-to-string fr)))
                         (push fr oops)
                         (return))))
     (loop for f = most-negative-single-float then (/ f 2.0)
           while (< f -0.0)
-          do (loop repeat 10
-                   for fr = (- (random (- f)))
+          do (loop for fr = (- (random (- f)))
+                   repeat 10
                    do (unless (eql fr (read-from-string (prin1-to-string fr)))
                         (push fr oops)
                         (return))))
@@ -622,23 +622,20 @@
 (with-test (:name (:fp-print-read-consistency double-float))
   (let ((*random-state* (make-random-state t))
         (oops))
-    ;; FIXME skipping denormalized floats due to bug 793774.
     (loop for f = most-positive-double-float then (/ f 2d0)
-          while (> f 0d0)
-          do (loop repeat 10
-                   for fr = (random f)
-                   do (unless (float-denormalized-p fr)
-                        (unless (eql fr (read-from-string (prin1-to-string fr)))
-                          (push fr oops)
-                          (return)))))
+          while (> f #-x86 0d0 #+x86 0.1d0) ;; too much precision
+          do (loop for fr = (random f)
+                   repeat 10
+                   do (unless (eql fr (read-from-string (prin1-to-string fr)))
+                        (push fr oops)
+                        (return))))
     (loop for f = most-negative-double-float then (/ f 2d0)
-          while (< f -0d0)
-          do (loop repeat 10
-                   for fr = (- (random (- f)))
-                   do (unless (float-denormalized-p fr)
-                        (unless (eql fr (read-from-string (prin1-to-string fr)))
-                          (push fr oops)
-                          (return)))))
+          while (< f #-x86 -0d0 #+x86 -0.1d0)
+          do (loop for fr = (- (random (- f)))
+                   repeat 10
+                   do (unless (eql fr (read-from-string (prin1-to-string fr)))
+                        (push fr oops)
+                        (return))))
     (when oops
       (error "FP print-read inconsistencies:~%~:{  ~S => ~S~%~}"
              (mapcar (lambda (f)
@@ -867,4 +864,30 @@ there"))))
     ;; The unmodified dispatch table never attempts to handle a subtype of INSTANCE.
     (let ((str (with-standard-io-syntax
                  (write-to-string x :pretty t :readably nil))))
-      (assert (search "#<SB-KERNEL:INSTANCE {" str)))))
+      (assert (search "#<SB-KERNEL:INSTANCE {" str))))
+  (let ((x (test-util::make-funcallable-instance 5)))
+    (let ((str (write-to-string x :pretty nil)))
+      (assert (search "#<SB-KERNEL:FUNCALLABLE-INSTANCE {" str)))))
+
+(with-test (:name :functionless-funcallable-instance)
+  (let ((x (sb-pcl::%make-standard-funcallable-instance
+            #()
+            #-executable-funinstances #xdead)))
+    (assert (search "#<SB-PCL::STANDARD-FUNCALLABLE-INSTANCE"
+                    (write-to-string x :pretty nil))))) ; should not crash
+
+(with-test (:name :bug-885320)
+  (let* ((form `(format nil "~E"))
+         (fun (compile nil `(lambda (x) (,@form x)))))
+    (assert (string= (funcall fun 1.0) "1.0e+0"))
+    (assert (string= (funcall fun 1.0d0) "1.0d+0"))
+    (assert (string= (apply (car form) (append (cdr form) (list 1.0))) "1.0e+0"))
+    (assert (string= (apply (car form) (append (cdr form) (list 1.0d0))) "1.0d+0"))))
+
+(with-test (:name (:bug-885320 :d-k+1))
+  (let* ((form `(format nil "~,2,,3E"))
+         (fun (compile nil `(lambda (x) (,@form x)))))
+    (assert (string= (funcall fun 1.0) "100.e-2"))
+    (assert (string= (funcall fun 1.0d0) "100.d-2"))
+    (assert (string= (apply (car form) (append (cdr form) (list 1.0))) "100.e-2"))
+    (assert (string= (apply (car form) (append (cdr form) (list 1.0d0))) "100.d-2"))))

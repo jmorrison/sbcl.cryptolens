@@ -113,6 +113,9 @@ test -f "$BUILD_ROOT$SBCL_HOME"/sbcl.core && \
 
 cp src/runtime/$RUNTIME "$BUILD_ROOT$INSTALL_ROOT"/bin/
 cp output/sbcl.core "$BUILD_ROOT$SBCL_HOME"/sbcl.core
+test -f src/runtime/libsbcl.so && \
+    cp src/runtime/libsbcl.so "$BUILD_ROOT$INSTALL_ROOT"/lib/
+
 cp src/runtime/sbcl.mk "$BUILD_ROOT$SBCL_HOME"/sbcl.mk
 for i in $(grep '^LIBSBCL=' src/runtime/sbcl.mk | cut -d= -f2-) ; do
     cp "src/runtime/$i" "$BUILD_ROOT$SBCL_HOME/$i"
@@ -120,22 +123,8 @@ done
 
 # installing contrib
 
-. ./sbcl-pwd.sh
-sbcl_pwd
-
-SBCL="$SBCL_PWD/src/runtime/sbcl --noinform --core $SBCL_PWD/output/sbcl.core --no-userinit --no-sysinit --disable-debugger"
-SBCL_BUILDING_CONTRIB=1
-export SBCL SBCL_BUILDING_CONTRIB SBCL_PWD
-
-. ./find-gnumake.sh
-find_gnumake
-
-for i in `cd obj/asdf-cache ; echo *`; do
-    test -d obj/asdf-cache/$i && test -f obj/sbcl-home/contrib/$i.fasl || continue;
-    INSTALL_DIR="$SBCL_HOME/contrib/"
-    export INSTALL_DIR
-    ensure_dirs "$BUILD_ROOT$INSTALL_DIR" && $GNUMAKE -C contrib/$i install < /dev/null
-done
+ensure_dirs "$BUILD_ROOT$SBCL_HOME/contrib/"
+cp obj/sbcl-home/contrib/* "$BUILD_ROOT$SBCL_HOME/contrib/"
 
 echo
 echo "SBCL has been installed:"

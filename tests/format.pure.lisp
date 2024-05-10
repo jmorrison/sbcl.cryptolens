@@ -61,7 +61,8 @@
     (assert-error (format* "~2@*" '()) format-error-with-control-string)
     (assert-error (format* "~1:*" '()) format-error-with-control-string)))
 
-(with-test (:name :encapsulated-~/-formatter)
+(with-test (:name :encapsulated-~/-formatter
+            :broken-on (and :gc-stress :x86-64))
   (let ((s (make-string-output-stream)))
     (declare (notinline format))
     (sb-int:encapsulate 'sb-ext:print-symbol-with-prefix 'test
@@ -116,12 +117,14 @@
     (try "~{~0%~
 ~0|~0~~}")))
 
-(with-test (:name :nowarn-princ)
+(with-test (:name :no-compiler-notes)
   ;; you should't see optimization notes from compiling format strings.
   ;; (the FORMATTER macro is a heavy user of PRINC)
   (checked-compile
    '(lambda (x) (declare (optimize speed)) (princ x))
-   :allow-notes nil))
+   :allow-notes nil)
+  (checked-compile
+   '(lambda ()  (declare (optimize speed)) (formatter "~:*"))))
 
 (defun format-to-string-stream (thing string-stream)
   (declare (notinline format))
@@ -148,3 +151,10 @@
              (format nil control-string '(1 2)))))
       (assert (string= s1 "hello (1 2)"))
       (assert (string= s2 "Yello (1 2)")))))
+
+(with-test (:name :return-value)
+  (let ((formatter (funcall (checked-compile `(lambda () (formatter "~a"))))))
+    (with-output-to-string (s)
+      (assert (null (funcall formatter s 1)))
+      (assert (equal (funcall formatter s 1 2) '(2))))
+    (assert (null (format (make-array 3 :element-type 'character :fill-pointer 0) formatter 1 2)))))

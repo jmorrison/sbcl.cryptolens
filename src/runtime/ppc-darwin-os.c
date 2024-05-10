@@ -14,7 +14,7 @@
  * files for more information.
  */
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "globals.h"
 #include "runtime.h"
 #include <signal.h>
@@ -24,16 +24,20 @@
 #include "arch.h"
 #include "interr.h"                     /* for declaration of lose */
 
-#ifdef LISP_FEATURE_SB_THREAD
-#error "Define threading support functions"
-#else
 int arch_os_thread_init(struct thread *thread) {
     return 1;                   /* success */
 }
+
+#ifdef LISP_FEATURE_SB_THREAD
+/* fix for "ld: absolute address to symbol _pthread_getspecific in a different linkage unit not supported" */
+void *arch_os_thread_getspecific(pthread_key_t key) {
+    return pthread_getspecific(key);
+}
+#endif
+
 int arch_os_thread_cleanup(struct thread *thread) {
     return 1;                   /* success */
 }
-#endif
 
 os_context_register_t   *
 os_context_register_addr(os_context_t *context, int offset)
@@ -131,12 +135,6 @@ os_context_register_t *
 os_context_cr_addr(os_context_t *context)
 {
     return (os_context_register_t *) &context->uc_mcontext->PPC_DARWIN_REGIFY(ss).PPC_DARWIN_REGIFY(cr);
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-  return &context->uc_mcontext->PPC_DARWIN_REGIFY(ss).PPC_DARWIN_REGIFY(srr0);
 }
 
 void

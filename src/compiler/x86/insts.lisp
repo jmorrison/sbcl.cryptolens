@@ -14,7 +14,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(conditional-opcode
+  (import '(conditional-opcode negate-condition
             register-p ; FIXME: rename to GPR-P
             make-ea ea-disp width-bits) "SB-VM")
   ;; Imports from SB-VM into this package
@@ -167,17 +167,19 @@
     (:le . 14) (:ng . 14)
     (:nle . 15) (:g . 15))
   #'equal)
-(defconstant-eqx sb-vm::+condition-name-vec+
-  #.(let ((vec (make-array 16 :initial-element nil)))
-      (dolist (cond +conditions+ vec)
-        (when (null (aref vec (cdr cond)))
-          (setf (aref vec (cdr cond)) (car cond)))))
+(defconstant-eqx +condition-name-vec+
+  (let ((vec (make-array 16 :initial-element nil)))
+    (dolist (cond +conditions+ vec)
+      (when (null (aref vec (cdr cond)))
+        (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
-(define-arg-type condition-code :printer sb-vm::+condition-name-vec+)
+(define-arg-type condition-code :printer +condition-name-vec+)
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
+(defun negate-condition (name)
+  (aref +condition-name-vec+ (logxor 1 (conditional-opcode name))))
 
 ;;;; disassembler instruction formats
 
@@ -243,11 +245,6 @@
   (accum :type 'accum)
   (imm)
   )
-
-;;; Same as reg, but with direction bit
-(define-instruction-format (reg-dir 8 :include reg)
-  (op  :field (byte 3 5))
-  (dir :field (byte 1 4)))
 
 (define-instruction-format (reg-reg/mem 16
                                         :default-printer
@@ -334,23 +331,6 @@
   (op    :field (byte 5 11))
   (reg   :field (byte 3 8) :type 'reg))
 
-;;; Same as reg/mem, but with a prefix of #b00001111
-(define-instruction-format (ext-reg/mem 24
-                                        :default-printer '(:name :tab reg/mem))
-  (prefix  :field (byte 8 0)    :value #b00001111)
-  (op      :fields (list (byte 7 9) (byte 3 19)))
-  (width   :field (byte 1 8)    :type 'width)
-  (reg/mem :fields (list (byte 2 22) (byte 3 16))
-                                :type 'sized-reg/mem)
-  ;; optional fields
-  (imm))
-
-(define-instruction-format (ext-reg/mem-imm 24
-                                        :include ext-reg/mem
-                                        :default-printer
-                                        '(:name :tab reg/mem ", " imm))
-  (imm :type 'imm-data))
-
 (define-instruction-format (ext-reg/mem-no-width+imm8 24
                                         :include ext-reg/mem-no-width
                                         :default-printer
@@ -374,17 +354,6 @@
   (suffix :field (byte 2 14) :value #b11)
   (op     :fields (list (byte 3 0) (byte 3 11)))
   (fp-reg :field (byte 3 8) :type 'fp-reg))
-
-;;; fp insn to/from fp reg, with the reversed source/destination flag.
-(define-instruction-format (floating-point-fp-d 16
-                            :default-printer
-                            `(:name :tab ,(swap-if 'd "ST0" ", " 'fp-reg)))
-  (prefix :field (byte 5 3) :value #b11011)
-  (suffix :field (byte 2 14) :value #b11)
-  (op     :fields (list (byte 2 0) (byte 3 11)))
-  (d      :field (byte 1 2))
-  (fp-reg :field (byte 3 8) :type 'fp-reg))
-
 
 ;;; (added by (?) pfw)
 ;;; fp no operand isns
@@ -792,7 +761,7 @@
            (emit-absolute-fixup segment src)
            (emit-imm-operand segment src size))))))
 
-(defun emit-move-with-extension (segment dst src opcode)
+(flet ((emit* (segment dst src opcode)
   (aver (register-p dst))
   (let ((dst-size (operand-size dst))
         (src-size (operand-size src)))
@@ -813,19 +782,19 @@
          (:word
           (emit-byte segment #b00001111)
           (emit-byte segment (logior opcode 1))
-          (emit-ea segment src (reg-tn-encoding dst))))))))
+          (emit-ea segment src (reg-tn-encoding dst)))))))))
 
 (define-instruction movsx (segment dst src)
   (:printer ext-reg-reg/mem ((op #b1011111)
                              (reg nil :type 'word-reg)
                              (reg/mem nil :type 'sized-reg/mem)))
-  (:emitter (emit-move-with-extension segment dst src #b10111110)))
+  (:emitter (emit* segment dst src #b10111110)))
 
 (define-instruction movzx (segment dst src)
   (:printer ext-reg-reg/mem ((op #b1011011)
                              (reg nil :type 'word-reg)
                              (reg/mem nil :type 'sized-reg/mem)))
-  (:emitter (emit-move-with-extension segment dst src #b10110110)))
+  (:emitter (emit* segment dst src #b10110110))))
 
 (define-instruction push (segment src &optional prefix)
   ;; register
@@ -862,11 +831,6 @@
                    (emit-byte segment #b11111111)
                    (emit-ea segment src #b110))))))))
 
-(define-instruction pusha (segment)
-  (:printer byte ((op #b01100000)))
-  (:emitter
-   (emit-byte segment #b01100000)))
-
 (define-instruction pop (segment dst)
   (:printer reg-no-width ((op #b01011)))
   (:printer reg/mem ((op '(#b1000111 #b000)) (width 1)))
@@ -879,11 +843,6 @@
            (t
             (emit-byte segment #b10001111)
             (emit-ea segment dst #b000))))))
-
-(define-instruction popa (segment)
-  (:printer byte ((op #b01100001)))
-  (:emitter
-   (emit-byte segment #b01100001)))
 
 (define-instruction xchg (segment operand1 operand2)
   ;; Register with accumulator.
@@ -957,71 +916,35 @@
 
 ;;;; flag control instructions
 
-;;; CLC -- Clear Carry Flag.
-(define-instruction clc (segment)
-  (:printer byte ((op #b11111000)))
-  (:emitter
-   (emit-byte segment #b11111000)))
-
-;;; CLD -- Clear Direction Flag.
-(define-instruction cld (segment)
-  (:printer byte ((op #b11111100)))
-  (:emitter
-   (emit-byte segment #b11111100)))
-
-;;; CLI -- Clear Iterrupt Enable Flag.
-(define-instruction cli (segment)
-  (:printer byte ((op #b11111010)))
-  (:emitter
-   (emit-byte segment #b11111010)))
-
-;;; CMC -- Complement Carry Flag.
-(define-instruction cmc (segment)
-  (:printer byte ((op #b11110101)))
-  (:emitter
-   (emit-byte segment #b11110101)))
-
-;;; LAHF -- Load AH into flags.
-(define-instruction lahf (segment)
-  (:printer byte ((op #b10011111)))
-  (:emitter
-   (emit-byte segment #b10011111)))
-
-;;; POPF -- Pop flags.
-(define-instruction popf (segment)
-  (:printer byte ((op #b10011101)))
-  (:emitter
-   (emit-byte segment #b10011101)))
-
-;;; PUSHF -- push flags.
-(define-instruction pushf (segment)
-  (:printer byte ((op #b10011100)))
-  (:emitter
-   (emit-byte segment #b10011100)))
-
-;;; SAHF -- Store AH into flags.
-(define-instruction sahf (segment)
-  (:printer byte ((op #b10011110)))
-  (:emitter
-   (emit-byte segment #b10011110)))
-
-;;; STC -- Set Carry Flag.
-(define-instruction stc (segment)
-  (:printer byte ((op #b11111001)))
-  (:emitter
-   (emit-byte segment #b11111001)))
-
-;;; STD -- Set Direction Flag.
-(define-instruction std (segment)
-  (:printer byte ((op #b11111101)))
-  (:emitter
-   (emit-byte segment #b11111101)))
-
-;;; STI -- Set Interrupt Enable Flag.
-(define-instruction sti (segment)
-  (:printer byte ((op #b11111011)))
-  (:emitter
-   (emit-byte segment #b11111011)))
+(macrolet ((def (mnemonic opcode)
+             `(define-instruction ,mnemonic (segment)
+                (:printer byte ((op ,opcode)))
+                (:emitter (emit-byte segment ,opcode)))))
+  (def daa   #x27) ; Decimal Adjust After Addition
+  (def das   #x2F) ; Decimal Adjust after Subtraction
+  (def aaa   #x37) ; ASCII Adjust After Addition
+  (def aas   #x3F) ; ASCII Adjust After Subtraction
+  (def pusha #x60) ; push all regs
+  (def popa  #x61) ; pop all regs
+  (def wait  #x9B) ; Wait
+  (def pushf #x9C) ; Push flags
+  (def popf  #x9D) ; Pop flags
+  (def sahf  #x9E) ; Store AH into flags
+  (def lahf  #x9F) ; Load AH from flags
+  (def leave #xC9)
+  (def into  #xCE) ; Interrupt if Overflow
+  (def iret  #xCF) ; Interrupt Return
+  (def xlat  #xD7) ; Translate Byte
+  (def icebp #xF1) ; ICE breakpoint
+  (def hlt   #xF4) ; Halt
+  (def cmc   #xF5) ; Complement Carry Flag
+  (def clc   #xF8) ; Clear Carry Flag
+  (def stc   #xF9) ; Set Carry Flag
+  (def cli   #xFA) ; Clear Iterrupt Enable Flag
+  (def sti   #xFB) ; Set Interrupt Enable Flag
+  (def cld   #xFC) ; Clear Direction Flag
+  (def std   #xFD) ; Set Direction Flag
+)
 
 ;;;; arithmetic
 
@@ -1030,7 +953,7 @@
     (maybe-emit-operand-size-prefix segment size)
     (cond
      ((or (integerp src)
-          (and (fixup-p src) (memq (fixup-flavor src) '(:layout-id))))
+          (and (fixup-p src) (memq (fixup-flavor src) '(:card-table-index-mask :layout-id))))
       (cond ((and (neq size :byte) (typep src '(signed-byte 8)))
              (emit-byte segment #b10000011)
              (emit-ea segment dst opcode)
@@ -1118,26 +1041,6 @@
      (maybe-emit-operand-size-prefix segment size)
      (emit-byte segment (if (eq size :byte) #b11110110 #b11110111))
      (emit-ea segment dst #b011))))
-
-(define-instruction aaa (segment)
-  (:printer byte ((op #b00110111)))
-  (:emitter
-   (emit-byte segment #b00110111)))
-
-(define-instruction aas (segment)
-  (:printer byte ((op #b00111111)))
-  (:emitter
-   (emit-byte segment #b00111111)))
-
-(define-instruction daa (segment)
-  (:printer byte ((op #b00100111)))
-  (:emitter
-   (emit-byte segment #b00100111)))
-
-(define-instruction das (segment)
-  (:printer byte ((op #b00101111)))
-  (:emitter
-   (emit-byte segment #b00101111)))
 
 (define-instruction mul (segment dst src)
   (:printer accum-reg/mem ((op '(#b1111011 #b100))))
@@ -1419,12 +1322,6 @@
      (aver (accumulator-p acc))
      (maybe-emit-operand-size-prefix segment size)
      (emit-byte segment (if (eq size :byte) #b10101010 #b10101011)))))
-
-(define-instruction xlat (segment)
-  (:printer byte ((op #b11010111)))
-  (:emitter
-   (emit-byte segment #b11010111)))
-
 
 ;;;; bit manipulation
 
@@ -1634,15 +1531,13 @@
 
 ;;;; conditional byte set
 
-(define-instruction set (segment dst cond)
+(define-instruction set (segment cond dst)
   (:printer cond-set ())
   (:emitter
    (emit-byte segment #b00001111)
    (emit-byte segment (dpb (conditional-opcode cond) (byte 4 0) #b10010000))
    (emit-ea segment dst #b000)))
 
-;;;; enter/leave
-
 (define-instruction enter (segment disp &optional (level 0))
   (:declare (type (unsigned-byte 16) disp)
             (type (unsigned-byte 8) level))
@@ -1651,11 +1546,6 @@
    (emit-byte segment #b11001000)
    (emit-word segment disp)
    (emit-byte segment level)))
-
-(define-instruction leave (segment)
-  (:printer byte ((op #b11001001)))
-  (:emitter
-   (emit-byte segment #b11001001)))
 
 ;;;; prefetch
 (define-instruction prefetchnta (segment ea)
@@ -1715,11 +1605,6 @@
       (emit-byte segment #b11001101)
       (emit-byte segment number)))))
 
-(define-instruction into (segment)
-  (:printer byte ((op #b11001110)))
-  (:emitter
-   (emit-byte segment #b11001110)))
-
 (define-instruction bound (segment reg bounds)
   (:emitter
    (let ((size (matching-operand-size reg bounds)))
@@ -1729,17 +1614,8 @@
      (emit-byte segment #b01100010)
      (emit-ea segment bounds (reg-tn-encoding reg)))))
 
-(define-instruction iret (segment)
-  (:printer byte ((op #b11001111)))
-  (:emitter
-   (emit-byte segment #b11001111)))
 
 ;;;; processor control
-
-(define-instruction hlt (segment)
-  (:printer byte ((op #b11110100)))
-  (:emitter
-   (emit-byte segment #b11110100)))
 
 (define-instruction nop (segment)
   (:printer byte ((op #b10010000)))
@@ -1747,10 +1623,6 @@
   (:emitter
    (emit-byte segment #b10010000)))
 
-(define-instruction wait (segment)
-  (:printer byte ((op #b10011011)))
-  (:emitter
-   (emit-byte segment #b10011011)))
 
 ;;;; miscellaneous hackery
 
@@ -2534,27 +2406,21 @@
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
-;;; Return T if and only if the fixup needs to be recorded in %CODE-FIXUPS
 (defun fixup-code-object (code offset value kind flavor)
   (declare (type index offset))
-  #+sb-xc-host (declare (notinline code-object-size)) ; forward ref
-  (sb-vm::with-code-instructions (sap code)
+  (let ((sap (code-instructions code)))
     (ecase kind
       (:absolute
        (case flavor
          (:layout-id
-          (setf (signed-sap-ref-32 sap offset) value)
-          nil) ; do not record this
+          (setf (signed-sap-ref-32 sap offset) value))
+         (:card-table-index-mask
+          ;; the VALUE is nbits, so convert it to an AND mask
+          (setf (sap-ref-32 sap offset) (1- (ash 1 value))))
          (t
-          ;; Word at sap + offset contains a value to be replaced by
-          ;; adding that value to fixup.
-          (let ((final-val (+ value (sap-ref-32 sap offset))))
-            (setf (sap-ref-32 sap offset) final-val)
-            ;; Record absolute fixups that point into CODE itself, with one
-            ;; exception: fixups within the range of unboxed words containing
-            ;; jump tables are automatically adjusted if the code moves.
-            (and (sb-vm::self-referential-code-fixup-p final-val code)
-                 (>= offset (ash (code-jump-table-words code) word-shift)))))))
+          ;; 32-bit quantity at SAP + offset contains an
+          ;; addend to be replaced by adding it to VALUE.
+          (setf (sap-ref-32 sap offset) (+ value (sap-ref-32 sap offset))))))
       (:relative
        ;; VALUE is the actual address wanted.
        ;; Replace word with displacement to get there.
@@ -2566,20 +2432,58 @@
               ;; The CPU calculates based off the next instruction.
               (rel-val (ldb (byte 32 0) (- value loc-sap 4))))
          (declare (type (unsigned-byte 32) loc-sap rel-val))
-         (setf (sap-ref-32 sap offset) rel-val))
-       ;; Record relative fixups pointing outside of this object.
-       (when (eq (sb-vm::containing-memory-space code) :dynamic)
-         (aver (not (sb-vm::self-referential-code-fixup-p value code)))
-         t)))))
+         (setf (sap-ref-32 sap offset) rel-val)))))
+  nil)
+
+(defun sb-fasl::pack-fixups-for-reapplication (fixup-notes)
+  (let (abs-fixups rel-fixups imm-fixups)
+    (dolist (note fixup-notes)
+      (let* ((fixup (fixup-note-fixup note))
+             (offset (fixup-note-position note))
+             (kind (fixup-note-kind note))
+             (flavor (fixup-flavor fixup)))
+        (cond ((and (eq kind :absolute) (eq flavor :code-object))
+               ;; If there are N jump table entries, then any code-object fixups occurring
+               ;; at offsets 4, 8, 12, ..., 4*N are to patch in the jump vectors, and
+               ;; do need need to be explicitly retained. GC knows how to fix them again.
+               ;; (Offset 0 is the jump table count word)
+               ;; We care where the patch occurs, and NOT where the patch points to.
+               (unless (<= offset (* sb-vm:n-word-bytes (sb-c::component-n-jump-table-entries)))
+                 (push offset abs-fixups)))
+              ((and (eq kind :relative) (member flavor '(:assembly-routine :foreign)))
+               (push offset rel-fixups))
+              ((eq flavor :card-table-index-mask)
+               (push offset imm-fixups))
+              ((or (and (eq kind :absolute)
+                        (member flavor '(:assembly-routine :foreign :foreign-dataref)))
+                   (member flavor '(:layout-id :symbol-tls-index)))) ; discard
+              (t
+               (bug "Unexpected fixup")))))
+    (sb-c:pack-code-fixup-locs abs-fixups rel-fixups imm-fixups)))
+
+;;; Coverage support
+
+(define-instruction store-coverage-mark (segment mark-index)
+  (:emitter
+   (let ((offset (+ (component-header-length)
+                    ;; skip over jump table word and entries
+                    (* (1+ (component-n-jump-table-entries))
+                       n-word-bytes)
+                    mark-index
+                    (- other-pointer-lowtag))))
+     (assemble (segment)
+       (inst mov (make-ea :byte :disp (make-fixup nil :code-object offset)) 1)))))
 
 ;;; Perform exhaustive analysis here because of the extreme degree
 ;;; of confusion I have about what is allowed to reach the instruction
 ;;; emitter as a raw fixup, a fixup wrapped in an EA, a label wrapped
 ;;; in a fixup wrapped in an EA etc.
+;;; (The x86-64 assembler is more understandable - we need to kill this one)
 (defun sb-assem::%mark-used-labels (operand)
   (named-let recurse ((operand operand))
     (etypecase operand
       ((or integer tn keyword null))
+      #+sb-xc-host ((cons (eql sb-assem::entry)))
       (ea
        (let ((disp (ea-disp operand)))
          (etypecase disp
@@ -2592,16 +2496,3 @@
                 (setf (label-usedp offset) t))
                ((consp offset)
                 (setf (label-usedp (car offset)) t))))))))
-
-(defun sb-c::branch-opcode-p (mnemonic)
-  (case mnemonic
-    ((call ret jmp jecxz break int iret
-      loop loopz loopnz syscall
-      byte word dword) ; unexplained phenomena
-     t)))
-
-;;; Replace the STATEMENT with an instruction to store a coverage mark
-;;; in the OFFSETth byte beyond LABEL.
-(defun sb-c::replace-coverage-instruction (statement label offset)
-  (setf (stmt-mnemonic statement) 'mov
-        (stmt-operands statement) `(,(make-ea :byte :disp `(+ ,label ,offset)) 1)))

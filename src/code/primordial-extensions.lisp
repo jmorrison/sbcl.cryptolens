@@ -16,14 +16,13 @@
 ;;; to CALL-WITH-FOO less ugly.
 (defmacro dx-flet (functions &body forms)
   `(flet ,functions
-     (declare (truly-dynamic-extent ,@(mapcar (lambda (func) `#',(car func))
-                                              functions)))
+     (declare (dynamic-extent ,@(mapcar (lambda (func) `#',(car func)) functions)))
      ,@forms))
 
 ;;; Another similar one.
 (defmacro dx-let (bindings &body forms)
   `(let ,bindings
-     (declare (truly-dynamic-extent
+     (declare (dynamic-extent
                ,@(mapcar (lambda (bind) (if (listp bind) (car bind) bind))
                          bindings)))
      ,@forms))
@@ -55,13 +54,12 @@
 ;;; Incidentally, this is essentially the same operator which
 ;;; _On Lisp_ calls WITH-GENSYMS.
 (defmacro with-unique-names (symbols &body body)
-  (declare (notinline every)) ; because we can't inline ALPHA-CHAR-P
   `(let ,(mapcar (lambda (symbol)
                    (let* ((symbol-name (symbol-name symbol))
-                          (stem (if (every #'alpha-char-p symbol-name)
-                                    symbol-name
-                                    (string (gensymify* symbol-name "-")))))
-                     `(,symbol (sb-xc:gensym ,stem))))
+                          (stem (if (find #\- symbol-name)
+                                    (string (gensymify* symbol-name "-"))
+                                    symbol-name)))
+                     `(,symbol (gensym ,stem))))
                  symbols)
      ,@body))
 
@@ -69,7 +67,7 @@
 ;;; macros and other code-manipulating code.)
 (defun make-gensym-list (n &optional name)
   (let ((arg (if name (string name) "G")))
-    (loop repeat n collect (sb-xc:gensym arg))))
+    (loop repeat n collect (gensym arg))))
 
 ;;;; miscellany
 
@@ -92,18 +90,21 @@
 
 (defun gensymify (x)
   (if (symbolp x)
-      (sb-xc:gensym (symbol-name x))
-      (sb-xc:gensym)))
+      (gensym (symbol-name x))
+      (gensym)))
 
 (eval-when (:load-toplevel :execute #+sb-xc-host :compile-toplevel)
-(labels ((symbol-concat (package &rest things)
+(labels ((symbol-concat (package ignore-lock &rest things)
            (dx-let ((strings (make-array (length things)))
                     (length 0)
                     (only-base-chars t))
              ;; This loop is nearly like DO-REST-ARG
              ;; but it works on the host too.
              (loop for index from 0 below (length things)
-                   do (let* ((s (string (nth index things)))
+                   do (let* ((thing (nth index things))
+                             (s (if (integerp thing)
+                                    (write-to-string thing :base 10 :radix nil :pretty nil)
+                                    (string thing)))
                              (l (length s)))
                         (setf (svref strings index) s)
                         (incf length l)
@@ -123,7 +124,8 @@
                  (setq name (make-array length :element-type elt-type)))
                (dotimes (index (length things)
                                (if package
-                                   (values (%intern name length package elt-type nil))
+                                   (values (%intern name length package elt-type
+                                                    ignore-lock))
                                    (make-symbol name)))
                  (let ((s (svref strings index)))
                    (replace name s :start1 start)
@@ -136,19 +138,26 @@
   ;; Concatenate together the names of some strings and symbols,
   ;; producing a symbol in the current package.
   (defun symbolicate (&rest things)
-    (apply #'symbol-concat (sane-package) things))
-  ;; SYMBOLICATE in given package.
+    (apply #'symbol-concat (sane-package) nil things))
+  ;; "bang" means intern even if the specified package is locked.
+  ;; Obviously it takes a package, so it doesn't need PACKAGE- in its name.
+  ;; The main use is to create interned temp vars. It really seems like there
+  ;; ought to be a single package into which all such vars go,
+  ;; avoiding any interning in locked packages.
+  (defun symbolicate! (package &rest things)
+    (apply #'symbol-concat (find-package package) t things))
+  ;; SYMBOLICATE in given package respecting package-lock.
   (defun package-symbolicate (package &rest things)
-    (apply #'symbol-concat (find-package package) things))
+    (apply #'symbol-concat (find-package package) nil things))
   ;; like SYMBOLICATE, but producing keywords
   (defun keywordicate (&rest things)
-    (apply #'symbol-concat *keyword-package* things))
+    (apply #'symbol-concat *keyword-package* nil things))
   ;; like the above, but producing an uninterned symbol.
   ;; [we already have GENSYMIFY, and naming this GENSYMICATE for
   ;; consistency with the above would not be particularly enlightening
   ;; as to how it isn't just GENSYMIFY]
   (defun gensymify* (&rest things)
-    (apply #'symbol-concat nil things))))
+    (apply #'symbol-concat nil nil things))))
 
 ;;; Access *PACKAGE* in a way which lets us recover when someone has
 ;;; done something silly like (SETF *PACKAGE* :CL-USER) in unsafe code.
@@ -284,7 +293,6 @@
              (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 (defvar *!removable-symbols* nil)
-(push '("SB-INT" check-designator) *!removable-symbols*)
 
 (defun %defconstant-eqx-value (symbol expr eqx)
   (declare (type function eqx))
@@ -303,38 +311,42 @@
 ;;;
 #+sb-xc-host
 (defmacro defconstant-eqx (symbol expr eqx &optional doc)
-  ;; CLISP needs the EVAL-WHEN here, or else the symbol defined is unavailable
-  ;; for later uses within the same file. For instance, in x86-64/vm, defining
-  ;; TEMP-REG-TN as R11-TN would get an error that R11-TN is unbound.
-  ;; We don't want that junk in our expansion, especially as our requirement
-  ;; is to separate the compile-time and load-time effect.
   `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+     ;; We use DEFVAR rather than DEFCONSTANT as a host effect in
+     ;; order to avoid differences in host decisions about inlining
+     ;; the value of the constant, with knock-on effects on EQLity
+     ;; of references to internal parts of the constant.
+     (defvar ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
        ,@(when doc (list doc)))))
 
-;;; This is the expansion as it should be for us, but notice that this
-;;; recapitulation of the macro is actually not defined at compile-time.
 #-sb-xc-host
-(let ()
-  (defmacro defconstant-eqx (symbol expr eqx &optional doc)
-    `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
-       ,@(when doc (list doc)))))
+(defmacro defconstant-eqx (symbol expr eqx &optional doc)
+  `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+     ,@(when doc (list doc))))
 
-;;; Special variant at cross-compile-time. Face it: the "croak-if-not-EQx" test
-;;; is irrelevant - there can be no pre-existing value to test against.
-;;; The extra requirement is that the EXPR must satisfy CONSTANTP so that this
-;;; macroexpander can EVAL it, and then the constant value can be dumped as a literal.
-;;; This in turn allows a LOAD-TIME-VALUE form referencing the constant to work
-;;; in genesis because the target representation of the value will be available.
-;;; It would not be available if the form were computable only by target code.
-#-sb-xc-host
-(eval-when (:compile-toplevel)
-  (sb-xc:defmacro defconstant-eqx (symbol expr eqx &optional doc)
-    (unless (constantp expr)
-      (error "DEFCONSTANT-EQX requires a literal constant"))
-    `(progn
-       (eval-when (:compile-toplevel)
-         (defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)))
-       (eval-when (:load-toplevel)
-         (sb-c::%defconstant ',symbol ',(eval expr)
-           (sb-c:source-location) ,@(when doc (list doc)))))))
+;;; utility for coalescing list substructure in quoted constants, for
+;;; ease of guarding against differences in host compilers with
+;;; respect to coalescing structure in (host) fasl files, which might
+;;; then be used in compiling the target.
+(defun hash-cons (list)
+  (declare (type list list))
+  (let ((table (make-hash-table :test 'equal)))
+    (labels ((hc (thing)
+               (cond
+                 ((atom thing) thing)
+                 ((gethash thing table))
+                 (t (setf (gethash thing table)
+                          (cons (hc (car thing)) (hc (cdr thing))))))))
+      (hc list))))
+
+;;; These are shorthand.
+;;; If in some policy we decide to open-code MEMBER, there should be
+;;; no discernable difference between MEMQ and (MEMBER ... :test 'EQ).
+(declaim (inline memq assq))
+(defun memq (item list)
+  "Return tail of LIST beginning with first element EQ to ITEM."
+  (member item list :test #'eq))
+
+(defun assq (item alist)
+  "Return the first pair of alist where item is EQ to the key of pair."
+  (assoc item alist :test #'eq))

@@ -572,6 +572,17 @@
     (inst add temp temp lo-bits)
     (inst fmvx-> :double res temp)))
 
+#+64-bit
+(define-vop (%make-double-float)
+  (:args (bits :scs (signed-reg)))
+  (:results (res :scs (double-reg)))
+  (:arg-types signed-num)
+  (:result-types double-float)
+  (:translate %make-double-float)
+  (:policy :fast-safe)
+  (:generator 2
+    (inst fmvx-> :double res bits)))
+
 (define-vop (single-float-bits)
   (:args (float :scs (single-reg descriptor-reg)
                 :load-if (not (sc-is float single-stack))))
@@ -787,14 +798,12 @@
          (unless (location= value-tn r)
            (inst fmove :single r value-tn)))
        #+64-bit
-       (ecase slot
-         (:real
-          (unless (location= r x)
-            (inst fmove :single r x)))
-         (:imag
-          (inst fmvx<- :double temp x)
-          (inst srli temp temp 32)
-          (inst fmvx-> :single r temp))))
+       (progn
+         (inst fmvx<- :double temp x)
+         (ecase slot
+           (:real)
+           (:imag (inst srli temp temp 32)))
+         (inst fmvx-> :single r temp)))
       (complex-single-stack
        (inst fload :single r (current-nfp-tn vop)
              (+ (ecase slot

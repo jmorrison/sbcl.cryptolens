@@ -26,7 +26,7 @@
 ;;; SKIPPED-CHAR-FORM - the form to execute when skipping a character
 ;;; EOF-DETECTED-FORM - the form to execute when EOF has been detected
 ;;;                     (this will default to EOF-RESULT)
-(sb-xc:defmacro generalized-peeking-mechanism
+(defmacro generalized-peeking-mechanism
     (peek-type eof-value char-var read-form read-eof unread-form
      &optional (skipped-char-form nil) (eof-detected-form nil))
   `(let ((,char-var ,read-form))
@@ -47,10 +47,11 @@
                          ,char-var)))
              ,skipped-char-form))
           ((eql ,peek-type t)
-           (do ((,char-var ,char-var ,read-form))
+           (do ((.readtable. *readtable*)
+                (,char-var ,char-var ,read-form))
                ((or (eql ,char-var ,read-eof)
                     ;; whitespace[2]p will type-check for us
-                    (not (whitespace[2]p ,char-var)))
+                    (not (whitespace[2]p ,char-var .readtable.)))
                 (cond ((eql ,char-var ,read-eof)
                        ,(if eof-detected-form
                             eof-detected-form
@@ -86,7 +87,7 @@
                             eof-value
                             recursive-p)
   (declare (type (or character boolean) peek-type) (explicit-check))
-  (stream-api-dispatch (stream (in-stream-from-designator stream))
+  (stream-api-dispatch (stream :input)
     :simple (let ((char (s-%peek-char stream peek-type eof-error-p eof-value)))
               ;; simple-streams -%PEEK-CHAR always ignored RECURSIVE-P
               ;; so I removed it from the call.
@@ -162,7 +163,7 @@
          (flet ((outfn (c)
                   (unless unread-p
                     (if (ansi-stream-p out)
-                        (funcall (ansi-stream-out out) out c)
+                        (funcall (ansi-stream-cout out) out c)
                         ;; gray-stream
                         (stream-write-char out c))))
                 (infn ()
@@ -191,6 +192,7 @@
                 read-char unread-char read-byte
                 read-sequence/read-function write-sequence/write-function
                 stream-element-mode))
+  (clear-info :function :inlinep name)
   (clear-info :function :inlining-data name))
 ;;; Can all the ANSI- function names be removed now? Maybe?
 (push '("SB-IMPL" ansi-stream-peek-char ansi-stream-unread-char)

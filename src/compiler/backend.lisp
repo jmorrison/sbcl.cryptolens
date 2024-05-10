@@ -67,10 +67,7 @@
 ;;; representation.
 ;;;
 ;;; The T primitive-type is kept in this variable so that people who
-;;; have to special-case it can get at it conveniently. This variable
-;;; has to be set by the machine-specific VM definition, since the
-;;; !DEF-PRIMITIVE-TYPE for T must specify the SCs that boxed objects
-;;; can be allocated in.
+;;; have to special-case it can get at it conveniently.
 (define-symbol-macro *backend-t-primitive-type*
     (the primitive-type (load-time-value (primitive-type-or-lose t) t)))
 
@@ -96,7 +93,6 @@
 ;;; from vm.lisp
 ;;; immediate-constant-sc
 ;;; location-print-name
-;;; combination-implementation-style
 ;;; convert-conditional-move-p
 ;;; boxed-immediate-sc-p
 
@@ -163,12 +159,9 @@ conditionalization.
 |#
 
 ;;; The default value of NIL means use only unguarded VOPs. The
-;;; initial value is customizeable via
-;;; customize-backend-subfeatures.lisp
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *backend-subfeatures*
-    '#.(sort (copy-list sb-cold:*shebang-backend-subfeatures*) #'string<)))
-(declaim (always-bound *backend-subfeatures*))
+;;; initial value is customizeable via customize-backend-subfeatures.lisp
+(defvar *backend-subfeatures* '#.(sort sb-cold:backend-subfeatures #'string<))
+#-sb-xc-host (declaim (always-bound *backend-subfeatures*))
 
 ;;; possible *BACKEND-SUBFEATURES* values:
 ;;;

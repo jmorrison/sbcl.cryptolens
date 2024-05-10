@@ -13,38 +13,6 @@
 
 (defknown %load-time-value (t) t (flushable movable))
 
-;;; Compile FORM and arrange for it to be called at load-time. Return
-;;; the dumper handle and our best guess at the type of the object.
-;;; It would be nice if L-T-V forms were generally eligible
-;;; for fopcompilation, as it could eliminate special cases below.
-(defun compile-load-time-value (form &optional no-skip)
-  (acond ((typecase form
-            ;; This case is important for dumping packages as constants
-            ;; in cold-init, but works fine in the normal target too.
-            ((cons (eql find-package) (cons string null)) 'package)
-            ;; Another similar case - this allows the printer to work
-            ;; immediately in cold-init. (See SETUP-PRINTER-STATE.)
-            ((cons (eql function)
-                   (cons (satisfies legal-fun-name-p) null))
-             'function)
-            ;; We want to construct cold classoid cells, but in general
-            ;; FIND-CLASSOID-CELL could be called with :CREATE NIL
-            ;; which can not be handled in cold-load.
-            #+sb-xc-host
-            ((cons (eql find-classoid-cell) (cons (cons (eql quote))))
-             (aver (eq (getf (cddr form) :create) t))
-             'sb-kernel::classoid-cell))
-          (fopcompile form nil t)
-          (values (sb-fasl::dump-pop *compile-object*) (specifier-type it)))
-         (t
-          (let ((lambda (compile-load-time-stuff form t)))
-            (values (fasl-dump-load-time-value-lambda lambda *compile-object*
-                                                      no-skip)
-                    (let ((type (leaf-type lambda)))
-                      (if (fun-type-p type)
-                          (single-value-type (fun-type-returns type))
-                          *wild-type*)))))))
-
 (def-ir1-translator load-time-value
     ((form &optional read-only-p) start next result)
   "Arrange for FORM to be evaluated at load-time and use the value produced as
@@ -93,7 +61,7 @@ guaranteed to never be modified, so it can be put in read-only storage."
              ;; ":PURE T" in its defstruct, then it will not be put in readonly
              ;; space, so we _could_ avoid the indirection cell. But it's not
              ;; worth trying to optimize that out for benefit of a crappy GC.
-             (cond #-gencgc
+             (cond #+cheneygc
                    ((not read-only-p)
                     `(make-value-cell ,form))
                    (t
@@ -101,7 +69,7 @@ guaranteed to never be modified, so it can be put in read-only storage."
           (unless (csubtypep type source-type)
             (setf type source-type))
           (let ((value-form
-                  (cond #-gencgc
+                  (cond #+cheneygc
                         ((not read-only-p)
                          `(value-cell-ref (%load-time-value ',handle)))
                         (t
@@ -118,7 +86,10 @@ guaranteed to never be modified, so it can be put in read-only storage."
         ;;  (LET ((X 3)) (MACROLET ((M () (HAIR))) (LOAD-TIME-VALUE (THING)))
         ;; can make use of M. We choose to say that it can't.
         (let ((value (let ((thunk ; Pass T for the EPHEMERAL flag.
-                            (compile-in-lexenv `(lambda () ,form) (make-null-lexenv)
+                            (compile-in-lexenv `(lambda ()
+                                                  (declare (local-optimize (verify-arg-count 0)))
+                                                  ,form)
+                                               (make-null-lexenv)
                                                nil nil nil t nil)))
                        (handler-case (funcall thunk)
                          (error (condition)
@@ -126,12 +97,12 @@ guaranteed to never be modified, so it can be put in read-only storage."
                                            condition))))))
           (if read-only-p
               (ir1-convert start next result `',value)
-              #-gencgc
+              #+cheneygc
               (the-in-policy (ctype-of value)
                              `(value-cell-ref ,(make-value-cell value))
                              **zero-typecheck-policy**
                              start next result)
-              #+gencgc
+              #+generational
               ;; Avoid complaints about constant modification
               (ir1-convert start next result `(ltv-wrapper ',value)))))))
 

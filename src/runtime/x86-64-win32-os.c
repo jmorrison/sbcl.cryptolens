@@ -28,7 +28,7 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #include <sys/types.h>
 #include "runtime.h"
@@ -54,6 +54,10 @@ int arch_os_thread_init(struct thread *thread)
      * grab the AllocationBase. -AB 2006/11/25
      */
 
+    /* This memset is probably not really necessary but it shuts up a warning
+     * about uninitialized memory. Compiler might be confused that stack_memory
+     * is both the address being queried, and the address of the result */
+    memset(&stack_memory, 0, sizeof(stack_memory));
     if (!VirtualQuery(&stack_memory, &stack_memory, sizeof(stack_memory))) {
         fprintf(stderr, "VirtualQuery: 0x%lx.\n", GetLastError());
         lose("Could not query stack memory information.");
@@ -61,21 +65,11 @@ int arch_os_thread_init(struct thread *thread)
 
     thread->control_stack_start = stack_memory.AllocationBase;
     thread->control_stack_end = cur_stack_end;
-
-#ifndef LISP_FEATURE_SB_THREAD
-    /*
-     * Theoretically, threaded SBCL binds directly against
-     * the thread structure for these values. We don't do
-     * threads yet, but we'll probably do the same. We do
-     * need to reset these, though, because they were
-     * initialized based on the wrong stack space.
-     */
-    SetSymbolValue(CONTROL_STACK_START,(lispobj)thread->control_stack_start,thread);
-    SetSymbolValue(CONTROL_STACK_END,(lispobj)thread->control_stack_end,thread);
 #endif
 
+    extern void win32_set_stack_guarantee(void);
+    win32_set_stack_guarantee();
 
-#endif
     return 1;
 }
 
@@ -87,12 +81,31 @@ int arch_os_thread_cleanup(struct thread *thread) {
     return 0;
 }
 
-#if defined(LISP_FEATURE_SB_THREAD)
 sigset_t *os_context_sigmask_addr(os_context_t *context)
 {
   return &context->sigmask;
 }
-#endif
+
+void visit_context_registers(void (*proc)(os_context_register_t,void*),
+                             os_context_t *context, void* arg)
+{
+    proc(context->win32_context->Rip, arg);
+    proc(context->win32_context->Rax, arg);
+    proc(context->win32_context->Rcx, arg);
+    proc(context->win32_context->Rdx, arg);
+    proc(context->win32_context->Rbx, arg);
+    // don't bother with rsp or rbp
+    proc(context->win32_context->Rsi, arg);
+    proc(context->win32_context->Rdi, arg);
+    proc(context->win32_context->R8,  arg);
+    proc(context->win32_context->R9,  arg);
+    proc(context->win32_context->R10, arg);
+    proc(context->win32_context->R11, arg);
+    proc(context->win32_context->R12, arg);
+    proc(context->win32_context->R13, arg);
+    proc(context->win32_context->R14, arg);
+    proc(context->win32_context->R15, arg);
+}
 
 os_context_register_t *
 os_context_register_addr(os_context_t *context, int offset)
@@ -115,15 +128,9 @@ os_context_register_addr(os_context_t *context, int offset)
         offsetof(CONTEXT,R14),
         offsetof(CONTEXT,R15),
     };
-    return
-        (offset >= 0 && offset < 16) ?
-        ((void*)(context->win32_context)) + offsets[offset]  : 0;
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    return (void*)&context->win32_context->Rip; /*  REG_EIP */
+    return (void*)
+       ((offset >= 0 && offset < 16) ?
+        ((char*)(context->win32_context)) + offsets[offset] : 0);
 }
 
 os_context_register_t *

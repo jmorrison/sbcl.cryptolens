@@ -59,6 +59,8 @@
      ;; Various
      (cons-name +exception-single-step+)
      (cons +exception-access-violation+ 'memory-fault-error)
+     #+x86-64
+     (cons +exception-heap-corruption+ 'foreign-heap-corruption)
      (cons-name +exception-array-bounds-exceeded+)
      (cons-name +exception-breakpoint+)
      (cons-name +exception-datatype-misalignment+)
@@ -112,6 +114,19 @@
                      (exception-record c)
                      (exception-code c)))))
 
+;;; Undocumented exception (STATUS_HEAP_CORRUPTION). Occurs when calling free()
+;;; with a bad pointer and possibly other places. On 64-bit processes,
+;;; frame-based handlers don't get a chance to handle this exception because the
+;;; HeapSetInformation() option HeapEnableTerminationOnCorruption is enabled by
+;;; default and cannot be disabled. For the sake of interactive development and
+;;; error reporting, we special-case this exception in our vectored exception
+;;; handler, otherwise the SBCL process would be abruptly terminated.
+#+x86-64
+(define-condition foreign-heap-corruption (error) ()
+  (:report
+   #.(format nil "A foreign heap corruption exception occurred. (Exception code: ~S)"
+             +exception-heap-corruption+)))
+
 ;;; Actual exception handler. We hit something the runtime doesn't
 ;;; want to or know how to deal with (that is, not a sigtrap or gc wp
 ;;; violation), so it calls us here.
@@ -120,29 +135,39 @@
          (code (slot record 'exception-code))
          (condition-name (cdr (assoc code *exception-code-map*)))
          (sb-debug:*stack-top-hint* (sb-kernel:find-interrupted-frame)))
-    (cond ((stringp condition-name)
-           (error condition-name))
-          ((and condition-name
-                (subtypep condition-name 'arithmetic-error))
-           (multiple-value-bind (op operands)
-               (sb-di::decode-arithmetic-error-operands context-sap)
-             ;; Reset the accumulated exceptions
-             (setf (ldb sb-vm:float-sticky-bits (sb-vm:floating-point-modes)) 0)
-             (error condition-name :operation op
-                                   :operands operands)))
-          ((eq condition-name 'memory-fault-error)
-           (error 'memory-fault-error :address
-                  (sap-int (deref (slot record 'exception-information) 1))))
-          (condition-name
-           (error condition-name))
-          ((= code +dbg-printexception-c+)
-           (dbg-printexception-c record))
-          ((= code +dbg-printexception-wide-c+)
-           (dbg-printexception-wide-c record))
-          (t
-           (cerror "Return from the exception handler"
-                   'exception :context context-sap :record exception-record-sap
-                              :code code)))))
+    (unwind-protect
+         (cond ((stringp condition-name)
+                (error condition-name))
+               ((and condition-name
+                     (subtypep condition-name 'arithmetic-error))
+                (multiple-value-bind (op operands)
+                    (sb-di::decode-arithmetic-error-operands context-sap)
+                  ;; KLUDGE: FP errors from library functions reset
+                  ;; the FPU control bits.
+                  ;; This might enable some disabled exceptions, but
+                  ;; since at least one exception is not disabled it's
+                  ;; unlikely that disabling other exceptions is
+                  ;; important.
+                  (sb-vm::float-cold-init-or-reinit)
+                  (error condition-name :operation op
+                                        :operands operands)))
+               ((eq condition-name 'memory-fault-error)
+                (error 'memory-fault-error :address
+                       (sap-int (deref (slot record 'exception-information) 1))))
+               (condition-name
+                (error condition-name))
+               ((= code +dbg-printexception-c+)
+                (dbg-printexception-c record))
+               ((= code +dbg-printexception-wide-c+)
+                (dbg-printexception-wide-c record))
+               (t
+                (cerror "Return from the exception handler"
+                        'exception :context context-sap :record exception-record-sap
+                                   :code code)))
+      (when (eql code +exception-stack-overflow+)
+        ;; on the way out, reset win32's stack guard page.
+        (alien-funcall (extern-alien "win32_reset_stack_overflow_guard_page"
+                                     (function void)))))))
 
 
 (in-package "SB-UNIX")

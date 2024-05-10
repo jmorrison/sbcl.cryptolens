@@ -15,59 +15,28 @@
 
 (in-package "SB-C")
 
-;;; An OPAQUE-BOX instance is used to pass data from IR1 to IR2 as
-;;; a quoted object in a "source form" (not user-written) such that the
-;;; contained object is in a for-evaluation position but ignored by
-;;; the compiler's constant-dumping logic.
-(defstruct (opaque-box (:constructor opaquely-quote (value))
-                       (:copier nil)
-                       (:predicate opaque-box-p))
-  value)
-(declaim (freeze-type opaque-box))
-
 ;;; ANSI limits on compilation
-(defconstant call-arguments-limit most-positive-fixnum
+;;; On AMD64 we prefer to use the ECX (not RCX) register,
+;;; which means that there can only be 32 bits of precision,
+;;; so accounting for the fixnum tag and 1 bit for the sign,
+;;; this leaves 30 bits. Of course this number is ridiculous
+;;; as a call with that many args would consume 8 GB of stack,
+;;; but it's surely not as ridiculous as MOST-POSITIVE-FIXNUM.
+(defconstant call-arguments-limit
+  #+x86-64 (ash 1 30)
+  #-x86-64 most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(defconstant lambda-parameters-limit most-positive-fixnum
+(defconstant lambda-parameters-limit call-arguments-limit
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(defconstant multiple-values-limit most-positive-fixnum
+(defconstant multiple-values-limit call-arguments-limit
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
 
 ;;;; miscellaneous types used both in the cross-compiler and on the target
-
-;;;; FIXME: The INDEX and LAYOUT-DEPTHOID definitions probably belong
-;;;; somewhere else, not "early-c", since they're after all not part
-;;;; of the compiler.
-
-;;; the type of LAYOUT-DEPTHOID and LAYOUT-LENGTH values.
-;;; Each occupies two bytes of the %BITS slot when possible,
-;;; otherwise a slot unto itself.
-(def!type layout-depthoid () '(integer -1 #x7FFF))
-(def!type layout-length () '(integer 0 #xFFFF))
-(def!type layout-bitmap () 'integer)
-;;; ID must be an fixnum for either value of n-word-bits.
-(def!type layout-id () '(signed-byte 30))
-
-;;; An INLINEP value describes how a function is called. The values
-;;; have these meanings:
-;;;     NIL     No declaration seen: do whatever you feel like, but don't
-;;;             dump an inline expansion.
-;;; NOTINLINE  NOTINLINE declaration seen: always do full function call.
-;;;    INLINE  INLINE declaration seen: save expansion, expanding to it
-;;;             if policy favors.
-;;; MAYBE-INLINE
-;;;             Retain expansion, but only use it opportunistically.
-;;;             MAYBE-INLINE is quite different from INLINE. As explained
-;;;             by APD on #lisp 2005-11-26: "MAYBE-INLINE lambda is
-;;;             instantiated once per component, INLINE - for all
-;;;             references (even under #'without FUNCALL)."
-(deftype inlinep ()
-  '(member inline maybe-inline notinline nil))
 
 (defstruct (dxable-args (:constructor make-dxable-args (list))
                         (:predicate nil)
@@ -82,22 +51,26 @@
 
 (defstruct (ir1-namespace (:conc-name "") (:copier nil) (:predicate nil))
   ;; FREE-VARS translates from the names of variables referenced
-  ;; globally to the LEAF structures for them.
+  ;; globally to the LEAF structures for them. FREE-FUNS is like
+  ;; FREE-VARS, only it deals with function names.
+  ;;
+  ;; We must preserve the property that a proclamation for a global
+  ;; thing only affects the code after it. This takes some work, since
+  ;; a proclamation may appear in the middle of a block being
+  ;; compiled. If there are references before the proclaim, then we
+  ;; copy the current entry before modifying it. Code converted before
+  ;; the proclaim sees the old Leaf, while code after it sees the new
+  ;; LEAF.
   (free-vars (make-hash-table :test 'eq) :read-only t :type hash-table)
-  ;; FREE-FUNS is like FREE-VARS, only it deals with function names.
-  (free-funs (make-hash-table :test 'equal) :read-only t :type hash-table)
-  ;; These hashtables translate from constants to the LEAFs that
-  ;; represent them.
-  ;; Table 1: one entry per named constant
-  (named-constants (make-hash-table :test 'eq) :read-only t :type hash-table)
-  ;; Table 2: one entry for each unnamed constant as compared by EQL
+  (free-funs (make-hash-table :test #'equal) :read-only t :type hash-table)
+  ;; We use the same CONSTANT structure to represent all EQL anonymous
+  ;; constants. This hashtable translates from constants to the LEAFs
+  ;; that represent them.
   (eql-constants (make-hash-table :test 'eql) :read-only t :type hash-table)
-  ;; Table 3: one key per EQUAL constant,
-  ;; with the caveat that lookups must discriminate amongst constants that
-  ;; are EQUAL but not similar.  The value in the hash-table is a list of candidates
-  ;; (#<constant1> #<constant2> ... #<constantN>) such that CONSTANT-VALUE
-  ;; of each is EQUAL to the key for the hash-table entry, but dissimilar
-  ;; from each other. Notably, strings of different element types can't be similar.
+  ;; During file compilation we are allowed to coalesce similar
+  ;; constants. This coalescing is distinct from the coalescing done
+  ;; in the dumper, since the effect here is to reduce the number of
+  ;; boxed constants appearing in a code component.
   (similar-constants (sb-fasl::make-similarity-table) :read-only t :type hash-table))
 (declaim (freeze-type ir1-namespace))
 
@@ -111,216 +84,102 @@
 (defvar *allow-instrumenting*)
 
 ;;; miscellaneous forward declarations
-#+sb-dyncount (defvar *collect-dynamic-statistics*)
 (defvar *component-being-compiled*)
 (defvar *compiler-error-context*)
-(defvar *compiler-error-count*)
-(defvar *compiler-warning-count*)
-(defvar *compiler-style-warning-count*)
-(defvar *compiler-note-count*)
 ;;; Bind this to a stream to capture various internal debugging output.
 (defvar *compiler-trace-output* nil)
 ;;; These are the default, but the list can also include
-;;; :pre-ir2-optimize and :symbolic-asm.
+;;; :pre-ir2-optimize, :symbolic-asm.
 (defvar *compile-trace-targets* '(:ir1 :ir2 :vop :symbolic-asm :disassemble))
-(defvar *constraint-universe*)
 (defvar *current-path*)
 (defvar *current-component*)
-(defvar *delayed-ir1-transforms*)
-#+sb-dyncount
-(defvar *dynamic-counts-tn*)
 (defvar *elsewhere-label*)
-(defvar *event-note-threshold*)
-(defvar *failure-p*)
 (defvar *source-info*)
 (defvar *source-plist*)
 (defvar *source-namestring*)
-(defvar *undefined-warnings*)
-(defvar *warnings-p*)
-(defvar *lambda-conversions*)
-(defvar *compile-object* nil)
-(defvar *location-context* nil)
 
-(defvar *stack-allocate-dynamic-extent* t
-  "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
-and stack allocates otherwise inaccessible parts of the object whenever
-possible. Potentially long (over one page in size) vectors are, however, not
-stack allocated except in zero SAFETY code, as such a vector could overflow
-the stack without triggering overflow protection.")
+(defvar *handled-conditions* nil)
+(defvar *disabled-package-locks* nil)
 
-;;; *BLOCK-COMPILE-ARGUMENT* holds the original value of the :BLOCK-COMPILE
-;;; argument, which overrides any internal declarations.
-(defvar *block-compile-argument*)
-(declaim (type (member nil t :specified)
-               *block-compile-default* *block-compile-argument*))
-
-;;; This lock is seized in the compiler, and related areas -- like the
-;;; classoid/layout/class system.
-;;; Assigning a literal object enables genesis to dump and load it
-;;; without need of a cold-init function.
-#-sb-xc-host
-(!define-load-time-global **world-lock** (sb-thread:make-mutex :name "World Lock"))
-
-#-sb-xc-host
-(define-load-time-global *static-linker-lock*
-    (sb-thread:make-mutex :name "static linker"))
-
-(defmacro with-world-lock (() &body body)
-  #+sb-xc-host `(progn ,@body)
-  #-sb-xc-host `(sb-thread:with-recursive-lock (**world-lock**) ,@body))
 
 ;;;; miscellaneous utilities
 
-;;; This is for "observers" who want to know if type names have been added.
-;;; Rather than registering listeners, they can detect changes by comparing
-;;; their stored nonce to the current nonce. Additionally the observers
-;;; can detect whether function definitions have occurred.
-#-sb-xc-host
-(progn (declaim (fixnum *type-cache-nonce*))
-       (!define-load-time-global *type-cache-nonce* 0))
+;;; COMPILE-FILE usually puts all nontoplevel code in immobile space, but COMPILE
+;;; offers a choice. Because the immobile space GC does not run often enough (yet),
+;;; COMPILE usually places code in the dynamic space managed by our copying GC.
+;;; Change this variable if your application always demands immobile code.
+;;; In particular, ELF cores shrink the immobile code space down to just enough
+;;; to contain all code, plus about 1/2 MiB of spare, which means that you can't
+;;; subsequently compile a whole lot into immobile space.
+;;; The value is changed to :AUTO in make-target-2-load.lisp which supresses
+;;; codegen optimizations for immobile space, but nonetheless prefers to allocate
+;;; the code there, falling back to dynamic space if there is no room left.
+;;; These controls exist whether or not the immobile-space feature is present.
+(declaim (type (member :immobile :dynamic :auto) *compile-to-memory-space*)
+         (type (member :immobile :dynamic) *compile-file-to-memory-space*))
+(defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
+(export '*compile-file-to-memory-space*) ; silly user code looks at, even if no immobile-space
+(defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
 
-(defstruct (undefined-warning
-            (:print-object (lambda (x s)
-                             (print-unreadable-object (x s :type t)
-                               (prin1 (undefined-warning-name x) s))))
-            (:copier nil))
-  ;; the name of the unknown thing
-  (name nil :type (or symbol list))
-  ;; the kind of reference to NAME
-  (kind (missing-arg) :type (member :function :type :variable))
-  ;; the number of times this thing was used
-  (count 0 :type unsigned-byte)
-  ;; a list of COMPILER-ERROR-CONTEXT structures describing places
-  ;; where this thing was used. Note that we only record the first
-  ;; *UNDEFINED-WARNING-LIMIT* calls.
-  (warnings () :type list))
-(declaim (freeze-type undefined-warning))
-
-;;; Delete any undefined warnings for NAME and KIND. This is for the
-;;; benefit of the compiler, but it's sometimes called from stuff like
-;;; type-defining code which isn't logically part of the compiler.
-(declaim (ftype (function ((or symbol cons) keyword) (values))
-                note-name-defined))
-(defun note-name-defined (name kind)
-  #-sb-xc-host (atomic-incf *type-cache-nonce*)
-  ;; We do this BOUNDP check because this function can be called when
-  ;; not in a compilation unit (as when loading top level forms).
-  (when (boundp '*undefined-warnings*)
-    (let ((name (uncross name)))
-      (setq *undefined-warnings*
-            (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
-                       *undefined-warnings*))))
-  (values))
-
-;;; to be called when a variable is lexically bound
-(declaim (ftype (function (symbol) (values)) note-lexical-binding))
-(defun note-lexical-binding (symbol)
-    ;; This check is intended to protect us from getting silently
-    ;; burned when we define
-    ;;   foo.lisp:
-    ;;     (DEFVAR *FOO* -3)
-    ;;     (DEFUN FOO (X) (+ X *FOO*))
-    ;;   bar.lisp:
-    ;;     (DEFUN BAR (X)
-    ;;       (LET ((*FOO* X))
-    ;;         (FOO 14)))
-    ;; and then we happen to compile bar.lisp before foo.lisp.
-  (when (looks-like-name-of-special-var-p symbol)
-    ;; FIXME: should be COMPILER-STYLE-WARNING?
-    (style-warn 'asterisks-around-lexical-variable-name
-                :format-control
-                "using the lexical binding of the symbol ~
-                 ~/sb-ext:print-symbol-with-prefix/, not the~@
-                 dynamic binding"
-                :format-arguments (list symbol)))
-  (values))
-
-;;; This is DEF!STRUCT so that when SB-C:DUMPABLE-LEAFLIKE-P invokes
-;;; SB-XC:TYPEP in make-host-2, it does not need need to signal PARSE-UNKNOWN
-;;; for each and every constant seen up until this structure gets defined.
-(def!struct (debug-name-marker (:print-function print-debug-name-marker)
-                               (:copier nil)))
-
-(defvar *debug-name-level* 4)
-(defvar *debug-name-length* 12)
-(defvar *debug-name-punt*)
-(define-load-time-global *debug-name-sharp* (make-debug-name-marker))
-(define-load-time-global *debug-name-ellipsis* (make-debug-name-marker))
-
-(defun print-debug-name-marker (marker stream level)
-  (declare (ignore level))
-  (cond ((eq marker *debug-name-sharp*)
-         (write-char #\# stream))
-        ((eq marker *debug-name-ellipsis*)
-         (write-string "..." stream))
-        (t
-         (write-string "???" stream))))
+(defun compile-perfect-hash (lambda test-inputs)
+  ;; Don't blindly trust the hash generator: assert that computed values are
+  ;; in range and not repeated.
+  (let ((seen (make-array (power-of-two-ceiling (length test-inputs))
+                          :element-type 'bit :initial-element 0))
+        (f #-sb-xc-host ; use fasteval if possible
+           (cond #+sb-fasteval
+                 ((< (length test-inputs) 100) ; interpreting is faster
+                  (let ((*evaluator-mode* :interpret))
+                    (eval lambda)))
+                 (t (let ((*compile-to-memory-space* :dynamic))
+                      (compile nil lambda))))
+           #+sb-xc-host
+           (destructuring-bind (head lambda-list . body) lambda
+             (aver (eq head 'lambda))
+             (multiple-value-bind (forms decls) (parse-body body nil)
+               (declare (ignore decls))
+               ;; Give the host a definition for SB-C::UINT32-MODULARLY and remove _all_
+               ;; OPTIMIZE decls hidden within. We don't need to pedantically correctly
+               ;; code-walk here, because hash expressions are largely boilerplate that
+               ;; will not confusingly match forms such as (LET ((OPTIMIZE ...))).
+               (let ((new-body
+                      `(macrolet ((uint32-modularly (&whole form &rest exprs)
+                                    (declare (ignore exprs))
+                                    (funcall (sb-xc:macro-function 'sb-c::uint32-modularly)
+                                             form nil)))
+                         ,@(subst-if '(optimize)
+                                     (lambda (x) (typep x '(cons (eql optimize) (not null))))
+                                     forms))))
+                 (compile nil `(lambda ,lambda-list ,new-body)))))))
+    (loop for input across test-inputs
+          do (let ((h (funcall f input)))
+               (unless (zerop (bit seen h))
+                 (bug "Perfect hash generator failed on ~X" test-inputs))
+               (setf (bit seen h) 1)))
+    f))
 
 (declaim (ftype (sfunction () list) name-context))
 (defun debug-name (type thing &optional context)
-  (let ((*debug-name-punt* nil))
-    (labels ((walk (x)
-               (typecase x
-                 (cons
-                  (if (plusp *debug-name-level*)
-                      (let ((*debug-name-level* (1- *debug-name-level*)))
-                        (do ((tail (cdr x) (cdr tail))
-                             (name (cons (walk (car x)) nil)
-                                   (cons (walk (car tail)) name))
-                             (n (1- *debug-name-length*) (1- n)))
-                            ((or (not (consp tail))
-                                 (not (plusp n))
-                                 *debug-name-punt*)
-                             (cond (*debug-name-punt*
-                                    (setf *debug-name-punt* nil)
-                                    (nreverse name))
-                                   ((atom tail)
-                                    (nconc (nreverse name) (walk tail)))
-                                   (t
-                                    (setf *debug-name-punt* t)
-                                    (nconc (nreverse name) (list *debug-name-ellipsis*)))))))
-                      *debug-name-sharp*))
-                 ((or symbol number string)
-                  x)
-                 (t
-                  (type-of x)))))
-      (let ((name (list* type (walk thing) (when context (name-context)))))
-        (when (legal-fun-name-p name)
-          (bug "~S is a legal function name, and cannot be used as a ~
-                debug name." name))
-        name))))
+  (let ((name (list* type thing (when context (name-context)))))
+    (when (legal-fun-name-p name)
+      (bug "~S is a legal function name, and cannot be used as a ~
+            debug name." name))
+    name))
 
 ;;; Bound during eval-when :compile-time evaluation.
 (defvar *compile-time-eval* nil)
 (declaim (always-bound *compile-time-eval*))
 
 #-immobile-code (defmacro code-immobile-p (thing) `(progn ,thing nil))
-
-;;; Various error-code generating helpers
-(defvar *adjustable-vectors*)
-
-(defmacro with-adjustable-vector ((var) &rest body)
-  `(let ((,var (or (pop *adjustable-vectors*)
-                   (make-array 16
-                               :element-type '(unsigned-byte 8)
-                               :fill-pointer 0
-                               :adjustable t))))
-     ;; Don't declare the length - if it gets adjusted and pushed back
-     ;; onto the freelist, it's anyone's guess whether it was expanded.
-     ;; This code was wrong for >12 years, so nobody must have needed
-     ;; more than 16 elements. Maybe we should make it nonadjustable?
-     (declare (type (vector (unsigned-byte 8)) ,var))
-     (setf (fill-pointer ,var) 0)
-     ;; No UNWIND-PROTECT here - semantics are unaffected by nonlocal exit,
-     ;; and this macro is about speeding up the compiler, not slowing it down.
-     ;; GC will clean up any debris, and since the vector does not point
-     ;; to anything, even an accidental promotion to a higher generation
-     ;; will not cause transitive garbage retention.
-     (prog1 (progn ,@body)
-       (push ,var *adjustable-vectors*))))
-
+#-sb-xc-host ; not needed for make-hlst-1
+(defmacro maybe-with-system-tlab ((source-object) allocator)
+  (declare (ignorable source-object))
+  #+system-tlabs `(if (sb-vm::force-to-heap-p ,source-object)
+                      (locally (declare (sb-c::tlab :system)) ,allocator)
+                      ,allocator)
+  #-system-tlabs allocator)
+;;; TLAB selection is an aspect of a POLICY but this sets the global choice
+(defvar *force-system-tlab* nil)
 
 ;;; The allocation quantum for boxed code header words.
 ;;; 2 implies an even length boxed header; 1 implies no restriction.
@@ -347,6 +206,13 @@ the stack without triggering overflow protection.")
     (list (make-hash-table :test 'equal :synchronized t)))
   (declaim (type (cons hash-table) *code-coverage-info*)))
 
+;;; Unique number assigned into high 4 bytes of 64-bit code size slot
+;;; so that we can sort the contents of text space in a more-or-less
+;;; predictable manner based on the order in which code was loaded.
+;;; This wraps around at 32 bits, but it's still deterministic.
+(define-load-time-global *code-serialno* 0)
+(declaim (fixnum *code-serialno*))
+
 (deftype id-array ()
   '(and (array t (*))
         ;; Might as well be as specific as we can.
@@ -369,6 +235,13 @@ the stack without triggering overflow protection.")
   (coverage-metadata nil :type (or (cons hash-table hash-table) null) :read-only t)
   (msan-unpoison nil :read-only t)
   (sset-counter 1 :type fixnum)
+  ;; Map of function name -> something about how many calls were converted
+  ;; as ordinary calls not in the scope of a local or global notinline declaration.
+  ;; Useful for finding functions that were supposed to have been converted
+  ;; through some kind of transformation but were not.
+  ;; FIXME: this should be scoped to a compile/load but there are
+  ;; apparently some difficulties in doing so.
+  ; (emitted-full-calls (make-hash-table :test 'equal))
   ;; if emitting a cfasl, the fasl stream to that
   (compile-toplevel-object nil :read-only t)
   ;; The current block compilation state.  These are initialized to
@@ -381,7 +254,14 @@ the stack without triggering overflow protection.")
   ;; level lambdas resulting from compiling subforms. (In reverse
   ;; order.)
   (toplevel-lambdas nil :type list)
-
+  ;; We build a list of top-level lambdas, and then periodically smash them
+  ;; together into a single component and compile it.
+  (pending-toplevel-lambdas nil :type list)
+  ;; We record whether the package environment has changed during the
+  ;; compilation of some sequence top level forms. This allows the
+  ;; compiler to dump symbols in such a way that the loader can
+  ;; reconstruct them in the correct package.
+  (package-environment-changed nil :type boolean)
   ;; Bidrectional map between IR1/IR2/assembler abstractions and a corresponding
   ;; small integer or string identifier. One direction could be done by adding
   ;; the ID as slot to each object, but we want both directions.
@@ -396,7 +276,7 @@ the stack without triggering overflow protection.")
   (objmap-id-to-ir2block nil :type (or null id-array)) ; number -> IR2-BLOCK
   (objmap-id-to-tn       nil :type (or null id-array)) ; number -> TN
   (objmap-id-to-label    nil :type (or null id-array)) ; number -> LABEL
-  )
+  deleted-source-paths)
 (declaim (freeze-type compilation))
 
 (sb-impl::define-thread-local *compilation*)
@@ -406,3 +286,39 @@ the stack without triggering overflow protection.")
 ;;  "#define MEM_TO_SHADOW(mem) (((uptr)(mem)) ^ 0x500000000000ULL)"
 #+linux ; shadow space differs by OS
 (defconstant sb-vm::msan-mem-to-shadow-xor-const #x500000000000)
+
+(define-load-time-global *emitted-full-calls*
+    (make-hash-table :test 'equal #-sb-xc-host :synchronized #-sb-xc-host t))
+
+(defmacro get-emitted-full-calls (name)
+;; Todo: probably remove the wrapping cons. It was for globaldb
+;; which is particularly inefficient at updates (because it can only
+;; use an R/C/U paradigm, and so conses on every insert,
+;; unlike a hash-table which can just update the cell)
+  `(gethash ,name *emitted-full-calls*))
+
+;; Return the number of calls to NAME that IR2 emitted as full calls,
+;; not counting calls via #'F that went untracked.
+;; Return 0 if the answer is nonzero but a warning was already signaled
+;; about any full calls were emitted. This return convention satisfies the
+;; intended use of this statistic - to decide whether to generate a warning
+;; about failure to inline NAME, which is shown at most once per name
+;; to avoid unleashing a flood of identical warnings.
+(defun emitted-full-call-count (name)
+  (let ((status (get-emitted-full-calls name)))
+    (and (integerp status)
+         ;; Bit 0 tells whether any call was NOT in the presence of
+         ;; a 'notinline' declaration, thus eligible to be inline.
+         ;; Bit 1 tells whether any warning was emitted yet.
+         (= (logand status 3) #b01)
+         (ash status -2)))) ; the call count as tracked by IR2
+
+(defun accumulate-full-calls (data)
+  (loop for (name status) in data
+        do
+        (let ((existing (gethash name *emitted-full-calls* 0)))
+          (setf (gethash name *emitted-full-calls*)
+                (logior (+ (logand existing #b11) ; old flag bits
+                           (logand status #b11))  ; new flag bits
+                        (logand existing -4)      ; old count
+                        (logand status -4))))))   ; new count

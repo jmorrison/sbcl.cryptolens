@@ -124,6 +124,27 @@
 
 (defun integer-from-octets (octets)
   (declare (type (array (unsigned-byte 8) (*)) octets))
+  #-sb-xc-host (aver (array-header-p octets))
+
+  ;; Bignums are little-endian by word, but native-endian within each word,
+  ;; making use of the less consy algorithm too tricky for big-endian CPUs.
+  ;; And this does not work for little-endian, but I don't know why.
+  ;; It should not be too hard to use random testing to find an input
+  ;; at which the output obviously differs from the shift+add loop.
+  #+nil
+  (let ((input (%array-data octets)))
+    (if (typep (%vector-raw-bits input 0) 'fixnum)
+        (%vector-raw-bits input 0)
+        (let* ((nbytes (length octets))
+               (last-byte (if (plusp nbytes) (aref octets (1- nbytes)) 0))
+               ;; If the high bit of the highest byte is 1, we might need one more
+               ;; byte to avoid the bignum coming out negative.
+               (nbits (* (+ nbytes (ash last-byte -7)) sb-vm:n-byte-bits))
+               (ndigits (ceiling nbits sb-vm:n-word-bits))
+               (bignum (sb-bignum:%allocate-bignum ndigits)))
+          (dotimes (i ndigits (sb-bignum::%normalize-bignum bignum ndigits))
+            (setf (%bignum-ref bignum i) (%vector-raw-bits input i))))))
+
   (let ((result 0) (shift 0))
     (dovector (byte octets result)
       (setf result (logior result (ash byte shift))
@@ -143,11 +164,13 @@
 ;;;   the code that could not be deduced by examining the object.
 ;;; It makes sense to store these externally to the object, as it would otherwise
 ;;; intrude on text pages. Also, some of the bignums are shareable this way.
-(defun pack-code-fixup-locs (abs-fixups rel-fixups)
-  (let ((bytes (make-array (* 2 (+ (length abs-fixups) ; guess at final length
-                                   (length rel-fixups)))
-                           :fill-pointer 0 :adjustable t
-                           :element-type '(unsigned-byte 8))))
+(defun pack-code-fixup-locs (abs-fixups rel-fixups more)
+  (dx-let ((bytes (make-array (min (* 2 (+ (length abs-fixups) ; guess at final length
+                                           (length rel-fixups)
+                                           (length more)))
+                                   1024) ; limit the stack usage
+                              :fill-pointer 0 :adjustable t
+                              :element-type '(unsigned-byte 8))))
     (flet ((pack (list &aux (prev 0))
              (dolist (x list)
                ;; two fixups at the same location have to be wrong,
@@ -156,9 +179,12 @@
                (write-var-integer (- x prev) bytes)
                (setq prev x))))
       (pack (sort abs-fixups #'<))
-      (when rel-fixups
+      (when (or rel-fixups more)
         (write-var-integer 0 bytes)
-        (pack (sort rel-fixups #'<))))
+        (pack (sort rel-fixups #'<)))
+      (when more
+        (write-var-integer 0 bytes)
+        (pack (sort more #'<))))
     ;; Stuff octets into an integer
     ;; It would be quite possible in the target to do something clever here
     ;; by creating a bignum directly from the ub8 vector.
@@ -189,12 +215,14 @@
                  (let ((,loc (+ ,prev ,acc))) ,@body (setq ,prev ,loc))
                  (setq ,acc 0 ,shift 0))))))))
 
+;;; Unpack the (potentially) three stream of data in PACKED-INTEGER.
 (defun unpack-code-fixup-locs (packed-integer)
-  (collect ((abs-locs) (rel-locs))
+  (collect ((stream1) (stream2) (stream3))
     (let ((pos 0))
-      (do-packed-varints (loc packed-integer pos) (abs-locs loc))
-      (do-packed-varints (loc packed-integer pos) (rel-locs loc)))
-    (values (abs-locs) (rel-locs))))
+      (do-packed-varints (loc packed-integer pos) (stream1 loc))
+      (do-packed-varints (loc packed-integer pos) (stream2 loc))
+      (do-packed-varints (loc packed-integer pos) (stream3 loc)))
+    (values (stream1) (stream2) (stream3))))
 
 (define-symbol-macro lz-symbol-1 210) ; arbitrary value that isn't frequent in the input
 (define-symbol-macro lz-symbol-2 218) ; ditto

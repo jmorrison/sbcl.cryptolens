@@ -59,36 +59,6 @@
 (defun sc-locations-member (location locations)
   (logbitp location locations))
 
-;;; This used to have two local functions in it, but when it did,
-;;; using ABCL as the build host crashed thusly with no backtrace:
-;;; (funcall (macro-function 'do-sc-locations)
-;;;           '(do-sc-locations (el (sc-locations sc) nil (sc-element-size sc))
-;;;             (feep))
-;;;            nil)
-;;;  => Debugger invoked on condition of type TYPE-ERROR
-;;;     The value NIL is not of type STRUCTURE-OBJECT.
-(defmacro do-sc-locations ((location locations
-                            &optional result increment (limit 'sb-vm:finite-sc-offset-limit))
-                           &body body)
-  (let ((mid (floor sb-vm:finite-sc-offset-limit 2)))
-    (once-only ((locations locations)
-                (increment `(the sb-vm:finite-sc-offset ,(or increment 1))))
-      (flet ((make-guarded-block (start end)
-                 (unless (and (integerp limit) (> start limit))
-                   (let ((mask (dpb -1 (byte mid start) 0)))
-                     `((when (logtest ,mask ,locations)
-                         (loop named #:noname
-                               for ,location
-                               from ,start below ,end by ,increment
-                               when (logbitp ,location ,locations)
-                                 do (locally (declare (type sb-vm:finite-sc-offset
-                                                            ,location))
-                                      ,@body))))))))
-        `(block nil
-           ,@(make-guarded-block 0   mid)
-           ,@(make-guarded-block mid limit)
-           ,result)))))
-
 ;;; the different policies we can use to determine the coding strategy
 (deftype ltn-policy ()
   '(member :safe :small :small-safe :fast :fast-safe))
@@ -134,8 +104,8 @@
 ;;;    environment pointer should be saved after the binding is
 ;;;    instantiated.
 ;;;
-;;; PHYSENV-INFO
-;;;    Holds the IR2-PHYSENV structure.
+;;; ENVIRONMENT-INFO
+;;;    Holds the IR2-ENVIRONMENT structure.
 ;;;
 ;;; TAIL-SET-INFO
 ;;;    Holds the RETURN-INFO structure.
@@ -162,9 +132,16 @@
 ;;; An IR2-BLOCK holds information about a block that is used during
 ;;; and after IR2 conversion. It is stored in the BLOCK-INFO slot for
 ;;; the associated block.
-(defstruct (ir2-block (:include block-annotation)
-                      (:constructor make-ir2-block (block))
+(defstruct (ir2-block (:constructor make-ir2-block (block))
                       (:copier nil))
+  ;; The IR1 block that this block is in the INFO for.
+  (block (missing-arg) :type cblock)
+  ;; the next and previous block in emission order (not DFO). This
+  ;; determines which block we drop though to, and is also used to
+  ;; chain together overflow blocks that result from splitting of IR2
+  ;; blocks in lifetime analysis.
+  (next nil :type (or ir2-block null))
+  (prev nil :type (or ir2-block null))
   ;; the IR2-BLOCK's number, which differs from BLOCK's BLOCK-NUMBER
   ;; if any blocks are split. This is assigned by lifetime analysis.
   (number nil :type (or index null))
@@ -185,6 +162,9 @@
   ;; first.
   (start-stack () :type list)
   (end-stack () :type list)
+  ;; list of all lvars ever pushed onto the stack when control reaches
+  ;; the start of this block.
+  (stack-mess-up () :type list)
   ;; the first and last VOP in this block. If there are none, both
   ;; slots are null.
   (start-vop nil :type (or vop null))
@@ -231,7 +211,9 @@
   (dropped-thru-to nil)
   ;; list of LOCATION-INFO structures describing all the interesting
   ;; (to the debugger) locations in this block
-  (locations nil :type list))
+  (locations nil :type list)
+  ;; reference to list of source paths for coverage
+  (covered-paths-ref (list nil) :type list))
 
 (defprinter (ir2-block :identity t)
   (pushed :test pushed)
@@ -242,7 +224,7 @@
   (%label :test %label))
 
 ;;; An IR2-LVAR structure is used to annotate LVARs that are used as a
-;;; function result LVARs or that receive MVs.
+;;; function result LVAR or that receive MVs.
 (defstruct (ir2-lvar
             (:constructor make-ir2-lvar (primitive-type))
             (:copier nil))
@@ -259,7 +241,10 @@
   ;;
   ;; If this is :UNUSED, then this LVAR should never actually be used
   ;; as the destination of a value: it is only used tail-recursively.
-  (kind :fixed :type (member :delayed :fixed :unknown :unused))
+  ;;
+  ;; If this is :STACK, then this LVAR represents the stack pointer
+  ;; used to undo stack allocation of dynamic extent objects.
+  (kind :fixed :type (member :delayed :fixed :unknown :unused :stack))
   ;; The primitive-type of the first value of this LVAR. This is
   ;; primarily for internal use during LTN, but it also records the
   ;; type restriction on delayed references. In multiple-value
@@ -276,8 +261,7 @@
   ;; since type checking is the responsibility of the values receiver,
   ;; these TNs primitive type is only based on the proven type
   ;; information.
-  (locs nil :type list)
-  (stack-pointer nil :type (or tn null)))
+  (locs nil :type list))
 
 (defprinter (ir2-lvar)
   kind
@@ -309,6 +293,7 @@
   ;; These TNs will also appear in the {NORMAL,RESTRICTED,WIRED} TNs
   ;; as appropriate to their location.
   (component-tns () :type list)
+  #-c-stack-is-control-stack
   ;; If this component has a NFP, then this is it.
   (nfp nil :type (or tn null))
   ;; a list of the explicitly specified save TNs (kind
@@ -319,12 +304,16 @@
   ;; POPPED. This slot is initialized by LTN-ANALYZE as an input to
   ;; STACK-ANALYZE.
   (values-receivers nil :type list)
+  ;; If this component stack allocates anything, this is true.
+  (stack-allocates-p nil :type boolean)
+  ;; a list of all the blocks which mess up the stack with dynamic
+  ;; extent allocated objects.
+  (stack-mess-ups nil :type list)
   ;; an adjustable vector that records all the constants in the
   ;; constant pool. A non-immediate :CONSTANT TN with offset 0 refers
   ;; to the constant in element 0, etc. Normal constants are
   ;; represented by the placing the CONSTANT leaf in this vector. A
-  ;; load-time constant is distinguished by being a cons
-  ;; (KIND WHAT TN).
+  ;; load-time constant is distinguished by being a cons (KIND WHAT).
   ;; KIND is a keyword indicating how the constant is computed, and
   ;; WHAT is some context.
   ;;
@@ -346,17 +335,19 @@
   ;;    Is replaced with the result of executing the forms
   ;;    to compute <handle>.
   ;;
+  ;; as well as a few other forms of magic - see DUMP-CODE-OBJECT.
+  ;; (:constant )
+  ;; (:coverage-marks )
+  ;; (:tls-index )
+
   ;; A null entry in this vector is a placeholder for implementation
   ;; overhead that is eventually stuffed in somehow.
   ;; Prior to performing SORT-BOXED-CONSTANTS, the index 0 is reserved
   ;; to signify something (other than NIL) if stored as a TN-OFFSET,
-  ;; though nothing makes use of this at present.
+  ;; though nothing makes use of this at present. (Uh, what did I mean by this?)
   (constants (make-array 10 :fill-pointer 1 :adjustable t
                          :initial-element :ignore)
              :type vector :read-only t)
-  ;; some kind of info about the component's run-time representation.
-  ;; This is filled in by the VM supplied SELECT-COMPONENT-FORMAT function.
-  format
   ;; a list of the ENTRY-INFO structures describing all of the entries
   ;; into this component. Filled in by entry analysis.
   (entries nil :type list)
@@ -375,8 +366,12 @@
   ;; collect dynamic statistics.)
   #+sb-dyncount
   (dyncount-info nil :type (or null dyncount-info))
-  #+avx2
-  (avx2-used-p nil))
+  ;; the number of jump table entries in this component
+  (n-jump-table-entries 0 :type index)
+  ;; an array of references to lists of original source paths covered
+  ;; for coverage instrumentation.
+  (coverage-map (make-array 0 :fill-pointer 0 :adjustable t)
+                :type vector :read-only t))
 
 ;;; An ENTRY-INFO condenses all the information that the dumper needs
 ;;; to create each XEP's function entry data structure. ENTRY-INFO
@@ -408,16 +403,16 @@
         (xref (entry-info-xref entry)))
     (if (and type xref) (cons type xref) (or type xref))))
 
-;;; An IR2-PHYSENV is used to annotate non-LET LAMBDAs with their
-;;; passing locations. It is stored in the PHYSENV-INFO.
-(defstruct (ir2-physenv (:copier nil))
+;;; An IR2-ENVIRONMENT is used to annotate non-LET LAMBDAs with their
+;;; passing locations. It is stored in the ENVIRONMENT-INFO.
+(defstruct (ir2-environment (:copier nil))
   ;; TN info for closed-over things within the function: an alist
   ;; mapping from NLX-INFOs and LAMBDA-VARs to TNs holding the
   ;; corresponding thing within this function
   ;;
   ;; Elements of this list have a one-to-one correspondence with
-  ;; elements of the PHYSENV-CLOSURE list of the PHYSENV object that
-  ;; links to us.
+  ;; elements of the ENVIRONMENT-CLOSURE list of the ENVIRONMENT
+  ;; object that links to us.
   (closure (missing-arg) :type list :read-only t)
   ;; the TNs that hold the OLD-FP and RETURN-PC within the function.
   ;; We always save these so that the debugger can do a backtrace,
@@ -441,6 +436,7 @@
   ;; True if this function has a frame on the number stack. This is
   ;; set by representation selection whenever it is possible that some
   ;; function in our tail set will make use of the number stack.
+  #-c-stack-is-control-stack
   (number-stack-p nil :type boolean)
   ;; a list of all the :ENVIRONMENT TNs live in this environment
   (live-tns nil :type list)
@@ -459,7 +455,7 @@
   #+unwind-to-frame-and-call-vop
   (bsp-save-tn nil :type (or tn null)))
 
-(defprinter (ir2-physenv)
+(defprinter (ir2-environment)
   closure
   old-fp
   return-pc
@@ -473,7 +469,7 @@
   ;; The return convention used:
   ;; -- If :UNKNOWN, we use the standard return convention.
   ;; -- If :FIXED, we use the known-values convention.
-  (kind (missing-arg) :type (member :fixed :unknown))
+  (kind (missing-arg) :type (member :fixed :unknown :unboxed))
   ;; the number of values returned, or :UNKNOWN if we don't know.
   ;; COUNT may be known when KIND is :UNKNOWN, since we may choose the
   ;; standard return convention for other reasons.
@@ -561,6 +557,8 @@
   ;; the link for a list running through all TN-REFs for this TN of
   ;; the same kind (read or write)
   (next nil :type (or tn-ref null))
+  ;; For faster delete-tn-ref
+  (prev nil :type (or tn-ref null))
   ;; the VOP where the reference happens, or NIL temporarily
   (vop nil :type (or vop null))
   ;; the link for a list of all TN-REFs in VOP, in reverse order of
@@ -692,7 +690,7 @@
   ;;
   ;; :KNOWN-RETURN
   ;;     If needed, the old NFP is computed using COMPUTE-OLD-NFP.
-  (move-args nil :type (member nil :full-call :local-call :known-return))
+  (move-args nil :type (member nil :full-call :local-call :known-return :fixed))
   ;; a list of sc-vectors representing the loading costs of each fixed
   ;; argument and result
   (arg-costs nil :type list)
@@ -709,6 +707,7 @@
   ;; operand SC restriction.
   (arg-load-scs nil :type list)
   (result-load-scs nil :type list)
+  (more-arg-load-scs nil :type (or null sc-vector))
   ;; a function that emits assembly code for a use of this VOP when it
   ;; is called with the VOP structure. This is null if this VOP has no
   ;; specified generator (i.e. if it exists only to be inherited by
@@ -734,13 +733,22 @@
   ;; encodes the source ref (shifted 8, it is also encoded in
   ;; MAX-VOP-TN-REFS) and the dest ref index.
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1)))
-  (optimizer nil :type (or null function))
+  (optimizer nil :type (or null function (cons function symbol)))
   (optional-results nil :type list)
-  move-vop-p)
+  move-vop-p
+  (after-sc-selection nil :type (or null function) :read-only t))
+(!set-load-form-method vop-info (:xc :target) :ignore-it)
+
 (declaim (inline vop-name))
 (defun vop-name (vop)
   (declare (type vop vop))
   (vop-info-name (vop-info vop)))
+
+(defun set-vop-optimizer (info fun)
+  (when (vop-info-optimizer info)
+    ;; Warn about trying to make two optimizers, because it doesn't work
+    (warn "Redefining vop-info-optimizer for ~S" (vop-info-name info)))
+  (setf (vop-info-optimizer info) fun))
 
 ;; These printers follow the definition of VOP-INFO because they
 ;; want to inline VOP-INFO-NAME, and it's less code to move them here
@@ -855,7 +863,8 @@
 ;;; The compiler will never look at the toplevel value though.
 (defvar *finite-sbs*
   #-sb-xc-host
-  (make-array #.(count :non-packed *backend-sbs* :key #'sb-kind :test #'neq)))
+  (make-array #.(count :non-packed *backend-sbs* :key #'sb-kind :test #'neq)
+              :initial-element (make-unbound-marker)))
 #-sb-xc-host
 (progn
   (declaim (type (simple-vector #.(length *finite-sbs*)) *finite-sbs*)
@@ -1089,8 +1098,8 @@
   ;; some kind of info about how important this TN is
   (cost 0 :type fixnum)
   ;; If a :ENVIRONMENT or :DEBUG-ENVIRONMENT TN, this is the
-  ;; physical environment that the TN is live throughout.
-  (physenv nil :type (or physenv null))
+  ;; environment that the TN is live throughout.
+  (environment nil :type (or environment null))
   ;; Used by pack-iterative
   (vertex nil))
 
@@ -1155,3 +1164,10 @@
   block
   kind
   (number :test number))
+
+(defstruct (conditional-flags
+            (:constructor make-conditional-flags (flags))
+            (:copier nil))
+  flags)
+
+(declaim (freeze-type conditional-flags))

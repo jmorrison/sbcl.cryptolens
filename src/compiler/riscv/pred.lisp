@@ -31,16 +31,16 @@
   (:generator 0
     (error "BRANCH-IF should not be needed on RISC-V.")))
 
-(defun convert-conditional-move-p (node dst-tn x-tn y-tn)
-  (declare (ignore node dst-tn x-tn y-tn))
+(defun convert-conditional-move-p (dst-tn)
+  (declare (ignore dst-tn))
   nil)
 
 
 ;;;; Conditional VOPs:
 
 (define-vop (if-eq)
-  (:args (x :scs (any-reg descriptor-reg))
-         (y :scs (any-reg descriptor-reg)))
+  (:args (x :scs (any-reg descriptor-reg zero))
+         (y :scs (any-reg descriptor-reg zero)))
   (:conditional)
   (:info target not-p)
   (:policy :fast-safe)

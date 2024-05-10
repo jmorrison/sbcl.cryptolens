@@ -18,7 +18,7 @@
  * more information.
  */
 
-#include "genesis/config.h"
+#include "genesis/sbcl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +29,7 @@
   #define boolean rpcndr_boolean
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
+  #include <ntstatus.h>
   #include <shlobj.h>
   #include <wincrypt.h>
   #include <winsock2.h>
@@ -70,11 +71,18 @@
 #endif
 
 #include "wrap.h"
-#include "gc.h"
+#include "gc-typedefs.h" // for page_index_t
+#include "os.h" // for os_vm_size_t
+
+#if defined LISP_FEATURE_WIN32 && defined LISP_FEATURE_64_BIT
+# define CAST_SIZEOF (unsigned long)
+#else
+# define CAST_SIZEOF
+#endif
 
 #define DEFTYPE(lispname,cname) { cname foo; \
     printf("(define-alien-type " lispname " (%s %lu))\n", \
-           (((foo=-1)<0) ? "signed" : "unsigned"), (8LU * (sizeof foo))); }
+           (((foo=-1)<0) ? "signed" : "unsigned"), (8LU * CAST_SIZEOF (sizeof foo))); }
 
 #define DEFSTRUCT(lispname,cname,body) { cname bar; \
     printf("(define-alien-type nil\n  (struct %s", #lispname); \
@@ -84,13 +92,16 @@
     printf("\n          (%s (%s %lu))", \
            #lispname, \
            (((bar.cname=-1)<0) ? "signed" : "unsigned"), \
-           (8LU * (sizeof bar.cname)))
+           (8LU * CAST_SIZEOF (sizeof bar.cname)))
 
-void
-defconstant(char* lisp_name, unsigned long unix_number)
-{
-    printf("(defconstant %s %lu) ; #x%lx\n",
-           lisp_name, unix_number, unix_number);
+#define DEFCONSTANT(lispname,cname) \
+  if (cname<0) defconstant_neg(lispname, cname); else defconstant(lispname,cname)
+
+void defconstant(char* lisp_name, unsigned long unix_number) {
+    printf("(defconstant %s %lu) ; #x%lx\n", lisp_name, unix_number, unix_number);
+}
+void defconstant_neg(char* lisp_name, long unix_number) {
+    printf("(defconstant %s %ld)\n", lisp_name, unix_number);
 }
 
 #ifdef __HAIKU__
@@ -340,10 +351,11 @@ main(int argc, char __attribute__((unused)) *argv[])
 #endif // !WIN32
     printf("\n");
 
+#if !defined(LISP_FEATURE_AVOID_CLOCK_GETTIME)
 #ifdef LISP_FEATURE_UNIX
-    defconstant("clock-realtime", CLOCK_REALTIME);
-    defconstant("clock-monotonic", CLOCK_MONOTONIC);
-    defconstant("clock-process-cputime-id", CLOCK_PROCESS_CPUTIME_ID);
+    DEFCONSTANT("clock-realtime", CLOCK_REALTIME);
+    DEFCONSTANT("clock-monotonic", CLOCK_MONOTONIC);
+    DEFCONSTANT("clock-process-cputime-id", CLOCK_PROCESS_CPUTIME_ID);
 #endif
 #ifdef LISP_FEATURE_LINUX
 #ifdef CLOCK_REALTIME_ALARM
@@ -361,7 +373,8 @@ main(int argc, char __attribute__((unused)) *argv[])
 #ifdef CLOCK_BOOTTIME_ALARM
     defconstant("clock-boottime-alarn", CLOCK_BOOTTIME_ALARM);
 #endif
-    defconstant("clock-thread-cputime-id", CLOCK_THREAD_CPUTIME_ID);
+    DEFCONSTANT("clock-thread-cputime-id", CLOCK_THREAD_CPUTIME_ID);
+#endif
 #endif
     printf(";;; structures\n");
     DEFSTRUCT(timeval, struct timeval,
@@ -393,7 +406,7 @@ main(int argc, char __attribute__((unused)) *argv[])
 #endif
 
     printf("(in-package \"SB-KERNEL\")\n\n");
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
     printf(";;; GENCGC related\n");
     DEFTYPE("page-index-t", page_index_t);
     DEFTYPE("generation-index-t", generation_index_t);

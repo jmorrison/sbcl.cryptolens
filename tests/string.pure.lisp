@@ -125,7 +125,11 @@ claim that any particular result from these edge cases constitutes a bug.
                        :allow-failure t :allow-warnings t)
     (assert failure-p)
     (assert (= 1 (length warnings)))
-    (assert-error (funcall fun) type-error)))
+    ;; It's not clear why this function should be expected to return a TYPE-ERROR.
+    ;; There is no object created which is of the wrong type,
+    ;; and the type of the legal value of ELEMENT-TYPE isn't really in question
+    ;; nor is the best way to describe what you can't pass.
+    (assert-error (funcall fun) #|type-error|#)))
 
 ;; MISC.574
 (with-test (:name (string<= base-string :optimized))
@@ -258,3 +262,115 @@ claim that any particular result from these edge cases constitutes a bug.
   (let ((result (funcall (checked-compile `(lambda (x) (write-to-string x))) 33d0)))
     (assert (equal result "33.0d0"))
     (assert (typep result 'simple-base-string))))
+
+(with-test (:name :make-string-fail-early)
+  ;; This used to get "Heap exhausted"
+  (assert-error
+   (funcall (opaque-identity 'make-string) (truncate array-total-size-limit 2)
+            :element-type '(unsigned-byte 8))))
+
+(with-test (:name :make-string-pedantic-initial-element)
+  ;; This used to be silently accepted (at least in the interpreter)
+  (assert-error
+   (funcall (opaque-identity 'make-string) 10
+            :element-type '(member #\a #\b #\c) :initial-element nil))
+  ;; As was this
+  (assert-error
+   (funcall (opaque-identity 'make-string) 10
+            :element-type '(member #\a #\b #\c) :initial-element #\x)))
+
+(with-test (:name :%sp-string-compare-argument-order)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (string/= "_" (the simple-string x)))
+   (("_") nil)
+   (("a") 0)))
+
+(with-test (:name :string=-derive-type)
+  (macrolet
+      ((check (fun expected)
+         `(assert
+           (equal (second
+                   (third
+                    (sb-kernel:%simple-fun-type
+                     (checked-compile '(lambda (x y)
+                                        (declare (ignorable x y))
+                                        ,fun)))))
+                  ',expected))))
+    (check (string= (the (simple-string 1) x)
+                    (the (simple-string 2) y)) null)
+    (check (string= (the (simple-base-string 1) x)
+                    (the (simple-base-string 2) y)) null)
+    (check (string= (the (simple-array character (1)) x)
+                    (the (simple-array character (2)) y)) null)))
+
+(with-test (:name :string/=-derive-type)
+  (macrolet
+      ((check (fun expected)
+         `(assert
+           (type-specifiers-equal
+            (second
+             (third
+              (sb-kernel:%simple-fun-type
+               (checked-compile '(lambda (x y)
+                                  (declare (ignorable x y))
+                                  ,fun)))))
+            ',expected))))
+    (check (string/= (the (simple-string 4) x)
+                     (the (simple-string 1) y)
+                     :start1 1 :end1 * :end2 0) (or (integer 1 1) null))))
+
+#+sb-unicode
+(with-test (:name :possibly-base-stringize)
+  ;;  simple-base, base non-simple
+  (let* ((str (make-string 4 :element-type 'base-char))
+         (res (sb-int:possibly-base-stringize str)))
+    (assert (eq res str)))
+  (let* ((str (make-array 4 :element-type 'base-char
+                          :displaced-to (make-string 4 :element-type 'base-char)))
+         (res (sb-int:possibly-base-stringize str)))
+    (assert (and (sb-int:neq res str) (typep res 'simple-base-string))))
+  ;;  simple-character w/ASCII only, non-simple character w/ASCII only
+  (let* ((str (make-string 4))
+         (res (sb-int:possibly-base-stringize str)))
+    (assert (and (sb-int:neq res str) (typep res 'simple-base-string))))
+  (let* ((str (make-array 4 :element-type 'character
+                          :displaced-to (make-string 4)))
+         (res (sb-int:possibly-base-stringize str)))
+    (assert (and (sb-int:neq res str) (typep res 'simple-base-string))))
+  ;; simple-character w/Unicode, non-simple character w/Unicode
+  (let* ((str (make-string 4 :initial-element #\u3f4))
+         (res (sb-int:possibly-base-stringize str)))
+    (assert (and (eq res str) (typep res 'sb-kernel:simple-character-string))))
+  (let* ((str (make-array 4 :element-type 'character
+                          :displaced-to
+                          (make-string 4 :initial-element #\u3f5)))
+         (res (sb-int:possibly-base-stringize str)))
+    (assert (and (sb-int:neq res str) (typep res 'sb-kernel:simple-character-string)))))
+(with-test (:name :possibly-base-stringize-dx :skipped-on :interpreter)
+  (let* ((str (make-string 4 :element-type 'base-char))
+         (res (sb-int:possibly-base-stringize-to-heap str)))
+    (declare (dynamic-extent str))
+    (assert (if (sb-kernel:dynamic-space-obj-p str)
+                (eq res str)
+                (not (eq res str))))))
+
+(with-test (:name :string-case-type)
+  (macrolet
+      ((check (fun expected)
+         `(assert
+           (type-specifiers-equal
+            (second
+             (third
+              (sb-kernel:%simple-fun-type
+               (checked-compile '(lambda (x)
+                                  (declare (ignorable x))
+                                  ,fun)))))
+            ',expected))))
+    (check (string-upcase nil)
+           (simple-base-string 3))
+    (check (string-upcase (the symbol x))
+           simple-string)
+    (check (string-upcase (the character x))
+           (simple-string 1))))

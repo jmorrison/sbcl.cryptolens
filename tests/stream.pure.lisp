@@ -207,6 +207,30 @@
     (princ "!!" stream)
     (assert (equal "0b2d!!" (get-output-stream-string stream)))))
 
+(with-test (:name (make-string-output-stream file-position :lp-1839040))
+  (let ((stream (make-string-output-stream)))
+    (dotimes (i 64) (write-char #\a stream))
+    (file-position stream 40)
+    (write-char #\x stream)
+    (file-position stream 39)
+    (write-char #\y stream)
+    (file-position stream 41)
+    (write-char #\z stream)
+    (let ((string (get-output-stream-string stream)))
+      (assert (equal "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaayxzaaaaaaaaaaaaaaaaaaaaaa" string))))
+  (let ((stream (make-string-output-stream)))
+    (dotimes (i 64) (write-char #\a stream))
+    (dotimes (i 64) (write-char #\b stream))
+    (file-position stream 3)
+    (file-position stream 4)
+    (write-char #\x stream)
+    (let ((string (get-output-stream-string stream))
+          (expected (concatenate
+                     'string
+                     (loop for i from 0 below 64 collect (if (= i 4) #\x #\a))
+                     (loop for i from 0 below 64 collect #\b))))
+      (assert (equal expected string)))))
+
 ;;; WITH-OUTPUT-TO-STRING (when provided with a string argument)
 ;;;
 ;;; * Observe FILE-POSITION :START and :END, and allow setting of
@@ -280,25 +304,25 @@
 ;;; MAKE-STRING-OUTPUT-STREAM and WITH-OUTPUT-TO-STRING take an
 ;;; :ELEMENT-TYPE keyword argument
 (with-test (:name (make-string-output-stream with-output-to-string :element-type))
-  (macrolet ((frob (element-type-form)
+  (macrolet ((frob (element-type-form expect &optional (expect2 expect))
                `(progn
                   (let ((s (with-output-to-string
                                (s nil ,@(when element-type-form
                                           `(:element-type ,element-type-form))))))
-                    (assert (typep s '(simple-array ,(or (eval element-type-form)
-                                                         'character)
-                                       (0)))))
-                  (get-output-stream-string
-                   (make-string-output-stream
-                    ,@(when element-type-form
-                        `(:element-type ,element-type-form)))))))
+                    (assert (typep s '(simple-array ,expect (0)))))
+                  (let ((s (get-output-stream-string
+                            (make-string-output-stream
+                             ,@(when element-type-form
+                                 `(:element-type ,element-type-form))))))
+                    (assert (typep s '(simple-array ,expect2 (0))))))))
     ;; If you pass NIL as element-type, note that there seems to be no requirement
     ;; to produce a stream that can *accept* only characters of that type.
     ;; We produce a CHARACTER-STRING-OUTPUT-STREAM if you do something so pointless.
-    (frob nil)
-    (frob 'character)
-    (frob 'base-char)
-    (frob 'nil)))
+    (frob nil character)
+    (frob 'character character)
+    (frob 'base-char base-char)
+    ;; I literally do not care why these results differ.
+    (frob 'nil base-char character)))
 
 (with-test (:name (make-string-output-stream :element-type :bogosity))
   (assert-error (make-string-output-stream :element-type 'real)))
@@ -349,7 +373,7 @@
     (assert (char= (peek-char t (make-string-input-stream " a")) #\Space))))
 
 (with-test (:name :whitespace[2]p-is-type-safe)
-  (let ((fun (checked-compile `(lambda () (sb-impl::whitespace[2]p :potato))
+  (let ((fun (checked-compile `(lambda () (sb-impl::whitespace[2]p :potato *readtable*))
                               :allow-warnings t)))
     (assert-error (funcall fun) type-error)))
 

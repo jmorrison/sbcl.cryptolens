@@ -65,7 +65,7 @@
   ;; vertex, taking into account reserve locations and preallocated
   ;; TNs.
   (initial-domain 0 :type sc-locations)
-  (initial-domain-size 0 :type #.`(integer 0 ,sb-vm:finite-sc-offset-limit))
+  (initial-domain-size 0 :type (integer 0 #.sb-vm:finite-sc-offset-limit))
   ;; TN this is a vertex for.
   (tn           nil :type tn :read-only t)
   (element-size nil :type (integer 1 8) :read-only t)
@@ -660,7 +660,6 @@
       ;; which the spill cost is non-negative (i.e. not live across so
       ;; many calls that it's simpler to just leave them on the stack)
       (when (and (not (tn-offset tn))
-                 (neq (tn-kind tn) :more)
                  (not (unbounded-tn-p tn))
                  (not (and (sc-save-p (tn-sc tn))   ; SC is caller-save, and
                            (minusp (tn-cost tn))))) ; TN lives in many calls

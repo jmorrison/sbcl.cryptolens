@@ -17,7 +17,7 @@
  */
 
 #include "os.h"
-#include "gc-internal.h" // for sizetab[] and os_allocate()
+#include "gc.h" // for sizetab[] and os_allocate()
 #include "hopscotch.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -46,7 +46,7 @@ void hopscotch_integrity_check(tableptr,char*,int);
 /// If a specific function has been set, then use that.
 static inline uint32_t hash(tableptr ht, lispobj x) {
     return ht->hash ? ht->hash(x) :
-#ifdef LISP_FEATURE_GENCGC
+#ifdef LISP_FEATURE_GENERATIONAL
       (x >> GENCGC_CARD_SHIFT) ^ (x >> (1+WORD_SHIFT));
 #else
       (x >> (1+WORD_SHIFT));
@@ -280,7 +280,7 @@ uword_t sxhash_simple_string(struct vector* string)
     unsigned int* char_string = (unsigned int*)(string->data);
 #endif
     unsigned char* base_string = (unsigned char*)(string->data);
-    sword_t len = fixnum_value(string->length);
+    sword_t len = vector_len(string);
     uword_t result = 0;
     sword_t i;
     switch (widetag_of(&string->header)) {
@@ -323,7 +323,7 @@ static uword_t vector_sxhash(lispobj* object)
  * and unlike EQUALP because it compares strings case-sensitively.
  * Note: this works on most numbers too, not just vectors.
  */
-static boolean vector_eql(uword_t arg1, uword_t arg2)
+static int vector_eql(uword_t arg1, uword_t arg2)
 {
     if (arg1 == arg2) return 1;
     lispobj* obj1 = (lispobj*)arg1;
@@ -334,7 +334,10 @@ static boolean vector_eql(uword_t arg1, uword_t arg2)
 
     int widetag1 = header_widetag(header1);
     sword_t nwords = sizetab[widetag1](obj1);
-    if (widetag1 < SIMPLE_ARRAY_UNSIGNED_BYTE_2_WIDETAG)
+    // OMGWTF! Widetags have been rearranged so many times, I am not sure
+    // how to keep this code from regressing.
+    // ASSUMPTION: the range of number widetags ends with (COMPLEX DOUBLE-FLOAT)
+    if (widetag1 <= COMPLEX_DOUBLE_FLOAT_WIDETAG)
         // All words must match exactly. Start by comparing the length
         // (as encoded in the header) since we don't yet know that obj2
         // occupies the correct number of words.
@@ -343,8 +346,14 @@ static boolean vector_eql(uword_t arg1, uword_t arg2)
 
     // Vector elements must have already been coalesced
     // when comparing simple-vectors for similarity.
-    return (obj1[1] == obj2[1]) // same length vectors
-        && !memcmp(obj1 + 2, obj2 + 2, (nwords-2) << WORD_SHIFT);
+    // Note that only vectors marked "shareable" will get here, so no
+    // hash-table storage vectors or anything of that nature.
+    struct vector *v1 = (void*)obj1;
+    struct vector *v2 = (void*)obj2;
+    return (vector_len(v1) == vector_len(v2)) // same length vectors
+        && !memcmp(v1->data, v2->data,
+                   // ASSUMPTION: exactly 2 non-data words
+                   (nwords-2) << WORD_SHIFT);
 }
 
 /* Initialize 'ht' for first use, which entails zeroing the counters
@@ -781,7 +790,7 @@ found0:
 
 #undef probe
 
-boolean hopscotch_delete(tableptr ht, uword_t key)
+int hopscotch_delete(tableptr ht, uword_t key)
 {
     gc_dcheck(key);
     int logical_index = hash(ht, key) & ht->mask;

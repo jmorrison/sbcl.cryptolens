@@ -18,8 +18,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -67,16 +66,6 @@ os_context_register_addr(os_context_t *context, int offset)
     return &((context->uc_mcontext.regs)->gpr[offset]);
 #elif defined(GLIBC232_STYLE_UCONTEXT)
     return &((context->uc_mcontext.uc_regs->gregs)[offset]);
-#endif
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.regs)->nip);
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.uc_regs->gregs)[PT_NIP]);
 #endif
 }
 

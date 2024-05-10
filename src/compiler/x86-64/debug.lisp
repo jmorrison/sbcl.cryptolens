@@ -19,7 +19,7 @@
   (:generator 1
     (move res rsp-tn)))
 
-(define-vop ()
+(define-vop (current-fp-sap)
   (:translate current-fp)
   (:policy :fast-safe)
   (:results (res :scs (sap-reg sap-stack)))
@@ -51,32 +51,43 @@
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg) :to :eval)
          (offset :scs (any-reg) :target temp)
-         (value :scs (descriptor-reg) :to :result :target result))
+         (value :scs (descriptor-reg)))
   (:arg-types system-area-pointer positive-fixnum *)
-  (:temporary (:sc unsigned-reg :from (:argument 1) :to :result) temp)
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) temp)
   (:generator 9
     (move temp offset)
     (inst neg temp)
     (inst mov
           (ea (frame-byte-offset 0) sap
               temp (ash 1 (- word-shift n-fixnum-tag-bits)))
-          value)
-    (move result value)))
+          value)))
 
 (define-vop ()
   (:translate fun-code-header)
   (:policy :fast-safe)
   (:args (thing :scs (descriptor-reg)))
   (:results (code :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
+  (:temporary (:sc unsigned-reg :to (:result 0) :target code) temp)
   (:generator 5
+    ;; This vop is supposed to return NIL if the simple-fun has an invalid header
+    ;; as determined by the relative backpointer being 0.  I don't know why a simple-fun
+    ;; would ever be constructed like that.
+    #-relocatable-static-space
+    (progn
+    ;; The largest displacement in words from a code header to
+    ;; the header word of a contained function is #xFFFFFF.
+    ;; (See FUN_HEADER_NWORDS_MASK in 'gc.h')
+    (inst mov :dword temp (ea (- fun-pointer-lowtag) thing))
+    (inst shr :dword temp n-widetag-bits)
+    (inst neg temp)
+    (inst lea code (ea (- other-pointer-lowtag fun-pointer-lowtag)
+                       thing temp n-word-bytes))
+    ;; note that LEA does not affect any flags
+    (inst cmov :z code (ea (- nil-value list-pointer-lowtag)))) ; put NIL into CODE if ZF
+    ;; I don't know where to load a NIL from with relocatable static space.
+    #+relocatable-static-space
     (let ((bogus (gen-label))
           (done (gen-label)))
-      ;; The largest displacement in words from a code header to
-      ;; the header word of a contained function is #xFFFFFF.
-      ;; (See FUN_HEADER_NWORDS_MASK in 'gc.h')
       (inst mov :dword temp (ea (- fun-pointer-lowtag) thing))
       (inst shr :dword temp n-widetag-bits)
       (inst jmp :z bogus)

@@ -15,10 +15,10 @@
 
 ;;;; coercions
 
-(deftransform float ((n f) (* single-float) *)
+(deftransform float ((n f) (t single-float) *)
   '(%single-float n))
 
-(deftransform float ((n f) (* double-float) *)
+(deftransform float ((n f) (t double-float) *)
   '(%double-float n))
 
 (deftransform float ((n) *)
@@ -26,16 +26,37 @@
        n
        (%single-float n)))
 
-(deftransform %single-float ((n) (single-float) *)
+(deftransform %single-float ((n) (single-float) * :important nil)
   'n)
 
-(deftransform %double-float ((n) (double-float) *)
+(deftransform %double-float ((n) (double-float) * :important nil)
   'n)
+
+(deftransform %single-float ((n) (ratio) * :important nil)
+  '(sb-kernel::single-float-ratio n))
+
+(deftransform %double-float ((n) (ratio) * :important nil)
+  '(sb-kernel::double-float-ratio n))
+
+(macrolet ((def (type from-type)
+             `(deftransform ,(symbolicate "%" type) ((n) ((or ,type ,from-type)) * :important nil)
+                (when (or (csubtypep (lvar-type n) (specifier-type ',type))
+                          (csubtypep (lvar-type n) (specifier-type ',from-type)))
+                  (give-up-ir1-transform))
+                `(if (,',(symbolicate type "-P") n)
+                     (truly-the ,',type n)
+                     (,',(symbolicate "%" type) (truly-the ,',from-type n))))))
+  (def single-float double-float)
+  (def single-float sb-vm:signed-word)
+  (def single-float word)
+  (def double-float single-float)
+  (def double-float sb-vm:signed-word)
+  (def double-float word))
 
 ;;; RANDOM
 (macrolet ((frob (fun type)
              `(deftransform random ((num &optional state)
-                                    (,type &optional *) *)
+                                    (,type &optional t) *)
                 "Use inline float operations."
                 '(,fun num (or state *random-state*)))))
   (frob %random-single-float single-float)
@@ -67,7 +88,7 @@
 ;;; a division to get the random value into the desired range.
 (deftransform random ((num &optional state)
                       ((constant-arg (integer 1 #.(expt 2 sb-vm:n-word-bits)))
-                       &optional *)
+                       &optional t)
                       *
                       :policy (and (> speed compilation-speed)
                                    (> speed space)))
@@ -169,6 +190,18 @@
             (if (minusp ,bits) (- ,temp) ,temp)))
         `(if (minusp ,bits) $-1d0 $1d0))))
 
+(deftransform float-sign-bit ((x) (single-float) *)
+  `(logand (ash (single-float-bits x) -31) 1))
+(deftransform float-sign-bit ((x) (double-float) *)
+  #-64-bit `(logand (ash (double-float-high-bits x) -31) 1)
+  #+64-bit `(ash (logand (double-float-bits x) most-positive-word) -63))
+
+(deftransform float-sign-bit-set-p ((x) (single-float) *)
+  `(logbitp 31 (single-float-bits x)))
+(deftransform float-sign-bit-set-p ((x) (double-float) *)
+  #-64-bit `(logbitp 31 (double-float-high-bits x))
+  #+64-bit `(logbitp 63 (double-float-bits x)))
+
 ;;; This doesn't deal with complex at the moment.
 (deftransform signum ((x) (number))
   (let* ((ctype (lvar-type x))
@@ -203,10 +236,22 @@
   (movable foldable flushable))
 
 (defknown scale-single-float (single-float integer) single-float
-  (movable foldable flushable))
-
+  (movable foldable flushable fixed-args unboxed-return))
 (defknown scale-double-float (double-float integer) double-float
-  (movable foldable flushable))
+    (movable foldable flushable fixed-args unboxed-return))
+
+(defknown sb-kernel::scale-single-float-maybe-overflow
+    (single-float integer) single-float
+    (movable foldable flushable fixed-args unboxed-return))
+(defknown sb-kernel::scale-single-float-maybe-underflow
+    (single-float integer) single-float
+  (movable foldable flushable fixed-args unboxed-return))
+(defknown sb-kernel::scale-double-float-maybe-overflow
+    (double-float integer) double-float
+    (movable foldable flushable fixed-args unboxed-return))
+(defknown sb-kernel::scale-double-float-maybe-underflow
+    (double-float integer) double-float
+    (movable foldable flushable fixed-args unboxed-return))
 
 (deftransform decode-float ((x) (single-float) *)
   '(decode-single-float x))
@@ -220,16 +265,16 @@
 (deftransform integer-decode-float ((x) (double-float) *)
   '(integer-decode-double-float x))
 
-(deftransform scale-float ((f ex) (single-float *) *)
-  (cond #+x86
+(deftransform scale-float ((f ex) (single-float t) *)
+  (cond #+(and x86 ()) ;; this producess different results based on whether it's inlined or not
         ((csubtypep (lvar-type ex)
                     (specifier-type '(signed-byte 32)))
          '(coerce (%scalbn (coerce f 'double-float) ex) 'single-float))
         (t
          '(scale-single-float f ex))))
 
-(deftransform scale-float ((f ex) (double-float *) *)
-  (cond #+x86
+(deftransform scale-float ((f ex) (double-float t) *)
+  (cond #+(and x86 ())
         ((csubtypep (lvar-type ex)
                     (specifier-type '(signed-byte 32)))
          '(%scalbn f ex))
@@ -322,80 +367,18 @@
         most-negative-single-float most-positive-single-float)
   (frob %double-float double-float
         most-negative-double-float most-positive-double-float))
+
+(defoptimizer (float derive-type) ((number prototype))
+  (let ((type (lvar-type prototype)))
+    (unless (or (csubtypep type (specifier-type 'double-float))
+                (csubtypep type (specifier-type 'single-float)))
+      (handler-case
+          (type-union
+           (one-arg-derive-type number #'%single-float-derive-type-aux #'%single-float)
+           (one-arg-derive-type number #'%double-float-derive-type-aux #'%double-float))
+        (type-error ()
+          nil)))))
 
-;;;; float contagion
-
-(defun safe-ctype-for-single-coercion-p (x)
-  ;; See comment in SAFE-SINGLE-COERCION-P -- this deals with the same
-  ;; problem, but in the context of evaluated and compiled (+ <int> <single>)
-  ;; giving different result if we fail to check for this.
-  (or (not (csubtypep x (specifier-type 'integer)))
-      #+x86
-      (csubtypep x (specifier-type `(integer ,most-negative-exactly-single-float-fixnum
-                                             ,most-positive-exactly-single-float-fixnum)))
-      #-x86
-      (csubtypep x (specifier-type 'fixnum))))
-
-;;; Do some stuff to recognize when the loser is doing mixed float and
-;;; rational arithmetic, or different float types, and fix it up. If
-;;; we don't, he won't even get so much as an efficiency note.
-;;; Unfortunately this produces unnecessarily bad code for something
-;;; as simple as (ZEROP (THE FLOAT X)) because we _know_ that the thing
-;;; is a float, but the ZEROP transform injected a rational 0,
-;;; which we then go to the trouble of coercing to a float.
-(progn
-  (deftransform real-float-contagion-arg1 ((x y) * * :defun-only t :node node)
-    (if (or (not (types-equal-or-intersect (lvar-type y) (specifier-type 'single-float)))
-            (safe-ctype-for-single-coercion-p (lvar-type x)))
-        `(,(lvar-fun-name (basic-combination-fun node)) (float x y) y)
-        (give-up-ir1-transform #1="the first argument cannot safely be converted to SINGLE-FLOAT")))
-  (deftransform complex-float-contagion-arg1 ((x y) * * :defun-only t :node node)
-    (if (or (not (types-equal-or-intersect
-                  (lvar-type y) (specifier-type '(complex single-float))))
-            (safe-ctype-for-single-coercion-p (lvar-type x)))
-        `(,(lvar-fun-name (basic-combination-fun node))
-          (float x (realpart y)) y)
-        (give-up-ir1-transform #1#)))
-  (deftransform real-float-contagion-arg2 ((x y) * * :defun-only t :node node)
-    (if (or (not (types-equal-or-intersect (lvar-type x) (specifier-type 'single-float)))
-            (safe-ctype-for-single-coercion-p (lvar-type y)))
-        `(,(lvar-fun-name (basic-combination-fun node)) x (float y x))
-        (give-up-ir1-transform #2="the second argument cannot safely be converted to SINGLE-FLOAT")))
-  (deftransform complex-float-contagion-arg2 ((x y) * * :defun-only t :node node)
-    (if (or (not (types-equal-or-intersect (lvar-type x) (specifier-type '(complex single-float))))
-            (safe-ctype-for-single-coercion-p (lvar-type y)))
-        `(,(lvar-fun-name (basic-combination-fun node))
-          x (float y (realpart x)))
-        (give-up-ir1-transform #2#))))
-
-(flet ((def (operator float-type other-type complexp argument)
-         (multiple-value-bind (type1 type2 function)
-             (ecase argument
-               (1 (if complexp
-                      (values other-type `(complex ,float-type) #'complex-float-contagion-arg1)
-                      (values other-type float-type #'real-float-contagion-arg1)))
-               (2 (if complexp
-                      (values `(complex ,float-type) other-type #'complex-float-contagion-arg2)
-                      (values float-type other-type #'real-float-contagion-arg2))))
-           (let ((note (format nil "open-code float conversion of ~:R ~
-                                    argument in mixed ~S-~S numeric ~
-                                    operation"
-                               argument type1 type2)))
-             (%deftransform operator `(function (,type1 ,type2) *) function note :slightly)))))
-
-  (dolist (operator '(+ * / -))
-    (def operator 'float 'rational nil 1)
-    (def operator 'float 'rational nil 2)
-    (def operator 'float 'rational t   1)
-    (def operator 'float 'rational t   2))
-
-  (dolist (operator '(= < > <= >= + * / -))
-    (def operator 'double-float 'single-float nil 1)
-    (def operator 'double-float 'single-float nil 2)
-    (when (member operator '(= + * / -))
-      (def operator 'double-float 'single-float t 1)
-      (def operator 'double-float 'single-float t 2))))
-
 (macrolet ((def (type &rest args)
              `(deftransform * ((x y) (,type (constant-arg (member ,@args))) *
                                ;; Beware the SNaN!
@@ -409,7 +392,6 @@
   (def double-float $1.0d0 $-1.0d0))
 
 ;;; Return the reciprocal of X if it can be represented exactly, NIL otherwise.
-#-sb-xc-host
 (defun maybe-exact-reciprocal (x)
   (unless (zerop x)
     (handler-case
@@ -470,19 +452,30 @@
 ;;; do it for any rational that has a precise representation as a
 ;;; float (such as 0).
 (macrolet ((frob (op &optional complex)
-             `(deftransform ,op ((x y) (,(if complex
-                                             '(complex float)
-                                             'float)
-                                        rational) *)
+             `(deftransform ,op ((x y) (:or ((,(if complex
+                                                   '(complex single-float)
+                                                   'single-float)
+                                              rational) *)
+                                            ((,(if complex
+                                                   '(complex double-float)
+                                                   'double-float)
+                                              rational) *)))
                 "open-code FLOAT to RATIONAL comparison"
                 (unless (constant-lvar-p y)
                   (give-up-ir1-transform
                    "The RATIONAL value isn't known at compile time."))
                 (let ((val (lvar-value y)))
-                  (unless (eql (rational (float val)) val)
-                    (give-up-ir1-transform
-                     "~S doesn't have a precise float representation."
-                     val)))
+                  (multiple-value-bind (low high type)
+                      (if (csubtypep (lvar-type x) (specifier-type 'double-float))
+                          (values most-negative-double-float most-positive-double-float
+                                  'double-float)
+                          (values most-negative-single-float most-positive-single-float
+                                  'single-float))
+                    (unless (and (sb-xc:<= low val high)
+                                 (eql (rational (coerce val type)) val))
+                      (give-up-ir1-transform
+                       "~S doesn't have a precise float representation."
+                       val))))
                 `(,',op x (float y ,',(if complex
                                           '(realpart x)
                                           'x))))))
@@ -492,14 +485,17 @@
   (frob >=)
   (frob =)
   (frob = t))
+
 
 ;;;; irrational transforms
 
 (macrolet ((def (name prim rtype)
              `(progn
-               (deftransform ,name ((x) (single-float) ,rtype)
-                 `(coerce (,',prim (coerce x 'double-float)) 'single-float))
-               (deftransform ,name ((x) (double-float) ,rtype)
+               (deftransform ,name ((x) (single-float) ,rtype :node node)
+                 (delay-ir1-transform node :ir1-phases)
+                 `(%single-float (,',prim (%double-float x))))
+               (deftransform ,name ((x) (double-float) ,rtype :node node)
+                 (delay-ir1-transform node :ir1-phases)
                  `(,',prim x)))))
   (def exp %exp *)
   (def log %log float)
@@ -562,7 +558,7 @@
            'single-float))
 (deftransform expt ((x y) (double-float double-float) double-float)
   `(%pow x y))
-(deftransform expt ((x y) (single-float integer) double-float)
+(deftransform expt ((x y) (single-float integer) single-float)
   `(coerce (%pow (coerce x 'double-float) (coerce y 'double-float))
     'single-float))
 (deftransform expt ((x y) (double-float integer) double-float)
@@ -619,15 +615,21 @@
 ;;; should be the right kind of float. Allow bounds for the float
 ;;; part too.
 (defun float-or-complex-float-type (arg &optional lo hi)
-  (declare (type numeric-type arg))
-  (let* ((format (case (numeric-type-class arg)
-                   ((integer rational) 'single-float)
-                   (t (numeric-type-format arg))))
-         (float-type (or format 'float))
-         (lo (coerce-numeric-bound lo float-type))
-         (hi (coerce-numeric-bound hi float-type)))
-    (specifier-type `(or (,float-type ,(or lo '*) ,(or hi '*))
-                         (complex ,float-type)))))
+  (cond
+    ((numeric-type-p arg)
+     (let* ((format (case (numeric-type-class arg)
+                      ((integer rational) 'single-float)
+                      (t (numeric-type-format arg))))
+            (float-type (or format 'float))
+            (lo (coerce-numeric-bound lo float-type))
+            (hi (coerce-numeric-bound hi float-type)))
+       (specifier-type `(or (,float-type ,(or lo '*) ,(or hi '*))
+                            (complex ,float-type)))))
+    ((union-type-p arg)
+     (apply #'type-union
+            (loop for type in (union-type-types arg)
+                  collect (float-or-complex-float-type type lo hi))))
+    (t (specifier-type 'number))))
 
 (eval-when (:compile-toplevel :execute)
   ;; So the problem with this hack is that it's actually broken.  If
@@ -666,9 +668,9 @@
               (long-float   $-0L0))
             arg-hi-val arg-hi))
     (flet ((fp-neg-zero-p (f)           ; Is F -0.0?
-             (and (floatp f) (zerop f) (= (float-sign-bit f) 1)))
+             (and (floatp f) (zerop f) (float-sign-bit-set-p f)))
            (fp-pos-zero-p (f)           ; Is F +0.0?
-             (and (floatp f) (zerop f) (= (float-sign-bit f) 0))))
+             (and (floatp f) (zerop f) (not (float-sign-bit-set-p f)))))
       (and (or (null domain-low)
                (and arg-lo (sb-xc:>= arg-lo-val domain-low)
                     (not (and (fp-pos-zero-p domain-low)
@@ -680,14 +682,6 @@
 
 (eval-when (:compile-toplevel :execute)
   (setf *read-default-float-format* 'cl:single-float))
-
-;;; The basic interval type. It can handle open and closed intervals.
-;;; A bound is open if it is a list containing a number, just like
-;;; Lisp says. NIL means unbounded.
-(defstruct (interval (:constructor %make-interval (low high))
-                     (:copier nil))
-  low high)
-(declaim (freeze-type interval))
 
 ;;; Handle monotonic functions of a single variable whose domain is
 ;;; possibly part of the real line. ARG is the variable, FUN is the
@@ -793,7 +787,7 @@
 (defun safe-expt (x y)
   (when (and (numberp x) (numberp y))
     (handler-case
-        (when (< (abs y) 10000)
+        (when (sb-xc:< (abs y) 10000)
           (expt x y))
       ;; Currently we can hide unanticipated errors (such as failure to use SB-XC: math
       ;; when cross-compiling) as well as the anticipated potential problem of overflow.
@@ -831,7 +825,7 @@
        (list (interval-expt-> x y-)
              (interval-expt-> x y+))))))
 
-;;; Handle the case when x <= 1
+;;; Handle the case when 0 <= x <= 1
 (defun interval-expt-< (x y)
   (case (interval-range-info x $0d0)
     (+
@@ -862,9 +856,13 @@
                 (interval-expt-< x y+))))))
     (-
      ;; The case where x <= 0. Y MUST be an INTEGER for this to work!
-     ;; The calling function must insure this! For now we'll just
-     ;; return the appropriate unbounded float type.
-     (list (make-interval :low nil :high nil)))
+     ;; The calling function must insure this!
+     (loop for interval in (flatten-list (interval-expt (interval-neg x) y))
+           for low = (interval-low interval)
+           for high = (interval-high interval)
+           collect interval
+           when (or high low)
+           collect (interval-neg interval)))
     (t
      (destructuring-bind (neg pos)
          (interval-split 0 x t t)
@@ -1014,11 +1012,9 @@
 
 (defun integer-float-p (float)
   (and (floatp float)
-       (or
-        #-sb-xc-host
-        (multiple-value-bind (significand exponent) (integer-decode-float float)
-          (or (plusp exponent)
-              (<= (- exponent) (sb-kernel::first-bit-set significand)))))))
+       (multiple-value-bind (significand exponent) (integer-decode-float float)
+         (or (plusp exponent)
+             (<= (- exponent) (sb-kernel::first-bit-set significand))))))
 
 (defun expt-derive-type-aux (x y same-arg)
   (declare (ignore same-arg))
@@ -1051,7 +1047,12 @@
 ;;; Note we must assume that a type including 0.0 may also include
 ;;; -0.0 and thus the result may be complex -infinity + i*pi.
 (defun log-derive-type-aux-1 (x)
-  (elfun-derive-type-simple x #'log $0d0 nil nil nil))
+  (elfun-derive-type-simple x #'log $0d0 nil
+                            ;; (log 0) is an error
+                            ;; and there's nothing between 0 and 1 for integers.
+                            (and (integer-type-p x)
+                                 $0f0)
+                            nil))
 
 (defun log-derive-type-aux-2 (x y same-arg)
   (let ((log-x (log-derive-type-aux-1 x))
@@ -1156,10 +1157,17 @@
 (defoptimizer (phase derive-type) ((num))
   (one-arg-derive-type num #'phase-derive-type-aux #'phase))
 
-(deftransform realpart ((x) ((complex rational)) *)
+(deftransform realpart ((x) ((complex rational)) * :important nil)
   '(%realpart x))
-(deftransform imagpart ((x) ((complex rational)) *)
+(deftransform imagpart ((x) ((complex rational)) * :important nil)
   '(%imagpart x))
+
+(deftransform realpart ((x) (real) * :important nil)
+  'x)
+(deftransform imagpart ((x) ((and single-float (not (eql $-0f0)))) * :important nil)
+  $0f0)
+(deftransform imagpart ((x) ((and double-float (not (eql $-0d0)))) * :important nil)
+  $0d0)
 
 ;;; Make REALPART and IMAGPART return the appropriate types. This
 ;;; should help a lot in optimized code.
@@ -1290,47 +1298,47 @@
                 ;; they be implemented on an all-or-none basis.
                 (unless (vop-existsp :named sb-vm::%negate/complex-double-float)
                 ;; negation
-                (deftransform %negate ((z) ((complex ,type)) *)
+                (deftransform %negate ((z) ((complex ,type)) * :important nil)
                   '(complex (%negate (realpart z)) (%negate (imagpart z))))
                 ;; complex addition and subtraction
-                (deftransform + ((w z) ((complex ,type) (complex ,type)) *)
+                (deftransform + ((w z) ((complex ,type) (complex ,type)) * :important nil)
                   '(complex (+ (realpart w) (realpart z))
                             (+ (imagpart w) (imagpart z))))
-                (deftransform - ((w z) ((complex ,type) (complex ,type)) *)
+                (deftransform - ((w z) ((complex ,type) (complex ,type)) * :important nil)
                   '(complex (- (realpart w) (realpart z))
                             (- (imagpart w) (imagpart z))))
                 ;; Add and subtract a complex and a real.
-                (deftransform + ((w z) ((complex ,type) real) *)
+                (deftransform + ((w z) ((complex ,type) real) * :important nil)
                   `(complex (+ (realpart w) z)
                             (+ (imagpart w) ,(coerce 0 ',type))))
-                (deftransform + ((z w) (real (complex ,type)) *)
+                (deftransform + ((z w) (real (complex ,type)) * :important nil)
                   `(complex (+ (realpart w) z)
                             (+ (imagpart w) ,(coerce 0 ',type))))
                 ;; Add and subtract a real and a complex number.
-                (deftransform - ((w z) ((complex ,type) real) *)
+                (deftransform - ((w z) ((complex ,type) real) * :important nil)
                   `(complex (- (realpart w) z)
                             (- (imagpart w) ,(coerce 0 ',type))))
-                (deftransform - ((z w) (real (complex ,type)) *)
+                (deftransform - ((z w) (real (complex ,type)) * :important nil)
                   `(complex (- z (realpart w))
                             (- ,(coerce 0 ',type) (imagpart w))))
                 ;; Multiply a complex by a real or vice versa.
-                (deftransform * ((w z) ((complex ,type) real) *)
+                (deftransform * ((w z) ((complex ,type) real) * :important nil)
                   '(complex (* (realpart w) z) (* (imagpart w) z)))
-                (deftransform * ((z w) (real (complex ,type)) *)
+                (deftransform * ((z w) (real (complex ,type)) * :important nil)
                   '(complex (* (realpart w) z) (* (imagpart w) z)))
                 ;; conjugate of complex number
-                (deftransform conjugate ((z) ((complex ,type)) *)
+                (deftransform conjugate ((z) ((complex ,type)) * :important nil)
                   '(complex (realpart z) (- (imagpart z))))
                 ;; comparison
-                (deftransform = ((w z) ((complex ,type) (complex ,type)) *)
+                (deftransform = ((w z) ((complex ,type) (complex ,type)) * :important nil)
                   '(and (= (realpart w) (realpart z))
                     (= (imagpart w) (imagpart z))))
-                (deftransform = ((w z) ((complex ,type) real) *)
+                (deftransform = ((w z) ((complex ,type) real) * :important nil)
                   '(and (= (realpart w) z) (zerop (imagpart w))))
-                (deftransform = ((w z) (real (complex ,type)) *)
+                (deftransform = ((w z) (real (complex ,type)) * :important nil)
                   '(and (= (realpart z) w) (zerop (imagpart z))))
                 ;; Multiply two complex numbers.
-                (deftransform * ((x y) ((complex ,type) (complex ,type)) *)
+                (deftransform * ((x y) ((complex ,type) (complex ,type)) * :important nil)
                   '(let* ((rx (realpart x))
                           (ix (imagpart x))
                           (ry (realpart y))
@@ -1338,12 +1346,12 @@
                     (complex (- (* rx ry) (* ix iy))
                              (+ (* rx iy) (* ix ry)))))
                 ;; Divide a complex by a real.
-                (deftransform / ((w z) ((complex ,type) real) *)
+                (deftransform / ((w z) ((complex ,type) real) * :important nil)
                   '(complex (/ (realpart w) z) (/ (imagpart w) z)))
                 )
 
                 ;; Divide two complex numbers.
-                (deftransform / ((x y) ((complex ,type) (complex ,type)) *)
+                (deftransform / ((x y) ((complex ,type) (complex ,type)) * :important nil)
                   (if (vop-existsp :translate sb-vm::swap-complex)
                       '(let* ((cs (conjugate (sb-vm::swap-complex x)))
                               (ry (realpart y))
@@ -1369,7 +1377,7 @@
                               (complex (/ (+ (* rx r) ix) dn)
                                        (/ (- (* ix r) rx) dn)))))))
                 ;; Divide a real by a complex.
-                (deftransform / ((x y) (,type (complex ,type)) *)
+                (deftransform / ((x y) (real (complex ,type)) * :important nil)
                   (if (vop-existsp :translate sb-vm::swap-complex)
                       '(let* ((ry (realpart y))
                               (iy (imagpart y)))
@@ -1398,7 +1406,77 @@
   (frob single-float (or rational single-float))
   (frob double-float (or rational single-float double-float)))
 
-(deftransform complex ((realpart &optional imagpart) (rational &optional (or null (integer 0 0))))
+
+;;;; float contagion
+(deftransform single-float-real-contagion ((x y) * * :node node :defun-only t)
+  (if (csubtypep (lvar-type y) (specifier-type 'single-float))
+      (give-up-ir1-transform)
+      `(,(lvar-fun-name (basic-combination-fun node)) x (%single-float y))))
+
+(deftransform real-single-float-contagion ((x y) * * :node node :defun-only t)
+  (if (csubtypep (lvar-type x) (specifier-type 'single-float))
+      (give-up-ir1-transform)
+      `(,(lvar-fun-name (basic-combination-fun node)) (%single-float x) y)))
+
+(deftransform double-float-real-contagion ((x y) * * :node node :defun-only t)
+  (if (csubtypep (lvar-type y) (specifier-type 'double-float))
+      (give-up-ir1-transform)
+      `(,(lvar-fun-name (basic-combination-fun node)) x (%double-float y))))
+
+(deftransform real-double-float-contagion ((x y) * * :node node :defun-only t)
+  (if (csubtypep (lvar-type x) (specifier-type 'double-float))
+      (give-up-ir1-transform)
+      `(,(lvar-fun-name (basic-combination-fun node)) (%double-float x) y)))
+
+(flet ((def (op)
+         (%deftransform op nil '(function (single-float real) single-float)
+                        #'single-float-real-contagion nil)
+         (%deftransform op nil '(function (real single-float) single-float)
+                        #'real-single-float-contagion nil)
+         (%deftransform op nil '(function (double-float real))
+                        #'double-float-real-contagion nil)
+         (%deftransform op nil '(function (real double-float))
+                        #'real-double-float-contagion nil)
+
+         (%deftransform op nil '(function ((complex single-float) real) (complex single-float))
+                        #'single-float-real-contagion nil)
+         (%deftransform op nil '(function (real (complex single-float)) (complex single-float))
+                        #'real-single-float-contagion nil)
+         (%deftransform op nil '(function ((complex double-float) real) (complex double-float))
+                        #'double-float-real-contagion nil)
+         (%deftransform op nil '(function (real (complex double-float)) (complex double-float))
+                        #'real-double-float-contagion nil)))
+  (dolist (op '(+ * / -))
+    (def op)))
+
+(flet ((def (op)
+         (%deftransform op nil `(function (single-float (integer ,most-negative-exactly-single-float-integer
+                                                                 ,most-positive-exactly-single-float-integer)))
+                        #'single-float-real-contagion nil)
+         (%deftransform op nil `(function ((integer ,most-negative-exactly-single-float-integer
+                                                    ,most-positive-exactly-single-float-integer)
+                                           single-float))
+                        #'real-single-float-contagion nil)
+
+         (%deftransform op nil `(function (double-float
+                                           (or single-float
+                                               (integer ,most-negative-exactly-double-float-integer
+                                                        ,most-positive-exactly-double-float-integer))))
+                        #'double-float-real-contagion nil)
+         (%deftransform op nil `(function ((or single-float
+                                               (integer ,most-negative-exactly-double-float-integer
+                                                        ,most-positive-exactly-double-float-integer))
+                                           double-float))
+                        #'real-double-float-contagion nil)))
+  (dolist (op '(= < > <= >=))
+    (def op)))
+
+(%deftransform '= nil '(function ((complex double-float) single-float))
+               #'double-float-real-contagion nil)
+(%deftransform '= nil '(function (single-float (complex double-float)))
+               #'real-double-float-contagion nil)
+
+(deftransform complex ((realpart &optional imagpart) (rational &optional (or null (integer 0 0))) * :important nil)
   'realpart)
 
 ;;; Here are simple optimizers for SIN, COS, and TAN. They do not
@@ -1513,22 +1591,173 @@
 
 
 ;;;; TRUNCATE, FLOOR, CEILING, and ROUND
+(deftransform truncate ((x &optional by)
+                        (t &optional (constant-arg (member 1))))
+  '(unary-truncate x))
 
-(macrolet ((define-frobs (fun ufun)
-             `(deftransform ,fun ((x &optional by)
-                                  (* &optional (constant-arg (member 1))))
-                  '(let ((res (,ufun x)))
-                    (values res (locally
-                                    (declare (flushable %single-float
-                                                        %double-float))
-                                  (- x res)))))))
-  (define-frobs truncate %unary-truncate)
-  (define-frobs round %unary-round))
+(deftransform round ((x &optional by)
+                     (t &optional (constant-arg (member 1))))
+  '(let ((res (%unary-round x)))
+    (values res (locally
+                    (declare (flushable %single-float
+                                        %double-float))
+                  (- x res)))))
 
 (deftransform %unary-truncate ((x) (single-float))
-  `(%unary-truncate/single-float x))
+  `(values (unary-truncate x)))
 (deftransform %unary-truncate ((x) (double-float))
-  `(%unary-truncate/double-float x))
+  `(values (unary-truncate x)))
+
+(defun value-within-numeric-type (type)
+  (labels ((try (x)
+             (when (ctypep x type)
+               (return-from value-within-numeric-type x)))
+           (next-float (float)
+             (multiple-value-bind (frac exp sign)
+                 (integer-decode-float float)
+               (* (scale-float (float (1+ frac) float) exp)
+                  sign)))
+           (prev-float (float)
+             (multiple-value-bind (frac exp sign)
+                 (integer-decode-float float)
+               (* (scale-float (float (1- frac) float) exp)
+                  sign)))
+           (next (x)
+             (typecase x
+               (integer
+                (1+ x))
+               (float
+                (next-float x))
+               (t
+                0)))
+           (prev (x)
+             (typecase x
+               (integer
+                (1- x))
+               (float
+                (prev-float x))
+               (t
+                0)))
+           (ratio-between (low high)
+             (+ low (/ (- high low) 2)))
+           (numeric (x)
+             (when (numeric-type-p x)
+               (let ((lo (numeric-type-low x))
+                     (hi (numeric-type-high x)))
+                 (when (numberp lo)
+                   (try lo))
+                 (when (numberp hi)
+                   (try hi))
+                 (when (consp lo)
+                   (try (next (car lo))))
+                 (when (consp hi)
+                   (try (prev (car hi))))
+                 (when (and (typep lo '(cons rational))
+                            (typep hi '(cons rational)))
+                   (try (ratio-between (car lo) (car hi))))
+                 (when (csubtypep x (specifier-type 'rational))
+                   (try 0))
+                 (when (csubtypep x (specifier-type 'double-float))
+                   (try $0d0))
+                 (when (csubtypep x (specifier-type 'single-float))
+                   (try $0f0))))))
+    (typecase type
+      (numeric-type (numeric type))
+      (union-type (mapc #'numeric (union-type-types type))))
+    (error "Couldn't come up with a value for ~s" type)))
+
+#-(or sb-xc-host 64-bit)
+(progn
+  (declaim (inline %make-double-float))
+  (defun %make-double-float (bits)
+    (make-double-float (ash bits -32) (ldb (byte 32 0) bits))))
+
+;;; Transform inclusive integer bounds so that they work on floats
+;;; before truncating to zero.
+(macrolet
+    ((def (type)
+       `(defun ,(symbolicate type '-integer-bounds) (low high)
+          (macrolet ((const (name)
+                       (package-symbolicate :sb-vm ',type '- name)))
+            (labels ((fractions-p (number)
+                       (< (integer-length (abs number))
+                          (const digits)))
+                     (c (number round)
+                       (if (zerop number)
+                           (sb-kernel:make-single-float 0)
+                           (let* ((negative (minusp number))
+                                  (number (abs number))
+                                  (length (integer-length number))
+                                  (shift (- length (const digits)))
+                                  (shifted (truly-the fixnum
+                                                      (ash number
+                                                           (- shift))))
+                                  ;; Cut off the hidden bit
+                                  (signif (ldb (const significand-byte) shifted))
+                                  (exp (+ (const bias) length))
+                                  (bits (ash exp
+                                             (byte-position (const exponent-byte)))))
+                             (incf signif round)
+                             ;; If rounding up overflows this will increase the exponent too
+                             (let ((bits (+ bits signif)))
+                               (when negative
+                                 (setf bits (logior (ash -1 ,(case type
+                                                               (double-float 63)
+                                                               (single-float 31)))
+                                                    bits)))
+                               (,(case type
+                                   (single-float 'make-single-float)
+                                   (double-float '%make-double-float)) bits))))))
+              (values (if (<= low 0)
+                          (if (fractions-p low)
+                              (c (1- low) -1)
+                              (c low 0))
+                          (c low 0))
+                      (if (< high 0)
+                          (c high 0)
+                          (if (fractions-p high)
+                              (c (1+ high) -1)
+                              (c high 0)))))))))
+  (def single-float)
+  (def double-float))
+
+(deftransform unary-truncate ((x) * * :result result :node node)
+  (unless (lvar-single-value-p result)
+    (give-up-ir1-transform))
+  (let ((rem-type (second (values-type-required (node-derived-type node)))))
+    `(values (%unary-truncate x)
+             ,(value-within-numeric-type rem-type))))
+
+(macrolet ((def (type)
+             `(deftransform unary-truncate ((number) (,type) * :node node)
+                (let ((cast (cast-or-check-bound-type node)))
+                  (if (and cast
+                           (csubtypep cast (specifier-type 'sb-vm:signed-word)))
+                      (let ((int (type-approximate-interval cast)))
+                        (when int
+                          (multiple-value-bind (low high) (,(symbolicate type '-integer-bounds)
+                                                           (interval-low int)
+                                                           (interval-high int))
+                            `(if (typep number
+                                        '(,',type ,low ,high))
+                                 (let ((truncated (truly-the ,(type-specifier cast) (,',(symbolicate '%unary-truncate/ type) number))))
+                                   (declare (flushable ,',(symbolicate "%" type)))
+                                   (values truncated
+                                           (- number
+                                              (coerce truncated ',',type))))
+                                 ,(internal-type-error-call 'number (type-specifier cast) 'truncate-to-integer)))))
+                      '(if (typep number
+                            '(,type
+                              ,(symbol-value (package-symbolicate :sb-kernel 'most-negative-fixnum- type))
+                              ,(symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type))))
+                        (let ((truncated (truly-the fixnum (,(symbolicate '%unary-truncate/ type) number))))
+                          (declare (flushable ,(symbolicate "%" type)))
+                          (values truncated
+                                  (- number
+                                     (coerce truncated ',type))))
+                        (,(symbolicate 'unary-truncate- type '-to-bignum) number)))))))
+  (def single-float)
+  (def double-float))
 
 ;;; Convert (TRUNCATE x y) to the obvious implementation.
 ;;;
@@ -1542,33 +1771,50 @@
 ;;; depending on FLOAT-ACCURACY. Finally, leave out the secondary value when
 ;;; we know it is unused: COERCE is not flushable.
 (macrolet ((def (type other-float-arg-types)
-             (let ((unary (symbolicate "%UNARY-TRUNCATE/" type))
-                   (coerce (symbolicate "%" type)))
+             (let* ((unary (symbolicate "%UNARY-TRUNCATE/" type))
+                    (unary-to-bignum (symbolicate '%unary-truncate- type '-to-bignum))
+                    (coerce (symbolicate "%" type))
+                    (unary `(lambda (number)
+                              (if (typep number
+                                         '(,type
+                                           ,(symbol-value (package-symbolicate :sb-kernel 'most-negative-fixnum- type))
+                                           ,(symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type))))
+                                  (truly-the fixnum (,unary number))
+                                  (,unary-to-bignum number)))))
                `(deftransform truncate ((x &optional y)
                                         (,type
                                          &optional (or ,type ,@other-float-arg-types integer))
                                         * :result result)
                   (let* ((result-type (and result
                                            (lvar-derived-type result)))
-                         (compute-all (and (values-type-p result-type)
+                         (compute-all (and (or (eq result-type *wild-type*)
+                                               (values-type-p result-type))
                                            (not (type-single-value-p result-type)))))
                     (if (or (not y)
-                            (and (constant-lvar-p y) (= 1 (lvar-value y))))
+                            (and (constant-lvar-p y) (sb-xc:= 1 (lvar-value y))))
                         (if compute-all
-                            `(let ((res (,',unary x)))
-                               (values res (- x (locally
-                                                    ;; Can be flushed as it will produce no errors.
-                                                    (declare (flushable ,',coerce))
-                                                    (,',coerce res)))))
+                            `(unary-truncate x)
                             `(let ((res (,',unary x)))
                                ;; Dummy secondary value!
                                (values res x)))
                         (if compute-all
                             `(let* ((f (,',coerce y))
-                                    (res (,',unary (/ x f))))
-                               (values res (- x (* f (locally
-                                                         (declare (flushable ,',coerce))
-                                                       (,',coerce res))))))
+                                    (div (/ x f))
+                                    (res (,',unary div)))
+                               (values res
+                                       (- x (* f
+                                               #+round-float
+                                               (- (,',(ecase type
+                                                        (double-float 'round-double)
+                                                        (single-float 'round-single))
+                                                      div :truncate)
+                                                  ,,(ecase type
+                                                      (double-float $-0.0d0)
+                                                      (single-float $-0.0f0)))
+                                               #-round-float
+                                               (locally
+                                                   (declare (flushable ,',coerce))
+                                                 (,',coerce res))))))
                             `(let* ((f (,',coerce y))
                                     (res (,',unary (/ x f))))
                                ;; Dummy secondary value!
@@ -1576,13 +1822,115 @@
   (def single-float ())
   (def double-float (single-float)))
 
+;;; truncate on bignum floats will always have a remainder of zero
+;;; on 64-bit, so ceiling and floor are the same as truncate.
+#+64-bit
+(macrolet ((def (name type other-float-arg-types
+                 fixup)
+             (let* ((unary (symbolicate "%UNARY-TRUNCATE/" type))
+                    (unary-to-bignum (symbolicate 'unary-truncate- type '-to-bignum))
+                    (coerce (symbolicate "%" type)))
+               `(deftransform ,name ((number &optional divisor)
+                                     (,type
+                                      &optional (or ,type ,@other-float-arg-types integer))
+                                     *)
+                  (block nil
+                    (let ((one-p (or (not divisor)
+                                     (and (constant-lvar-p divisor) (sb-xc:= (lvar-value divisor) 1)))))
+                      #+round-float
+                      (when-vop-existsp (:translate %unary-ceiling)
+                        (when one-p
+                          (return
+                            `(if (typep number
+                                        '(,',type
+                                          ,',(symbol-value (package-symbolicate :sb-kernel 'most-negative-fixnum- type))
+                                          ,',(symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type))))
+                                 (values (truly-the fixnum (,',(symbolicate '%unary- name) number))
+                                         (- number
+                                            (,',(ecase type
+                                                  (double-float 'round-double)
+                                                  (single-float 'round-single))
+                                             number ,,(keywordicate name))))
+                                 (,',unary-to-bignum number)))))
+                      `(let* ,(if one-p
+                                  `((f-divisor 1)
+                                    (div number))
+                                  `((f-divisor (,',coerce divisor))
+                                    (div (/ number f-divisor))))
+                         (if (typep div
+                                    '(,',type
+                                      ,',(symbol-value (package-symbolicate :sb-kernel 'most-negative-fixnum- type))
+                                      ,',(symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type))))
+                             (let* ((tru (truly-the fixnum (,',unary div)))
+                                    (rem (- number (* ,@(unless one-p
+                                                          '(f-divisor))
+                                                      #+round-float
+                                                      (- (,',(ecase type
+                                                               (double-float 'round-double)
+                                                               (single-float 'round-single))
+                                                             div :truncate)
+                                                         ,,(ecase type
+                                                             (double-float $-0.0d0)
+                                                             (single-float $-0.0f0)))
+                                                      #-round-float
+                                                      (locally
+                                                          (declare (flushable ,',coerce))
+                                                        (,',coerce tru))))))
+                               ,',fixup)
+                             (,',unary-to-bignum div)))))))))
+  (def floor single-float ()
+    #1=(if (and (not (zerop rem))
+                (if (minusp f-divisor)
+                    (plusp number)
+                    (minusp number)))
+           (values
+            ;; the above conditions wouldn't hold when tru is m-n-f
+            (truly-the fixnum (1- tru))
+            (+ rem f-divisor))
+           (values tru rem)))
+  (def floor double-float (single-float)
+    #1#)
+  (def ceiling single-float ()
+    #2=(if (and (not (zerop rem))
+                (if (minusp f-divisor)
+                    (minusp number)
+                    (plusp number)))
+           (values (+ tru 1) (- rem f-divisor))
+           (values tru rem)))
+  (def ceiling double-float (single-float)
+    #2#))
+
+#-64-bit
+(macrolet ((def (number-type divisor-type)
+             `(progn
+                (deftransform floor ((number divisor) (,number-type ,divisor-type) * :node node)
+                  `(let ((divisor (coerce divisor ',',number-type)))
+                     (multiple-value-bind (tru rem) (truncate number divisor)
+                       (if (and (not (zerop rem))
+                                (if (minusp divisor)
+                                    (plusp number)
+                                    (minusp number)))
+                           (values (1- tru) (+ rem divisor))
+                           (values tru rem)))))
+
+                (deftransform ceiling ((number divisor) (,number-type ,divisor-type) * :node node)
+                  `(let ((divisor (coerce divisor ',',number-type)))
+                     (multiple-value-bind (tru rem) (truncate number divisor)
+                       (if (and (not (zerop rem))
+                                (if (minusp divisor)
+                                    (minusp number)
+                                    (plusp number)))
+                           (values (+ tru 1) (- rem divisor))
+                           (values tru rem))))))))
+  (def double-float (or float integer))
+  (def single-float (or single-float integer)))
+
 #-round-float
 (progn
-  (defknown %unary-ftruncate (real) float (movable foldable flushable))
-  (defknown %unary-ftruncate/single (single-float) single-float
-      (movable foldable flushable))
-  (defknown %unary-ftruncate/double (double-float) double-float
-      (movable foldable flushable))
+  (defknown (%unary-ftruncate %unary-fround) (real) float (movable foldable flushable))
+  #-64-bit
+  (defknown (%unary-ftruncate/double %unary-fround/double) (double-float) double-float
+    (movable foldable flushable))
 
   (deftransform %unary-ftruncate ((x) (single-float))
     `(cond ((or (typep x '(single-float ($-1f0) ($0f0)))
@@ -1594,45 +1942,123 @@
            (t
             x)))
 
-  #-32-bit
-  (deftransform %unary-ftruncate ((x) (double-float))
-    `(cond ((or (typep x '(double-float ($-1d0) ($0d0)))
-                (eql x $-0d0))
-            $-0d0)
-           ((typep x '(double-float ,(float (- (expt 2 sb-vm:double-float-digits)) $1d0)
-                       ,(float (1- (expt 2 sb-vm:double-float-digits)) $1d0)))
-            (float (truncate x) $1d0))
+  (deftransform %unary-fround ((x) (single-float))
+    `(cond ((or (typep x '(single-float $-0.5f0 ($0f0)))
+                (eql x $-0f0))
+            $-0f0)
+           ((typep x '(single-float ,(float (- (expt 2 sb-vm:single-float-digits)) $1f0)
+                       ,(float (1- (expt 2 sb-vm:single-float-digits)) $1f0)))
+            (float (round x) $1f0))
            (t
             x)))
 
-  #+(and (not sb-xc-host) 32-bit)
-  (defun %unary-ftruncate/double (x)
-    (declare (muffle-conditions compiler-note))
-    (declare (type double-float x))
-    (declare (optimize speed (safety 0)))
-    (let* ((high (double-float-high-bits x))
-           (low (double-float-low-bits x))
-           (exp (ldb sb-vm:double-float-exponent-byte high))
-           (biased (the double-float-exponent
-                        (- exp sb-vm:double-float-bias))))
-      (declare (type (signed-byte 32) high)
-               (type (unsigned-byte 32) low))
-      (cond
-        ((= exp sb-vm:double-float-normal-exponent-max) x)
-        ((<= biased 0) (* x $0d0))
-        ((>= biased (float-digits x)) x)
-        (t
-         (let ((frac-bits (- (float-digits x) biased)))
-           (cond ((< frac-bits 32)
-                  (setf low (logandc2 low (- (ash 1 frac-bits) 1))))
-                 (t
-                  (setf low 0)
-                  (setf high (logandc2 high (- (ash 1 (- frac-bits 32)) 1)))))
-           (make-double-float high low))))))
-  #+32-bit
-  (deftransform %unary-ftruncate ((x) (double-float))
-    `(%unary-ftruncate/double x)))
+  #+64-bit
+  (progn
+    (deftransform %unary-ftruncate ((x) (double-float))
+      `(cond ((or (typep x '(double-float ($-1d0) ($0d0)))
+                  (eql x $-0d0))
+              $-0d0)
+             ((typep x '(double-float ,(float (- (expt 2 sb-vm:double-float-digits)) $1d0)
+                         ,(float (1- (expt 2 sb-vm:double-float-digits)) $1d0)))
+              (float (truncate x) $1d0))
+             (t
+              x)))
 
+    (deftransform %unary-fround ((x) (double-float))
+      `(cond ((or (typep x '(double-float $-0.5d0 ($0d0)))
+                  (eql x $-0d0))
+              $-0d0)
+             ((typep x '(double-float ,(float (- (expt 2 sb-vm:double-float-digits)) $1d0)
+                         ,(float (1- (expt 2 sb-vm:double-float-digits)) $1d0)))
+              (float (round x) $1d0))
+             (t
+              x))))
+
+  #-64-bit
+  (progn
+    #-sb-xc-host
+    (progn
+      (defun %unary-ftruncate/double (x)
+        (declare (muffle-conditions compiler-note))
+        (declare (type double-float x))
+        (declare (optimize speed (safety 0)))
+        (let* ((high (double-float-high-bits x))
+               (low (double-float-low-bits x))
+               (exp (ldb sb-vm:double-float-hi-exponent-byte high))
+               (biased (the double-float-exponent
+                            (- exp sb-vm:double-float-bias))))
+          (declare (type (signed-byte 32) high)
+                   (type (unsigned-byte 32) low))
+          (cond
+            ((= exp sb-vm:double-float-normal-exponent-max) x)
+            ((<= biased 0) (* x $0d0))
+            ((>= biased (float-digits x)) x)
+            (t
+             (let ((frac-bits (- (float-digits x) biased)))
+               (cond ((< frac-bits 32)
+                      (setf low (logandc2 low (- (ash 1 frac-bits) 1))))
+                     (t
+                      (setf low 0)
+                      (setf high (logandc2 high (- (ash 1 (- frac-bits 32)) 1)))))
+               (make-double-float high low))))))
+      (defun %unary-fround/double (x)
+        (declare (muffle-conditions compiler-note))
+        (declare (type double-float x))
+        (declare (optimize speed (safety 0)))
+        (let* ((high (double-float-high-bits x))
+               (low (double-float-low-bits x))
+               (exp (ldb sb-vm:double-float-hi-exponent-byte high))
+               (biased (the double-float-exponent
+                            (- exp sb-vm:double-float-bias))))
+          (declare (type (signed-byte 32) high)
+                   (type (unsigned-byte 32) low))
+          (cond
+            ((= exp sb-vm:double-float-normal-exponent-max) x)
+            ((<= biased -1) (* x $0d0)) ; [0,0.5)
+            ((and (= biased 0) (= low 0) (= (ldb sb-vm:double-float-hi-significand-byte high) 0)) ; [0.5,0.5]
+             (* x $0d0))
+            ((= biased 0) (float-sign x $1d0)) ; (0.5,1.0)
+            ((= biased 1) ; [1.0,2.0)
+             (cond
+               ((>= (ldb sb-vm:double-float-hi-significand-byte high) (ash 1 19))
+                (float-sign x $2d0))
+               (t (float-sign x $1d0))))
+            ((>= biased (float-digits x)) x)
+            (t
+             ;; it's probably possible to do something very contorted
+             ;; to avoid consing intermediate bignums, by performing
+             ;; arithmetic on the fractional part, the low integer
+             ;; part, the high integer part, and the exponent of the
+             ;; double float.  But in the interest of getting
+             ;; something correct to start with, delegate to ROUND.
+             (float (round x) $1d0))))))
+    (deftransform %unary-ftruncate ((x) (double-float))
+      `(%unary-ftruncate/double x))
+    (deftransform %unary-fround ((x) (double-float))
+      `(%unary-fround/double x))))
+
+#+round-float
+(deftransform fround ((number &optional divisor) (double-float &optional t))
+  (if (or (not divisor)
+          (and (constant-lvar-p divisor)
+               (= (lvar-value divisor) 1)))
+      `(let ((res (round-double number :round)))
+         (values res (- number res)))
+      `(let* ((divisor (%double-float divisor))
+              (res (round-double (/ number (%double-float divisor)) :round)))
+         (values res (- number (* res divisor))))))
+
+#+round-float
+(deftransform fround ((number &optional divisor) (single-float &optional (or null single-float rational)))
+  (if (or (not divisor)
+          (and (constant-lvar-p divisor)
+               (= (lvar-value divisor) 1)))
+      `(let ((res (round-single number :round)))
+         (values res (- number res)))
+      `(let* ((divisor (%single-float divisor))
+              (res (round-single (/ number divisor) :round)))
+         (values res (- number (* res divisor))))))
+
 ;;;; TESTS
 
 ;;; Dumping of double-float literals in genesis got some bits messed up,
@@ -1669,12 +2095,24 @@
                 thereis (typep (code-header-ref code index) 'complex))))
   (fmakunbound test))
 
-;;; An example that we can't cross-compile: CTYPE-OF-NUMBER tries to compute
-;;; low/high bounds so that it can return (COMPLEX (SINGLE-FLOAT <LOW> <HIGH>))
-;;; but we haven't taught the MIN,MAX interceptors how to operate on infinity.
-#+nil
 (defun more-folding ()
   (values (complex single-float-positive-infinity single-float-positive-infinity)
           (complex single-float-negative-infinity single-float-positive-infinity)
           (complex single-float-negative-infinity single-float-negative-infinity)
           (complex single-float-positive-infinity single-float-negative-infinity)))
+
+#-sb-xc-host
+(multiple-value-bind (a b c d) (funcall 'more-folding)
+  (assert (sb-ext:float-infinity-p (realpart a)))
+  (assert (sb-ext:float-infinity-p (imagpart a)))
+  (assert (sb-ext:float-infinity-p (realpart b)))
+  (assert (sb-ext:float-infinity-p (imagpart b)))
+  (assert (sb-ext:float-infinity-p (realpart c)))
+  (assert (sb-ext:float-infinity-p (imagpart c)))
+  (assert (sb-ext:float-infinity-p (realpart d)))
+  (assert (sb-ext:float-infinity-p (imagpart d)))
+  (let ((code (fun-code-header (symbol-function 'more-folding))))
+    (aver (loop for index from sb-vm:code-constants-offset
+                below (code-header-words code)
+                thereis (typep (code-header-ref code index) 'complex))))
+  (fmakunbound 'more-folding))

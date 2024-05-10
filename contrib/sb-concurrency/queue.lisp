@@ -144,3 +144,59 @@ must walk the entire queue."
 (defun queue-empty-p (queue)
   "Returns T if QUEUE is empty, NIL otherwise."
   (null (cdr (queue-head queue))))
+
+;;; Experimental support for compiling in the background.
+;;; The use-case is that you have some functions which you'll need later,
+;;; but want to pass them around now as compiled-functions without waiting
+;;; for COMPILE. If the timing is right, the compiler will be done by the time
+;;; of the call to such functions, but if not, that's OK - it just works.
+#+sb-thread
+(progn
+  (define-load-time-global *compilation-queue* (make-queue :name "compiler"))
+
+  (defun run-background-compile (&aux compiled)
+    (loop
+     (let ((item (dequeue *compilation-queue*)))
+       (unless item (return compiled))
+       (setq compiled t)
+       (let ((fin (elt (the (simple-vector 3) item) 0))
+             (lexpr (elt item 1)))
+         (multiple-value-bind (compiled-function warnings errors) (compile nil lexpr)
+           (declare (ignore warnings))
+           ;; It's OK for a closure's raw addr slot to point directly to an address
+           ;; within a code blob, but I'm not sure if it's legal in a funinstance.
+           ;; Probably need to tweak the GC to allow it. Then we would bypass
+           ;; the embedded trampoline for anonymous call; the caller would jump
+           ;; directly to where the call is intended to end up.
+           (setf (sb-kernel:%funcallable-instance-fun fin)
+                 (if errors
+                     (lambda (&rest args)
+                       (declare (ignore args))
+                       (error "Compiling ~S failed" fin))
+                     (lambda (&rest args)
+                       (apply compiled-function args))))
+           (open-gate (elt item 2)))))))
+
+  (setq sb-impl::*bg-compiler-function* #'run-background-compile)
+
+  (defun promise-compile (lexpr)
+    ;;   Dynamic      Immobile
+    ;;   -------      --------
+    ;;   header       header+layout
+    ;;   trampoline   trampoline -----\
+    ;;   layout       machine code   <--
+    ;;   impl-fun     machine code
+    ;;   unused       impl-fun
+    ;;   unused
+    ;; The constant 1 here is ok for #+ or #- immobile-space.
+    (let ((fin (sb-kernel:%make-funcallable-instance 1))
+          (gate (make-gate)))
+      (sb-kernel:%set-fun-layout fin (sb-kernel:find-layout 'function))
+      (sb-vm::write-funinstance-prologue fin)
+      (setf (sb-kernel:%funcallable-instance-fun fin)
+            (lambda (&rest args)
+              (wait-on-gate gate)
+              (apply fin args)))
+      (enqueue (vector fin lexpr gate) *compilation-queue*)
+      (sb-impl::finalizer-thread-notify 0)
+      fin)))

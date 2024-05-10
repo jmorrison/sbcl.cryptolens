@@ -17,7 +17,199 @@
 ;;; A list of UNDEFINED-WARNING structures representing references to unknown
 ;;; stuff which came up in a compilation unit.
 (defvar *undefined-warnings*)
-(declaim (list *undefined-warnings*))
+(defvar *argument-mismatch-warnings*)
+(declaim (list *undefined-warnings* *argument-mismatch-warnings*))
+
+;;; Delete any undefined warnings for NAME and KIND. This is for the
+;;; benefit of the compiler, but it's sometimes called from stuff like
+;;; type-defining code which isn't logically part of the compiler.
+(declaim (ftype (function ((or symbol cons) keyword) (values))
+                note-name-defined))
+(defun note-name-defined (name kind)
+  #-sb-xc-host (atomic-incf sb-kernel::*type-cache-nonce*)
+  ;; We do this BOUNDP check because this function can be called when
+  ;; not in a compilation unit (as when loading top level forms).
+  (when (boundp '*undefined-warnings*)
+    (let ((name (uncross name)))
+      (setq *undefined-warnings*
+            (delete-if (lambda (x)
+                         (and (equal (undefined-warning-name x) name)
+                              (eq (undefined-warning-kind x) kind)))
+                       *undefined-warnings*))))
+  (values))
+
+(defun check-variable-name (name &key
+                                   (context "local variable")
+                                   (signal-via #'compiler-error))
+  (unless (legal-variable-name-p name)
+    (funcall signal-via "~@<~S~[~; is a keyword and~; is not a symbol and~
+                         ~] cannot be used as a ~A.~@:>"
+             name
+             (typecase name
+               (null    0)
+               (keyword 1)
+               (t       2))
+             context))
+  name)
+
+;;; Check that NAME is a valid function name, returning the name if
+;;; OK, and signalling an error if not. In addition to checking for
+;;; basic well-formedness, we also check that symbol names are not NIL
+;;; or the name of a special form.
+(defun check-fun-name (name)
+  (typecase name
+    (list
+     (unless (legal-fun-name-p name)
+       (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
+    (symbol
+     (when (eq (info :function :kind name) :special-form)
+       (compiler-error "~@<Special form is an illegal function name: ~S.~@:>"
+                       name)))
+    (t
+     (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
+  name)
+
+;;; Check that NAME is a valid class name, returning the name if OK,
+;;; and signalling an error if not.
+(declaim (inline sb-pcl::check-class-name))
+(defun sb-pcl::check-class-name (name &optional (allow-nil t))
+  ;; Apparently, FIND-CLASS and (SETF FIND-CLASS) accept any symbol,
+  ;; but DEFCLASS only accepts non-NIL symbols.
+  (if (or (not (legal-class-name-p name))
+          (and (null name) (not allow-nil)))
+      (error 'sb-kernel::illegal-class-name-error :name name)
+      name))
+
+;;; Check that NAME is a valid designator for the defining macro
+;;; MACRO. This is used mostly to give a consistent message for all
+;;; defining forms, except for DEFCLASS, which uses CHECK-CLASS-NAME.
+(defun check-designator (name macro &optional (predicate #'symbolp)
+                                              (what "symbol")
+                                              (arg-reference "NAME"))
+  ;; If we decide that the correct behavior is to actually macroexpand
+  ;; and then fail later, well, I suppose we could express all macros
+  ;; such that they perform their LEGAL-FUN-NAME-P/SYMBOLP check as
+  ;; part of the ordinary code, as in: (DEFPARAMETER "foo" 3) ->
+  ;; (%defparameter (the symbol '"foo") ...)  which seems at least
+  ;; slightly preferable to failing in the internal function that
+  ;; would store the globaldb info.
+  (unless (funcall predicate name)
+    (error (format nil "The ~A argument to ~A, ~~S, is not a ~A."
+                   arg-reference macro what)
+           name)))
+
+;;; This is called to do something about SETF functions that overlap
+;;; with SETF macros. Perhaps we should interact with the user to see
+;;; whether the macro should be blown away, but for now just give a
+;;; warning. Due to the weak semantics of the (SETF FUNCTION) name, we
+;;; can't assume that they aren't just naming a function (SETF FOO)
+;;; for the heck of it. NAME is already known to be well-formed.
+(defun warn-if-setf-macro (name)
+  ;; Never warn about this situation when running the cross-compiler.
+  ;; SBCL provides expanders/inverses *and* functions for most SETFable things
+  ;; even when CLHS does not specifically state that #'(SETF x) exists.
+  #+sb-xc-host (declare (ignore name))
+  #-sb-xc-host
+  (let ((stem (second name)))
+    (when (info :setf :expander stem)
+      (compiler-style-warn
+         "defining function ~S when ~S already has a SETF macro"
+         name stem)))
+  (values))
+
+;;; Record a new function definition, and check its legality.
+(defun proclaim-as-fun-name (name)
+
+  ;; legal name?
+  (check-fun-name name)
+
+  ;; KLUDGE: This can happen when eg. compiling a NAMED-LAMBDA, and isn't
+  ;; guarded against elsewhere -- so we want to assert package locks here. The
+  ;; reason we do it only when stomping on existing stuff is because we want
+  ;; to keep
+  ;;   (WITHOUT-PACKAGE-LOCKS (DEFUN LOCKED:FOO ...))
+  ;; viable, which requires no compile-time violations in the harmless cases.
+  (with-single-package-locked-error ()
+    (flet ((assert-it ()
+             (assert-symbol-home-package-unlocked name "proclaiming ~S as a function")))
+
+      (let ((kind (info :function :kind name)))
+        ;; scrubbing old data: possible collision with a macro
+        ;; There's a silly little problem with fun names that are not ANSI-legal names,
+        ;; e.g. (CAS mumble). We can't ask the host whether that is FBOUNDP,
+        ;; because it would rightly complain. So, just assume that it is not FBOUNDP.
+        (when (and #+sb-xc-host (symbolp name)
+                   (fboundp name)
+                   (eq :macro kind))
+          (assert-it)
+          (compiler-style-warn "~S was previously defined as a macro." name)
+          (setf (info :function :where-from name) :assumed)
+          (clear-info :function :macro-function name))
+
+        (unless (eq :function kind)
+          (assert-it)
+          ;; There's no reason to store (:FUNCTION :KIND) for names which
+          ;; could only be of kind :FUNCTION if anything.
+          (unless (pcl-methodfn-name-p name)
+            (setf (info :function :kind name) :function))))))
+
+  (values))
+
+;;; Make NAME no longer be a function name: clear everything back to
+;;; the default.
+(defun undefine-fun-name (name)
+  (when name
+    (macrolet ((frob (&rest types)
+                 `(clear-info-values
+                   name ',(mapcar (lambda (x)
+                                    (meta-info-number (meta-info :function x)))
+                                  types))))
+      ;; Note that this does not clear the :DEFINITION.
+      ;; That's correct, because if we lose the association between a
+      ;; symbol and its #<fdefn> object, it could lead to creation of
+      ;; a non-unique #<fdefn> for a name.
+      (frob :info
+            :type ; Hmm. What if it was proclaimed- shouldn't it stay?
+            :where-from ; Ditto.
+            :inlinep
+            :kind
+            :macro-function
+            :inlining-data
+            :source-transform
+            :assumed-type)))
+  (values))
+
+;;; part of what happens with DEFUN, also with some PCL stuff: Make
+;;; NAME known to be a function definition.
+(defun become-defined-fun-name (name)
+  (proclaim-as-fun-name name)
+  (when (eq (info :function :where-from name) :assumed)
+    (setf (info :function :where-from name) :defined)
+    (if (info :function :assumed-type name)
+        (clear-info :function :assumed-type name))))
+
+;;; to be called when a variable is lexically bound
+(declaim (ftype (function (symbol) (values)) note-lexical-binding))
+(defun note-lexical-binding (symbol)
+    ;; This check is intended to protect us from getting silently
+    ;; burned when we define
+    ;;   foo.lisp:
+    ;;     (DEFVAR *FOO* -3)
+    ;;     (DEFUN FOO (X) (+ X *FOO*))
+    ;;   bar.lisp:
+    ;;     (DEFUN BAR (X)
+    ;;       (LET ((*FOO* X))
+    ;;         (FOO 14)))
+    ;; and then we happen to compile bar.lisp before foo.lisp.
+  (when (looks-like-name-of-special-var-p symbol)
+    ;; FIXME: should be COMPILER-STYLE-WARNING?
+    (style-warn 'asterisks-around-lexical-variable-name
+                :format-control
+                "using the lexical binding of the symbol ~
+                 ~/sb-ext:print-symbol-with-prefix/, not the~@
+                 dynamic binding"
+                :format-arguments (list symbol)))
+  (values))
 
 ;;; In the target compiler, a lexenv can hold an alist of condition
 ;;; types (CTYPE . ACTION) such that when signaling condition CTYPE,
@@ -51,6 +243,7 @@
           #-sb-xc-host
           (let ((type (compiler-specifier-type typespec)))
             (cond ((not type))
+                  ((contains-unknown-type-p type))
                   (ospec
                    (setf (car ospec) (type-union (car ospec) type)))
                   (t
@@ -101,11 +294,7 @@
       (enable-package-locks
        (set-difference old names :test #'equal)))))
 
-;;; This variable really wants to be a DEFVAR, but the "if (boundp)" expression
-;;; is too tricky for genesis. Let's ensure proper behavior by not clobbering
-;;; it in the host, but doing the only thing that genesis can do in the target.
-(#+sb-xc-host defvar #-sb-xc-host defparameter
- *queued-proclaims* nil) ; should this be !*QUEUED-PROCLAIMS* ?
+(defvar *queued-proclaims* nil)
 
 (defun process-variable-declaration (name kind info-value)
   (unless (symbolp name)
@@ -120,14 +309,8 @@
   (multiple-value-bind (allowed test)
       (ecase kind
         (special
-         ;; KLUDGE: There is probably a better place to do this.
-         (when (boundp '*ir1-namespace*)
-           (remhash name (free-vars *ir1-namespace*)))
          (values '(:special :unknown) #'eq))
         (global
-         ;; KLUDGE: Ditto.
-         (when (boundp '*ir1-namespace*)
-           (remhash name (free-vars *ir1-namespace*)))
          (values '(:global :unknown) #'eq))
         (always-bound (values '(:constant) #'neq)))
     (let ((old (info :variable :kind name)))
@@ -138,11 +321,12 @@
       (:symbol name "globally declaring ~A ~A" kind)
     (if (eq kind 'always-bound)
         (setf (info :variable :always-bound name) info-value)
-        (setf (info :variable :kind name) info-value))))
+        (setf (info :variable :kind name) info-value)))
+  #-sb-xc-host (unset-symbol-progv-optimize name))
 
-(defun type-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'type-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
+#-sb-xc-host
+(defun unset-symbol-progv-optimize (symbol)
+  (reset-header-bits symbol sb-vm::+symbol-fast-bindable+))
 
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
@@ -150,17 +334,29 @@
 
   (with-single-package-locked-error
       (:symbol name "globally declaring the TYPE of ~A")
-    (when (eq (info :variable :where-from name) :declared)
-      (let ((old-type (info :variable :type name)))
-        (when (type/= type old-type)
-          (type-proclamation-mismatch-warn
-           name (type-specifier old-type) type-specifier))))
+    (let (warned)
+     (when (eq (info :variable :where-from name) :declared)
+       (let ((old-type (info :variable :type name)))
+         (when (type/= type old-type)
+           (setf warned t)
+           (warn 'type-proclamation-mismatch-warning
+                 :name name
+                 :old (type-specifier old-type)
+                 :new type-specifier))))
+      (when (and (not warned)
+                 (boundp name))
+        #-sb-xc-host
+        (let ((value (symbol-value name)))
+          (when (multiple-value-bind (p really) (ctypep value type)
+                  (and really
+                       (not p)))
+            (warn 'type-proclamation-mismatch-warning
+                  :name name
+                  :old (type-of value)
+                  :value value
+                  :new type-specifier)))))
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
-
-(defun ftype-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'ftype-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
 
 (defun proclaim-ftype (name type-oid type-specifier where-from)
   (declare (type (or ctype defstruct-description) type-oid))
@@ -171,23 +367,45 @@
     (error "Not a function type: ~/sb-impl:print-type/" type-oid))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
-    (when (eq (info :function :where-from name) :declared)
-      (let ((old-type (global-ftype name))
-            (type (if (ctype-p type-oid)
-                      type-oid
-                      (specifier-type type-specifier))))
-        (cond
-          ((not (type/= type old-type))) ; not changed
-          ((not (info :function :info name)) ; not a known function
-           (ftype-proclamation-mismatch-warn
-            name (type-specifier old-type) type-specifier))
-          ((csubtypep type old-type)) ; tighten known function type
-          (t
-           (cerror "Continue"
-                   'ftype-proclamation-mismatch-error
+    (let ((from (info :function :where-from name)))
+     (case from
+       (:declared
+        (let ((old-type (global-ftype name))
+              (type (if (ctype-p type-oid)
+                        type-oid
+                        (specifier-type type-specifier))))
+          (cond
+            ((not (type/= type old-type)))    ; not changed
+            ((not (info :function :info name)) ; not a known function
+             (warn 'ftype-proclamation-mismatch-warning
                    :name name
                    :old (type-specifier old-type)
-                   :new type-specifier)))))
+                   :new type-specifier))
+            ((csubtypep type old-type)) ; tighten known function type
+            (t
+             (cerror "Continue"
+                     'ftype-proclamation-mismatch-error
+                     :name name
+                     :old (type-specifier old-type)
+                     :new type-specifier)))))
+       (:defined
+        (when (and #+sb-xc-host (not (sb-cold::make-host-2-parallelism)))
+          (let* ((old-type (global-ftype name))
+                 (type (if (ctype-p type-oid)
+                           type-oid
+                           (specifier-type type-specifier)))
+                 (old-return-type (if (fun-type-p old-type)
+                                      (fun-type-returns old-type)
+                                      *wild-type*))
+                 (return-type (if (fun-type-p type)
+                                  (fun-type-returns type)
+                                  *wild-type*)))
+            (cond
+              ((values-subtypep old-return-type return-type))
+              (t
+               (style-warn 'sb-kernel::ftype-proclamation-derived-mismatch-warning
+                           :name name :old (type-specifier old-type)
+                           :new type-specifier))))))))
     ;; Now references to this function shouldn't be warned about as
     ;; undefined, since even if we haven't seen a definition yet, we
     ;; know one is planned.
@@ -201,36 +419,17 @@
     (setf (info :function :type name) type-oid
           (info :function :where-from name) where-from)))
 
-(defun seal-class (class)
-  (declare (type classoid class))
-  (setf (classoid-state class) :sealed)
-  (let ((subclasses (classoid-subclasses class)))
-    (when subclasses
-      (dohash ((subclass layout) subclasses :locked t)
-        (declare (ignore layout))
-        (setf (classoid-state subclass) :sealed)))))
+(defun seal-class (classoid)
+  (declare (type classoid classoid))
+  (setf (classoid-state classoid) :sealed)
+  (sb-kernel::do-subclassoids ((subclassoid layout) classoid)
+    (declare (ignore layout))
+    (setf (classoid-state subclassoid) :sealed)))
 
 (defun process-freeze-type-declaration (type-specifier)
   (let ((class (specifier-type type-specifier)))
     (when (typep class 'classoid)
       (seal-class class))))
-
-(defun process-inline-declaration (name kind)
-  (declare (type (and inlinep (not null)) kind))
-  ;; since implicitly it is a function, also scrubs (FREE-FUNS *IR1-NAMESPACE*)
-  (proclaim-as-fun-name name)
-  (warn-if-inline-failed/proclaim name kind)
-  (setf (info :function :inlinep name) kind))
-
-(defun process-block-compile-declaration (entries kind)
-  (ecase kind
-    (start-block
-     (finish-block-compilation)
-     (let ((compilation *compilation*))
-       (setf (block-compile compilation) t)
-       (setf (entry-points compilation) entries)))
-    (end-block
-     (finish-block-compilation))))
 
 (defun check-deprecation-declaration (state since form)
   (unless (typep state 'deprecation-state)
@@ -306,6 +505,19 @@
 (defun %proclaim (raw-form location)
   (destructuring-bind (&whole form &optional kind &rest args)
       (canonized-decl-spec raw-form)
+    ;; It seems strange to test whether we are currently in
+    ;; compile-time mode this way, but the reason we don't just call
+    ;; %COMPILER-PROCLAIM in a :COMPILE-TOPLEVEL-only situation in the
+    ;; macro-expansion of DECLAIM is that unlike the DEFmumble macros,
+    ;; DECLAIM and PROCLAIM both exist, and it is unclear whether the
+    ;; intent of the ANSI specification is that
+    ;;   (EVAL-WHEN (:COMPILE-TOPLEVEL ...)
+    ;;     (LET ()
+    ;;       (PROCLAIM ...)))
+    ;; should have the exact same compile time effects as (DECLAIM ...).
+    ;; We make the assumption that yes, they should have the same semantics.
+    (when (boundp '*compilation*)
+      (%compiler-proclaim kind args))
     (labels ((store-location (name &key (key kind))
                (if location
                    (setf (getf (info :source-location :declaration name) key)
@@ -338,17 +550,14 @@
                                     (type #'proclaim-type)
                                     (ftype #'proclaim-ftype))
                             ctype type :declared)))
-             (push raw-form *queued-proclaims*)))
-        #-sb-fluid
+             #-sb-xc-host
+             (push raw-form *queued-proclaims*)
+             #+sb-xc-host
+             (error "Type system not yet initialized.")))
         (freeze-type
          (map-args #'process-freeze-type-declaration))
-        ((start-block end-block)
-         (when (and *compile-time-eval* (boundp '*compilation*))
-           (if (eq *block-compile-argument* :specified)
-               (process-block-compile-declaration args kind)
-               (compiler-notify "ignoring ~S declaration since ~
-                                :BLOCK-COMPILE is not :SPECIFIED"
-                                kind))))
+        ;; This only has compile-time effects.
+        ((start-block end-block))
         (optimize
          (multiple-value-bind (new-policy specified-qualities)
              (process-optimize-decl form *policy*)
@@ -372,8 +581,11 @@
         ((disable-package-locks enable-package-locks)
          (setq *disabled-package-locks*
                (process-package-lock-decl form *disabled-package-locks*)))
-        ((#-sb-fluid inline notinline #-sb-fluid maybe-inline)
-         (map-args #'process-inline-declaration kind))
+        ((inline notinline maybe-inline)
+         (dolist (name args)
+           (warn-if-inline-failed/proclaim name kind)
+           (setf (info :function :inlinep name)
+                 (the (and inlinep (not null)) kind))))
         (deprecated
          (destructuring-bind (state since &rest things) args
            (multiple-value-bind (state software version)
@@ -391,9 +603,17 @@
          (unless (info :declaration :known kind)
            (compiler-warn "unrecognized declaration ~S" raw-form)))))))
 
-(defun sb-xc:proclaim (raw-form)
+(defun proclaim (raw-form)
   (/noshow "PROCLAIM" raw-form)
   (%proclaim raw-form nil)
+  (values))
+
+;;; Note that the type NAME has been (re)defined, updating the
+;;; undefined warnings and VALUES-SPECIFIER-TYPE cache.
+(defun %note-type-defined (name)
+  (declare (symbol name))
+  (note-name-defined name :type)
+  (values-specifier-type-cache-clear)
   (values))
 
 ;; Issue a style warning if there are any repeated OPTIMIZE declarations

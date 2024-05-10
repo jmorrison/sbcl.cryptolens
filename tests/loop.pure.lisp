@@ -90,7 +90,7 @@
 (assert (= (loop for nil being the external-symbols of :cl count t) 978))
 (assert (= (loop for x being the external-symbols of :cl count x) 977))
 
-(let ((*package* (find-package :cl)))
+(let ((cl:*package* (find-package :cl)))
   (assert (= (loop for x being each external-symbol count t) 978)))
 
 (assert (eq (loop for a = (return t) return nil) t))
@@ -428,7 +428,7 @@
   (assert-no-signal
    (compile nil '(lambda ()
                    (declare (optimize speed))
-                   (loop repeat (+ 1 5) for baz = 'this then 'that
+                   (loop for baz = 'this then 'that repeat (+ 1 5)
                          do (print baz))))))
 
 (with-test (:name :loop-default-init-type)
@@ -454,6 +454,7 @@
                  for (a b) = (multiple-value-list (floor i 5))
                  sum (+ a b))))
     (ctu:assert-no-consing (f 1000))))
+
 (with-test (:name :destructuring-m-v-list-with-nil)
   (assert (equal-mod-gensyms
            (macroexpand-1 '(sb-loop::loop-desetq (x nil z) (multiple-value-list (foo))))
@@ -461,3 +462,20 @@
              (declare (ignore g2))
              (sb-loop::loop-desetq x g1)
              (sb-loop::loop-desetq z g3)))))
+
+(with-test (:name :collect-list-type)
+  (assert
+   (equal (third (sb-kernel:%simple-fun-type
+                  (checked-compile
+                   '(lambda (l)
+                     (loop for x in l
+                           collect x into m
+                           finally (return m))))))
+          '(values list &optional)))
+  (assert
+   (equal (third (sb-kernel:%simple-fun-type
+                  (checked-compile
+                   '(lambda (l)
+                     (loop for x in l
+                           collect x)))))
+          '(values list &optional))))

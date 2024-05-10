@@ -137,7 +137,7 @@
    (locally (declare (optimize (safety 0)))
     (defstruct f
       (x (print t) :type fixnum)))
-   (2 2))
+   (1 2 2))
   (assert-condition-source-paths
    (locally (declare (optimize (safety 0)))
      (defstruct f
@@ -277,4 +277,73 @@
 (with-test (:name (:source-path typep :invalid-type-specifier))
   (assert-condition-source-paths
    (typep 1 'undefined-type)
-   (2)))
+   ;; both the style-warning and the note count
+   (2) (2)))
+
+(with-test (:name :dead-code-note-after-transforms)
+  (assert
+   (typep (nth-value 4
+                     (checked-compile
+                      `(lambda (x)
+                         (when nil
+                           (funcall x)))))
+          '(cons sb-ext:code-deletion-note null))))
+
+(with-test (:name :dead-code-note-after-transforms.2)
+  (assert
+   (typep (nth-value 4
+                     (checked-compile
+                      `(lambda (a v)
+                         (declare (vector v))
+                         (block nil
+                           (when (integerp a)
+                             (if (integerp a)
+                                 (return))
+                             (length v))))))
+          '(cons sb-ext:code-deletion-note null))))
+
+(with-test (:name :ignore-deleted-subforms)
+  (assert-condition-source-paths
+   (lambda (x m)
+     (when nil
+       (funcall x
+                (if m
+                    (print 20)
+                    (print x)))))
+   (2 2)))
+
+(with-test (:name :ignore-deleted-subforms.2)
+  (assert-condition-source-paths
+   (lambda ()
+     (when nil
+       (let ((z (print 10)))
+         z)))
+   (2 2)))
+
+(with-test (:name :ignore-deleted-subforms.3)
+  (assert-condition-source-paths
+   (lambda (x)
+     (when x
+       (unless x
+         (let ((z (print 10)))
+           (if z
+               10
+               (funcall x))))))
+   (2 2 2)))
+
+(with-test (:name :ignore-deleted-subforms.4)
+  (assert-condition-source-paths
+   (lambda (x)
+     (when nil
+       (if (print 10)
+           10
+           x)))
+   (2 2)))
+
+(with-test (:name :dotted-comma-source-paths)
+  (assert-condition-source-paths
+   (lambda ()
+     `(progn
+        . ,(progn
+             (progn (setq x 1)))))
+   (1 1 1 1 2)))

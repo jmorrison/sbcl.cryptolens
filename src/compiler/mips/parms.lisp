@@ -15,9 +15,12 @@
 
 (defconstant +backend-fasl-file-implementation+ :mips)
 
-  ;; The o32 ABI specifies 4k-64k as page size. We have to pick the
-  ;; maximum since mprotect() works only with page granularity.
-(defconstant +backend-page-bytes+ 65536)
+;; backend-page-size is the granularity at which we try to map/unmap.
+;; linux says getpagesize() is 4k so any multiple thereof is fine.
+(defconstant +backend-page-bytes+ 16384)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
+(defconstant cards-per-page 8)
+(defconstant gencgc-alloc-granularity 0)
 
 ;;;; Machine Architecture parameters:
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -28,28 +31,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 32)
-
-(defconstant float-sign-shift 31)
-
-(defconstant single-float-bias 126)
-(defconstant-eqx single-float-exponent-byte (byte 8 23) #'equalp)
-(defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-(defconstant single-float-normal-exponent-min 1)
-(defconstant single-float-normal-exponent-max 254)
-(defconstant single-float-hidden-bit (ash 1 23))
-
-(defconstant double-float-bias 1022)
-(defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
-(defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
-(defconstant double-float-normal-exponent-min 1)
-(defconstant double-float-normal-exponent-max #x7FE)
-(defconstant double-float-hidden-bit (ash 1 20))
-
-(defconstant single-float-digits
-  (+ (byte-size single-float-significand-byte) 1))
-
-(defconstant double-float-digits
-  (+ (byte-size double-float-significand-byte) n-word-bits 1))
 
 (defconstant float-inexact-trap-bit (ash 1 0))
 (defconstant float-underflow-trap-bit (ash 1 1))
@@ -74,25 +55,11 @@
 
 #+linux
 (progn
-  ;; Where to put the address spaces on Linux.
-  ;;
-  ;; C runtime executable segment starts at 0x00400000
-  (defconstant read-only-space-start #x01000000)
-  (defconstant read-only-space-end   #x07ff0000) ; 112 MiB
+  (gc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
-  (defconstant linkage-table-space-start #x08000000)
-  ;; 64K of linkage space = 16K linkage entries
-  (defconstant linkage-table-space-end   (+ linkage-table-space-start 65536))
-  (defconstant static-space-start    linkage-table-space-end)
-  (defconstant static-space-end      #x0fff0000)
-  ;; C runtime read/write segment starts at 0x10000000, heap and DSOs
-  ;; start at 0x2a000000
-  (defparameter dynamic-0-space-start #x30000000)
-  (defparameter dynamic-0-space-end   #x4fff0000)
-
-  (defconstant linkage-table-entry-size 4)
-  (defconstant linkage-table-growth-direction :down)
-  (setq *linkage-space-predefined-entries* '(("call_into_c" nil)))
+  (defconstant alien-linkage-table-entry-size 4)
+  (defconstant alien-linkage-table-growth-direction :down)
+  (setq *alien-linkage-table-predefined-entries* '(("call_into_c" nil)))
 
   ;; C stack grows downward from 0x80000000
   )
@@ -102,14 +69,12 @@
 
 ;;;; Other non-type constants.
 
-(defenum ()
-  atomic-flag
-  interrupted-flag)
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
   cerror-trap
+  invalid-arg-count-trap
+  allocation-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   after-breakpoint-trap
@@ -127,26 +92,11 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 (defconstant-eqx +static-symbols+
-  `#(,@+common-static-symbols+)
+  `#(,@+common-static-symbols+
+     *pseudo-atomic-atomic*
+     *pseudo-atomic-interrupted*)
   #'equalp)
 
 (defconstant-eqx +static-fdefns+
-  #(two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    two-arg-<=
-    two-arg->=
-    two-arg-/=
-    eql
-    %negate
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    length
-    two-arg-gcd
-    two-arg-lcm)
+    `#(two-arg-<= two-arg->= two-arg-/= ,@common-static-fdefns)
   #'equalp)

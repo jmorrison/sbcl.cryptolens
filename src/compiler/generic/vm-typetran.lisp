@@ -32,7 +32,6 @@
 #+long-float
 (define-type-predicate long-float-p long-float)
 (define-type-predicate ratiop ratio)
-(define-type-predicate short-float-p short-float)
 (define-type-predicate single-float-p single-float)
 (define-type-predicate simple-array-p simple-array)
 (define-type-predicate simple-array-nil-p (simple-array nil (*)))
@@ -97,10 +96,16 @@
 #+sb-unicode (define-type-predicate simple-character-string-p
                   (simple-array character (*)))
 (define-type-predicate system-area-pointer-p system-area-pointer)
+
+(when-vop-existsp (:translate signed-byte-8-p)
+  (define-type-predicate signed-byte-8-p (signed-byte 8)))
+(when-vop-existsp (:translate signed-byte-16-p)
+  (define-type-predicate signed-byte-16-p (signed-byte 16)))
+
 #-64-bit
 (define-type-predicate unsigned-byte-32-p (unsigned-byte 32))
-#-64-bit
-(define-type-predicate signed-byte-32-p (signed-byte 32))
+(when-vop-existsp (:translate signed-byte-32-p)
+  (define-type-predicate signed-byte-32-p (signed-byte 32)))
 #+64-bit
 (define-type-predicate unsigned-byte-64-p (unsigned-byte 64))
 #+64-bit
@@ -111,55 +116,74 @@
 (define-type-predicate simd-pack-256-p simd-pack-256)
 (define-type-predicate weak-pointer-p weak-pointer)
 (define-type-predicate code-component-p code-component)
-#-(or x86 x86-64) (define-type-predicate lra-p lra)
+#-(or x86 x86-64 arm64) (define-type-predicate lra-p lra)
 (define-type-predicate fdefn-p fdefn)
-(macrolet
-    ((def ()
-       `(progn ,@(loop for (name spec) in *vector-without-complex-typecode-infos*
-                       collect `(define-type-predicate ,name (vector ,spec))))))
-  (def))
 ;;; Unlike the un-%'ed versions, these are true type predicates,
 ;;; accepting any type object.
 (define-type-predicate %standard-char-p standard-char)
 (define-type-predicate non-null-symbol-p (and symbol (not null)))
+
 
 (defglobal *backend-type-predicates-grouped*
-    (let (plist)
-      (loop for (type . pred) in *backend-type-predicates*
-            for class = (#-sb-xc-host %instance-layout
-                         #+sb-xc-host type-of
-                         type)
-            do (push type (getf plist class))
-               (push pred (getf plist class)))
-      (map 'vector (lambda (x)
-                     (if (listp x)
-                         (concatenate 'vector
-                                      (list
-                                       (every (lambda (x)
-                                                (or (symbolp x)
-                                                    (and (sb-kernel::ctype-eq-comparable x)
-                                                         (sb-kernel::ctype-interned-p x))))
-                                              x))
-                                      (nreverse x))
-                         x))
-           plist)))
+  (let ((classes (make-array (count-if #'identity sb-kernel::*type-classes*)
+                             :initial-element nil)))
+    (dolist (cell *backend-type-predicates*)
+      (let ((index (sb-kernel::type-class-id (car cell))))
+        (push cell (aref classes index))))
+    (dotimes (i (length classes) classes)
+      (let ((elements (nreverse (aref classes i))))
+        (setf (aref classes i)
+              (when elements
+                (let ((types (coerce (mapcar 'car elements) 'vector))
+                      (preds (coerce (mapcar 'cdr elements) 'vector)))
+                  (cons types preds))))))))
 (declaim (simple-vector *backend-type-predicates-grouped*))
 
 (defun backend-type-predicate (type)
   #-sb-xc-host
   (declare (optimize (insert-array-bounds-checks 0)))
-  (flet ((vector-getf (vector key test &optional (start 0))
-           (loop for i from start below (length vector) by 2
-                 when (funcall test (svref vector i) key)
-                 return (svref vector (1+ i)))))
-    (declare (inline vector-getf))
-    (let ((group (truly-the (or simple-vector null)
-                            (vector-getf *backend-type-predicates-grouped*
-                                         (#-sb-xc-host %instance-layout
-                                          #+sb-xc-host type-of type)
-                                         #'eq))))
-      (when group
-        (if (and (svref group 0)
-                 (sb-kernel::ctype-eq-comparable type))
-            (vector-getf (truly-the simple-vector group) type #'eq 1)
-            (vector-getf (truly-the simple-vector group) type #'type= 1))))))
+  (let* ((choices (aref *backend-type-predicates-grouped*
+                        (sb-kernel::type-class-id type)))
+         (ctypes (car choices)))
+    ;; Other than array types, there is no way to make a type
+    ;; which is TYPE= to one of the choices but not EQ to it.
+    ;; But often with array types, EQ works, so always try it first.
+    (dotimes (i (length ctypes))
+      (when (eq type (aref ctypes i))
+        (return-from backend-type-predicate (aref (cdr choices) i))))
+    ;; "if at first you don't succeed ..."
+    (when (array-type-p type)
+      (dotimes (i (length ctypes))
+        (when (type= type (aref ctypes i))
+          (return (aref (cdr choices) i)))))))
+
+(defglobal *backend-union-type-predicates*
+    (let ((unions (sort
+                   (loop for (type . pred) in *backend-type-predicates*
+                         when (union-type-p type)
+                         collect (cons type pred))
+                   #'>
+                   :key (lambda (x)
+                          (length (union-type-types (car x)))))))
+      (coerce (loop for (key . value) in unions
+                    collect key
+                    collect value)
+              'vector)))
+(declaim (simple-vector *backend-union-type-predicates*))
+
+(defun split-union-type-tests (type)
+  (let ((predicates *backend-union-type-predicates*)
+        (types (union-type-types type)))
+    (loop for x below (length predicates) by 2
+          for union-types = (union-type-types (aref predicates x))
+          when (subsetp union-types types :test #'type=)
+          return (values (aref predicates (1+ x))
+                         (remove-if
+                          (lambda (x) (member x union-types :test #'type=))
+                          types)))))
+
+(unless-vop-existsp (:translate keywordp)
+(define-source-transform keywordp (x)
+  `(let ((object ,x))
+     (and (non-null-symbol-p object)
+          (= (symbol-package-id object) ,sb-impl::+package-id-keyword+)))))

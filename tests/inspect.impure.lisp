@@ -37,22 +37,22 @@
     (assert (search "PROTOTYPE: " (test-inspect class)))))
 
 (with-test (:name (inspect array :element-type :lp-1835934))
-  (let* ((array (make-array '()))
+  (let* ((array (make-array '() :initial-element 0))
          (result (test-inspect array)))
     (assert (search "an ARRAY of T" result))
     (assert (search "dimensions are ()" result)))
 
-  (let ((array (make-array '() :element-type 'fixnum)))
+  (let ((array (make-array '() :element-type 'fixnum :initial-element 0)))
     (assert (search "an ARRAY of FIXNUM" (test-inspect array))))
 
-  (let ((array (let ((a (make-array ())))
+  (let ((array (let ((a (make-array () :initial-element 0)))
                  (make-array '() :displaced-to a))))
     (assert (search "a displaced ARRAY of T" (test-inspect array)))))
 
 (with-test (:name (inspect vector :*inspect-length*))
   (let* ((array (make-array 100 :initial-element t))
          (result (test-inspect array)))
-    (assert (search "VECTOR of length 100." result))
+    (assert (search "(VECTOR T) of length 100." result))
     (assert (search "0. T" result))
     (assert (search "9. T" result))
     (assert (not (search "10. T" result)))))
@@ -66,6 +66,39 @@
     (assert (not (search "10." result)))))
 
 (with-test (:name (inspect vector fill-pointer))
-  (let* ((array (make-array 3 :fill-pointer 2))
+  (let* ((array (make-array 3 :fill-pointer 2 :initial-element 0))
          (result (test-inspect array)))
-    (assert (search "VECTOR of length 2" result))))
+    (assert (search "(VECTOR T) of length 2" result))))
+
+(with-test (:name (inspect array nil))
+  (let* ((array (make-array 3 :element-type nil))
+         (result (test-inspect array)))
+    (assert (search "(VECTOR NIL) of length 3" result)))
+  (let* ((array (make-array '(3 3) :element-type nil))
+         (result (test-inspect array)))
+    (assert (search "ARRAY of NIL" result))))
+
+(defclass standard-object-with-unbound-slot ()
+  (foo))
+
+(with-test (:name (inspect standard-object unbound-slot))
+  (let* ((object (make-instance 'standard-object-with-unbound-slot))
+         (result (test-inspect object)))
+    (assert (search "#<unbound slot>" result))))
+
+(defstruct (structure-with-unbound-slot
+             (:constructor make-structure-with-unbound-slot (&aux foo)))
+  foo)
+
+(with-test (:name (inspect standard-object unbound-slot))
+  (let* ((object (make-structure-with-unbound-slot))
+         (result (test-inspect object)))
+    (assert (search "#<unbound slot>" result))))
+
+(define-condition condition-with-unbound-slot ()
+  (foo))
+
+(with-test (:name (inspect condition unbound-slot))
+  (let* ((object (make-condition 'condition-with-unbound-slot))
+         (result (test-inspect object)))
+    (assert (search "#<unbound slot>" result))))

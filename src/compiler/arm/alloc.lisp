@@ -11,26 +11,18 @@
 
 (in-package "SB-VM")
 
-(define-vop (list-or-list*)
-  (:args (things :more t :scs (control-stack)))
+(define-vop (list)
+  (:args (things :more t :scs (any-reg descriptor-reg null control-stack)))
   (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (any-reg)) temp)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
-  (:info num)
+  (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
-  (:variant-vars star)
-  (:policy :fast-safe)
   (:node-var node)
   (:generator 0
-    (cond ((zerop num)
-           (move result null-tn))
-          ((and star (= num 1))
-           (move result (tn-ref-tn things)))
-          (t
-           (macrolet
-               ((maybe-load (tn)
+    (macrolet ((maybe-load (tn)
                   (once-only ((tn tn))
                     `(sc-case ,tn
                        ((any-reg descriptor-reg null)
@@ -38,9 +30,8 @@
                        (control-stack
                         (load-stack-tn temp ,tn)
                         temp)))))
-             (let* ((cons-cells (if star (1- num) num))
-                    (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag)
+      (let ((alloc (* (pad-data-block cons-size) cons-cells)))
+        (pseudo-atomic (pa-flag)
                  (allocation 'list alloc list-pointer-lowtag res
                              :flag-tn pa-flag
                              :stack-allocate-p (node-stack-allocate-p node))
@@ -59,13 +50,7 @@
                              (maybe-load (tn-ref-tn (tn-ref-across things)))
                              null-tn)
                      ptr cons-cdr-slot list-pointer-lowtag))
-               (move result res)))))))
-
-(define-vop (list list-or-list*)
-  (:variant nil))
-
-(define-vop (list* list-or-list*)
-  (:variant t))
+        (move result res)))))
 
 ;;;; Special purpose inline allocators.
 
@@ -127,17 +112,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst mov result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:temporary (:sc interior-reg) lip)
-  (:generator 1
-    (let ((fixup (gen-label)))
-      (inst load-from-label result lip fixup)
-      (assemble (:elsewhere)
-        (emit-label fixup)
-        (inst word (make-fixup 'funcallable-instance-tramp :assembly-routine))))))
 
 (define-vop (fixed-alloc)
   (:args)

@@ -33,30 +33,73 @@
                       nl7-offset)
        index))
 
-(defun int-arg (state prim-type reg-sc stack-sc)
+(define-vop (move-word-arg-stack)
+  (:args (x :scs (signed-reg unsigned-reg single-reg))
+         (fp :scs (any-reg)))
+  (:info size offset)
+  (:generator 0
+    (let ((addr (@ fp (load-store-offset offset))))
+      (ecase size
+        (1
+         (inst strb x addr))
+        (2
+         (inst strh x addr))
+        (4
+         (inst str (if (sc-is x single-reg)
+                       x
+                       (32-bit-reg x))
+               addr))))))
+
+(defun move-to-stack-location (value size offset prim-type sc node block nsp)
+  (let ((temp-tn (sb-c:make-representation-tn
+                  (primitive-type-or-lose prim-type)
+                  sc)))
+    (sb-c::emit-move node
+                     block
+                     (sb-c::lvar-tn node block value)
+                     temp-tn)
+    (sb-c::vop move-word-arg-stack node block temp-tn nsp size offset)))
+
+(defun int-arg (state prim-type reg-sc stack-sc &optional (size 8))
   (let ((reg-args (arg-state-num-register-args state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-num-register-args state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc (register-args-offset reg-args)))
           (t
-           (let ((frame-size (arg-state-stack-frame-size state)))
-             (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (make-wired-tn* prim-type stack-sc frame-size))))))
+           (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
+             (setf (arg-state-stack-frame-size state) (+ frame-size size))
+             (cond #+darwin
+                   ((/= size n-word-bytes)
+                    (lambda (value node block nsp)
+                      (move-to-stack-location value size frame-size
+                                              prim-type reg-sc node block nsp)))
+                   (t
+                    (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
-(defun float-arg (state prim-type reg-sc stack-sc)
+(defun float-arg (state prim-type reg-sc stack-sc &optional (size 8))
   (let ((reg-args (arg-state-fp-registers state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-fp-registers state) (1+ reg-args))
            (make-wired-tn* prim-type reg-sc reg-args))
           (t
-           (let ((frame-size (arg-state-stack-frame-size state)))
-             (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (make-wired-tn* prim-type stack-sc frame-size))))))
+           (let ((frame-size (align-up (arg-state-stack-frame-size state) size)))
+             (setf (arg-state-stack-frame-size state) (+ frame-size size))
+             (cond #+darwin
+                   ((/= size n-word-bytes)
+                    (lambda (value node block nsp)
+                      (move-to-stack-location value size frame-size
+                                              prim-type reg-sc node block nsp)))
+                   (t
+                    (make-wired-tn* prim-type stack-sc (truncate frame-size size)))))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
-  (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number)
-      (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number)))
+ (let ((size #+darwin (truncate (alien-type-bits type) n-byte-bits)
+             #-darwin n-word-bytes))
+   (if (alien-integer-type-signed type)
+       (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number
+                size)
+       (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number
+                size))))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
@@ -64,7 +107,7 @@
 
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'single-float single-reg-sc-number single-stack-sc-number))
+  (float-arg state 'single-float single-reg-sc-number single-stack-sc-number #+darwin 4))
 
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
@@ -73,6 +116,10 @@
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
     (foldable flushable movable))
+
+(defoptimizer (sign-extend derive-type) ((x size))
+  (when (sb-c:constant-lvar-p size)
+    (specifier-type `(signed-byte ,(sb-c:lvar-value size)))))
 
 (define-vop (sign-extend)
   (:translate sign-extend)
@@ -141,10 +188,11 @@
               do
               #+darwin
               (when (eql i variadic)
-                (setf (arg-state-num-register-args arg-state) +max-register-args+))
+                (setf (arg-state-num-register-args arg-state) +max-register-args+
+                      (arg-state-fp-registers arg-state) +max-register-args+))
               (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))))
       (values (make-normal-tn *fixnum-primitive-type*)
-              (* (arg-state-stack-frame-size arg-state) n-word-bytes)
+              (arg-state-stack-frame-size arg-state)
               (arg-tns)
               (invoke-alien-type-method :result-tn
                                         (alien-fun-type-result-type type)
@@ -156,11 +204,10 @@
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
-  (:temporary (:scs (interior-reg)) lip)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
-    (load-inline-constant res `(:fixup ,foreign-symbol :foreign) lip)))
+    (load-foreign-symbol res foreign-symbol)))
 
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
@@ -168,37 +215,108 @@
   (:args)
   (:arg-types (:constant simple-string))
   (:info foreign-symbol)
-  (:temporary (:scs (interior-reg)) lip)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
-    (load-inline-constant res `(:fixup ,foreign-symbol :foreign-dataref) lip)
-    (inst ldr res (@ res))))
+    (load-foreign-symbol res foreign-symbol :dataref t)))
+
+#+sb-safepoint
+(defconstant thread-saved-csp-slot (- (1+ sb-vm::thread-header-slots)))
+
+(defun emit-c-call (vop nfp-save temp temp2 cfunc function)
+  (let ((cur-nfp (current-nfp-tn vop)))
+    (when cur-nfp
+      (store-stack-tn nfp-save cur-nfp))
+    (assemble ()
+      #+sb-thread
+      (progn
+        (inst add temp csp-tn (* 2 n-word-bytes))
+        ;; Build a new frame to stash a pointer to the current code object
+        ;; for the GC to see.
+        (inst adr temp2 return)
+        (inst stp cfp-tn temp2 (@ csp-tn))
+        (storew-pair csp-tn thread-control-frame-pointer-slot temp thread-control-stack-pointer-slot thread-tn)
+        ;; OK to run GC without stopping this thread from this point
+        ;; on.
+        #+sb-safepoint
+        (storew csp-tn thread-tn thread-saved-csp-slot)
+        (cond ((stringp function)
+               (invoke-foreign-routine function cfunc))
+              (t
+               (sc-case function
+                 (sap-reg (move cfunc function))
+                 (sap-stack
+                  (load-stack-offset cfunc cur-nfp function)))
+               (inst blr cfunc)))
+        (loop for reg in (list r0-offset r1-offset r2-offset r3-offset
+                               r4-offset r5-offset r6-offset r7-offset
+                               #-darwin r8-offset)
+              do
+              (inst mov
+                    (make-random-tn
+                     :kind :normal
+                     :sc (sc-or-lose 'descriptor-reg)
+                     :offset reg)
+                    0))
+        ;; No longer OK to run GC except at safepoints.
+        #+sb-safepoint
+        (storew zr-tn thread-tn thread-saved-csp-slot)
+        (storew zr-tn thread-tn thread-control-stack-pointer-slot))
+      return
+      #-sb-thread
+      (progn
+        temp2
+        (if (stringp function)
+            (load-foreign-symbol cfunc function)
+            (sc-case function
+              (sap-reg (move cfunc function))
+              (sap-stack
+              (load-stack-offset cfunc cur-nfp function))))
+        (invoke-foreign-routine "call_into_c" temp))
+      (when cur-nfp
+        (load-stack-tn cur-nfp nfp-save)))))
+
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+  (defun destroyed-c-registers ()
+    (let ((gprs (list nl0-offset nl1-offset nl2-offset nl3-offset
+                      nl4-offset nl5-offset nl6-offset nl7-offset nl8-offset #| tmp-offset |#
+                      r0-offset r1-offset r2-offset r3-offset
+                      r4-offset r5-offset r6-offset r7-offset
+                      #-darwin r8-offset
+                      #-sb-thread r11-offset))
+          (vars))
+      (append
+       (loop for gpr in gprs
+             collect `(:temporary (:sc any-reg :offset ,gpr :from :eval :to :result)
+                                  ,(car (push (gensym) vars))))
+       (loop for float to 31
+             collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
+                                  ,(car (push (gensym) vars))))
+       `((:ignore ,@vars))))))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg sap-stack))
          (args :more t))
   (:results (results :more t))
-  (:ignore args results)
-  (:save-p t)
+  (:ignore args results lr)
+  (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:temporary (:sc any-reg :offset r9-offset
                :from (:argument 0) :to (:result 0)) cfunc)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:sc any-reg :offset r7-offset) temp)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc any-reg :offset #+darwin r8-offset #-darwin r10-offset) temp)
+  (:temporary (:sc any-reg :offset lexenv-offset) temp2)
   (:vop-var vop)
   (:generator 0
-    (let ((cur-nfp (current-nfp-tn vop)))
-      (when cur-nfp
-        (store-stack-tn nfp-save cur-nfp))
-      (load-inline-constant temp '(:fixup "call_into_c" :foreign) lip)
-      (sc-case function
-        (sap-reg (move cfunc function))
-        (sap-stack
-         (load-stack-offset cfunc cur-nfp function)))
-      (inst blr temp)
-      (when cur-nfp
-        (load-stack-tn cur-nfp nfp-save)))))
+    (emit-c-call vop nfp-save temp temp2 cfunc function))
+  .
+  #. (destroyed-c-registers))
+
+;;; Manually load the fixup instead of using foreign-symbol-sap,
+;;; because it wants to go to r9, which is not compatible with sap-reg.
+(define-vop (call-out-named call-out)
+  (:args (args :more t))
+  (:info function variadic)
+  (:ignore args results variadic lr))
 
 (define-vop (alloc-number-stack-space)
   (:info amount)
@@ -219,76 +337,6 @@
       (let ((delta (logandc2 (+ amount +number-stack-alignment-mask+)
                              +number-stack-alignment-mask+)))
         (inst add nsp-tn nsp-tn (add-sub-immediate delta))))))
-
-;;; long-long support
-;; (deftransform %alien-funcall ((function type &rest args) * * :node node)
-;;   (aver (sb-c::constant-lvar-p type))
-;;   (let* ((type (sb-c::lvar-value type))
-;;          (env (sb-c::node-lexenv node))
-;;          (arg-types (alien-fun-type-arg-types type))
-;;          (result-type (alien-fun-type-result-type type)))
-;;     (aver (= (length arg-types) (length args)))
-;;     (if (or (some (lambda (type)
-;;                     (and (alien-integer-type-p type)
-;;                          (> (sb-alien::alien-integer-type-bits type) 64)))
-;;                   arg-types)
-;;             (and (alien-integer-type-p result-type)
-;;                  (> (sb-alien::alien-integer-type-bits result-type) 64)))
-;;         (collect ((new-args) (lambda-vars) (new-arg-types))
-;;                  (loop with i = 0
-;;                        for type in arg-types
-;;                        for arg = (gensym)
-;;                        do
-;;                        (lambda-vars arg)
-;;                        (cond ((and (alien-integer-type-p type)
-;;                                    (> (sb-alien::alien-integer-type-bits type) 64))
-;;                               (when (oddp i)
-;;                                 ;; long-long is only passed in pairs of r0-r1 and r2-r3,
-;;                                 ;; and the stack is double-word aligned
-;;                                 (incf i)
-;;                                 (new-args 0)
-;;                                 (new-arg-types (parse-alien-type '(signed 8) env)))
-;;                               (incf i 2)
-;;                               (new-args `(logand ,arg #xffffffffffffffff))
-;;                               (new-args `(ash ,arg -64))
-;;                               (new-arg-types (parse-alien-type '(unsigned 64) env))
-;;                               (if (alien-integer-type-signed type)
-;;                                   (new-arg-types (parse-alien-type '(signed 64) env))
-;;                                   (new-arg-types (parse-alien-type '(unsigned 64) env))))
-;;                              (t
-;;                               (incf i (cond ((alien-double-float-type-p type)
-;;                                              0)
-;;                                             (t
-;;                                              1)))
-;;                               (new-args arg)
-;;                               (new-arg-types type))))
-;;                  (cond ((and (alien-integer-type-p result-type)
-;;                              (> (sb-alien::alien-integer-type-bits result-type) 64))
-;;                         (let ((new-result-type
-;;                                 (let ((sb-alien::*values-type-okay* t))
-;;                                   (parse-alien-type
-;;                                    (if (alien-integer-type-signed result-type)
-;;                                        '(values (unsigned 64) (signed 64))
-;;                                        '(values (unsigned 64) (unsigned 64)))
-;;                                    env))))
-;;                           `(lambda (function type ,@(lambda-vars))
-;;                              (declare (ignore type))
-;;                              (multiple-value-bind (low high)
-;;                                  (%alien-funcall function
-;;                                                  ',(make-alien-fun-type
-;;                                                     :arg-types (new-arg-types)
-;;                                                     :result-type new-result-type)
-;;                                                  ,@(new-args))
-;;                                (logior low (ash high 64))))))
-;;                        (t
-;;                         `(lambda (function type ,@(lambda-vars))
-;;                            (declare (ignore type))
-;;                            (%alien-funcall function
-;;                                            ',(make-alien-fun-type
-;;                                               :arg-types (new-arg-types)
-;;                                               :result-type result-type)
-;;                                            ,@(new-args))))))
-;;         (sb-c::give-up-ir1-transform))))
 
 ;;; Callback
 #-sb-xc-host
@@ -316,7 +364,7 @@
            ;; How many arguments have been copied
            (arg-count 0)
            ;; How many arguments have been copied from the stack
-           (stack-argument-count 0)
+           (stack-argument-bytes 0)
            (r0-tn (make-tn 0))
            (r1-tn (make-tn 1))
            (r2-tn (make-tn 2))
@@ -339,9 +387,8 @@
         ;; Copy arguments
         (dolist (type argument-types)
           (let ((target-tn (@ nsp-tn (* arg-count n-word-bytes)))
-                ;; A TN pointing to the stack location that contains
-                ;; the next argument passed on the stack.
-                (stack-arg-tn (@ nsp-save-tn (* stack-argument-count n-word-bytes))))
+                (size #+darwin (truncate (alien-type-bits type) n-byte-bits)
+                      #-darwin n-word-bytes))
             (cond ((or (alien-integer-type-p type)
                        (alien-pointer-type-p type)
                        (alien-type-= #.(parse-alien-type 'system-area-pointer nil)
@@ -350,9 +397,30 @@
                      (cond (gpr
                             (inst str gpr target-tn))
                            (t
-                            (incf stack-argument-count)
-                            (inst ldr temp-tn stack-arg-tn)
-                            (inst str temp-tn target-tn))))
+                            (setf stack-argument-bytes
+                                  (align-up stack-argument-bytes size))
+                            (let ((addr (@ nsp-save-tn stack-argument-bytes)))
+                              (cond #+darwin
+                                    ((/= size 8)
+                                     (let ((signed (and (alien-integer-type-p type)
+                                                        (alien-integer-type-signed type))))
+                                       (ecase size
+                                         (1
+                                          (if signed
+                                              (inst ldrsb temp-tn addr)
+                                              (inst ldrb temp-tn addr)))
+                                         (2
+                                          (if signed
+                                              (inst ldrsh temp-tn addr)
+                                              (inst ldrh temp-tn addr)))
+                                         (4
+                                          (if signed
+                                              (inst ldrsw (32-bit-reg temp-tn) addr)
+                                              (inst ldr (32-bit-reg temp-tn) addr))))))
+                                    (t
+                                     (inst ldr temp-tn addr)))
+                              (inst str temp-tn target-tn))
+                            (incf stack-argument-bytes size))))
                    (incf arg-count))
                   ((alien-float-type-p type)
                    (cond ((< fp-registers 8)
@@ -362,9 +430,18 @@
                                                  'double-reg))
                                 target-tn))
                          (t
-                          (incf stack-argument-count)
-                          (inst ldr temp-tn stack-arg-tn)
-                          (inst str temp-tn target-tn)))
+                          (setf stack-argument-bytes
+                                  (align-up stack-argument-bytes size))
+                          (case size
+                            #+darwin
+                            (4
+                             (let ((reg (32-bit-reg temp-tn)))
+                              (inst ldr reg (@ nsp-save-tn stack-argument-bytes))
+                              (inst str reg target-tn)))
+                            (t
+                             (inst ldr temp-tn (@ nsp-save-tn stack-argument-bytes))
+                             (inst str temp-tn target-tn)))
+                          (incf stack-argument-bytes size)))
                    (incf fp-registers)
                    (incf arg-count))
                   (t

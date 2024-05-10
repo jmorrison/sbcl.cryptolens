@@ -100,18 +100,25 @@
   (declare (type lvar lvar))
   (ir2-lvar-primitive-type (lvar-info lvar)))
 
+;;; Return true if a constant LEAF is of a type which we can legally
+;;; directly reference in code. Named constants with arbitrary pointer
+;;; values cannot, since we must preserve EQLness.
+(defun legal-immediate-constant-p (leaf)
+  (declare (type constant leaf))
+  (or (not (leaf-has-source-name-p leaf))
+      (sb-xc:typep (constant-value leaf) '(or symbol number character))))
+
 ;;; If LVAR is used only by a REF to a leaf that can be delayed, then
 ;;; return the leaf, otherwise return NIL.
 (defun lvar-delayed-leaf (lvar)
   (declare (type lvar lvar))
-  (unless (lvar-dynamic-extent lvar)
-    (let ((use (lvar-uses lvar)))
-      (and (ref-p use)
-           (let ((leaf (ref-leaf use)))
-             (etypecase leaf
-               (lambda-var (if (null (lambda-var-sets leaf)) leaf nil))
-               (constant leaf)
-               ((or functional global-var) nil)))))))
+  (let ((use (lvar-uses lvar)))
+    (and (ref-p use)
+         (let ((leaf (ref-leaf use)))
+           (etypecase leaf
+             (lambda-var (if (null (lambda-var-sets leaf)) leaf nil))
+             (constant leaf)
+             ((or functional global-var) nil))))))
 
 ;;; Annotate a normal single-value lvar. If its only use is a ref that
 ;;; we are allowed to delay the evaluation of, then we mark the lvar
@@ -126,10 +133,7 @@
       (setf (ir2-lvar-kind info) :delayed))
      (t (let ((tn (make-normal-tn (ir2-lvar-primitive-type info))))
           (setf (tn-type tn) (lvar-type lvar))
-          (setf (ir2-lvar-locs info) (list tn))
-          (when (lvar-dynamic-extent lvar)
-            (setf (ir2-lvar-stack-pointer info)
-                  (make-stack-pointer-tn)))))))
+          (setf (ir2-lvar-locs info) (list tn))))))
   (ltn-annotate-casts lvar)
   (values))
 
@@ -162,18 +166,19 @@
   (values))
 
 #+call-symbol
-(defoptimizer (%coerce-callable-for-call ltn-annotate) ((fun) node ltn-policy)
-  (declare (ignore ltn-policy))
-  (let ((dest (node-dest node)))
+(defoptimizer (%coerce-callable-for-call ltn-annotate) ((fun) node)
+  (multiple-value-bind (dest dest-lvar)
+      (and (node-lvar node)
+           (principal-lvar-end (node-lvar node)))
     (cond ((and (basic-combination-p dest)
                 (eq (basic-combination-kind dest) :full)
-                (eq (lvar-uses (basic-combination-fun dest)) node)
+                (eq (basic-combination-fun dest) dest-lvar)
                 ;; Everything else can't handle NIL, just don't
                 ;; bother optimizing it.
-                (not (and (constant-lvar-p fun)
-                          (null (lvar-value fun)))))
+                (not (lvar-value-is fun nil)))
            (setf (basic-combination-fun dest) fun
-                 (basic-combination-args node) '(nil)
+                 (basic-combination-args node) '()
+                 (lvar-dest fun) dest
                  (node-lvar node) nil
                  (lvar-info fun) (make-ir2-lvar (primitive-type (lvar-type fun))))
            (annotate-1-value-lvar fun))
@@ -189,9 +194,15 @@
 (defun flush-full-call-tail-transfer (call)
   (declare (type basic-combination call))
   (let ((tails (and (node-tail-p call)
-                    (lambda-tail-set (node-home-lambda call)))))
+                    (lambda-tail-set (node-home-lambda call))))
+        (unboxed-return (let ((info (basic-combination-fun-info call)))
+                          (and info
+                               (ir1-attributep (fun-info-attributes info) unboxed-return)))))
     (cond ((not tails))
-          ((eq (return-info-kind (tail-set-info tails)) :unknown)
+          ((eq (return-info-kind (tail-set-info tails))
+               (if unboxed-return
+                   :unboxed
+                   :unknown))
            (ir2-change-node-successor call
                                       (component-tail (block-component (node-block call)))))
           (t
@@ -199,9 +210,10 @@
   (values))
 
 (defun signal-delayed-combination-condition (call)
-  (let ((*compiler-error-context* call)
-        (delayed (combination-info call)))
-    (apply #'funcall delayed)))
+  (let* ((delayed (combination-info call))
+         (*compiler-error-context* call))
+    (when (consp delayed)
+      (apply #'funcall delayed))))
 
 ;;; We set the kind to :FULL or :FUNNY, depending on whether there is
 ;;; an IR2-CONVERT method. If a funny function, then we inhibit tail
@@ -285,11 +297,7 @@
       (loop for type in lvar-types
             for tn in (ir2-lvar-locs info)
             do (setf (tn-type tn) type)))
-    (setf (lvar-info lvar) info)
-    (when (lvar-dynamic-extent lvar)
-      (aver (proper-list-of-length-p types 1))
-      (setf (ir2-lvar-stack-pointer info)
-            (make-stack-pointer-tn))))
+    (setf (lvar-info lvar) info))
   (ltn-annotate-casts lvar)
   (values))
 
@@ -463,10 +471,17 @@
   (let* ((test (if-test node))
          (use (lvar-uses test)))
     (unless (and (combination-p use)
+                 (immediately-used-p test use)
                  (let ((info (basic-combination-info use)))
                    (and (template-p info)
                         (template-conditional-p info))))
       (annotate-ordinary-lvar test)))
+  (values))
+
+(defun ltn-analyze-jump-table (node)
+  (declare (type jump-table node))
+  (setf (node-tail-p node) nil)
+  (annotate-ordinary-lvar (jump-table-index node))
   (values))
 
 ;;; If there is a value lvar, then annotate it for unknown values. In
@@ -476,8 +491,27 @@
   (setf (node-tail-p node) nil)
   (let ((value (exit-value node)))
     (when value
-      (annotate-unknown-values-lvar value)))
+      (if (lvar-single-value-p (node-lvar node))
+          (annotate-fixed-values-lvar value (list *backend-t-primitive-type*))
+          (annotate-unknown-values-lvar value))))
   (values))
+
+;;; Annotate DYNAMIC-EXTENT's info lvar as a stack lvar, which cleanup
+;;; code will use to clean up any values stack allocated in this
+;;; extent. Stack analysis will insert code to initialize this lvar
+;;; wherever necessary.
+(defun ltn-analyze-dynamic-extent (node)
+  (declare (type cdynamic-extent node))
+  (let ((lvar (dynamic-extent-info node))
+        (2comp (component-info (node-component node))))
+    (when lvar
+      (setf (ir2-component-stack-allocates-p 2comp) t)
+      (setf (lvar-dest lvar) node)
+      (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
+        (setf (lvar-info lvar) info)
+        (setf (ir2-lvar-kind info) :stack)
+        (setf (ir2-lvar-locs info)
+              (list (make-stack-pointer-tn)))))))
 
 ;;; We need a special method for %UNWIND-PROTECT that ignores the
 ;;; cleanup function. We don't annotate either arg, since we don't
@@ -486,24 +520,16 @@
 ;;; (The default is o.k. for %CATCH, since environment analysis
 ;;; converted the reference to the escape function into a constant
 ;;; reference to the NLX-INFO.)
-(defoptimizer (%unwind-protect ltn-annotate) ((escape cleanup)
-                                              node
-                                              ltn-policy)
-  (declare (ignore escape cleanup ltn-policy))
+(defoptimizer (%unwind-protect ltn-annotate) ((escape cleanup) node)
   (setf (basic-combination-info node) :funny)
   (setf (node-tail-p node) nil))
 
 ;;; Make sure that arguments of magic functions are not annotated.
 ;;; (Otherwise the compiler may dump its internal structures as
 ;;; constants :-()
-(defoptimizer (%pop-values ltn-annotate) ((%lvar) node ltn-policy)
-  (declare (ignore %lvar node ltn-policy)))
-(defoptimizer (%dummy-dx-alloc ltn-annotate) ((target source) node ltn-policy)
-  (declare (ignore target source node ltn-policy)))
+(defoptimizer (%pop-values ltn-annotate) ((%lvar)))
 
-(defoptimizer (%nip-values ltn-annotate) ((&rest lvars)
-                                          node ltn-policy)
-  (declare (ignore node ltn-policy))
+(defoptimizer (%nip-values ltn-annotate) ((&rest lvars))
   ;; Undo the optimization performed by LTN-ANALYZE-MV-CALL,
   ;; which only uses the CSP of the first argument.
   (loop for lvar-lvar in lvars
@@ -542,7 +568,13 @@
                       (funcall (second type) value)
                       (sb-xc:typep value type))))
           (cond (lvar
-                 (and (constant-lvar-p lvar)
+                 (and (if (policy (let ((uses (lvar-uses lvar)))
+                                    (if (consp uses)
+                                        (car uses)
+                                        uses))
+                              (= preserve-constants 3))
+                          (constant-lvar-ignore-types-p lvar nil)
+                          (constant-lvar-p lvar))
                       (type-p (lvar-value lvar) (cdr restr))))
                 (tn
                  (and (eq (tn-kind tn) :constant)
@@ -574,6 +606,26 @@
         (unless (operand-restriction-ok type (lvar-ptype arg)
                                         :lvar arg)
           (return nil))))))
+(defun diagnose-template-args (template call)
+  ;; Scan all except the MORE args. If you've managed to create not-ok MORE args,
+  ;; you're probably smart enough to figure it out on your own.
+  (let ((args (basic-combination-args call))
+        (types (template-arg-types template)))
+    (unless (= (length args) (length types))
+      (return-from diagnose-template-args "bad length"))
+    (do ((args args (cdr args))
+         (i 0 (1+ i))
+         (any-fail nil)
+         (types types (cdr types)))
+        ((null types) any-fail)
+      (let* ((arg (car args))
+             (type (car types))
+             (ok (operand-restriction-ok type (lvar-ptype arg) :lvar arg)))
+        (let ((*print-pretty* nil))
+          (format t "arg~d: is ~s need ~s, ~a~%" i
+                  (primitive-type-name (lvar-ptype arg))
+                  type (if ok "OK" "FAIL")))
+        (unless ok (setq any-fail :fail))))))
 
 ;;; Check that TEMPLATE can be used with the specifed RESULT-TYPE.
 ;;; Result type checking is pretty different from argument type
@@ -583,7 +635,7 @@
 ;;; before we run out of restrictions, then we only succeed if the
 ;;; leftover restrictions are *. If we run out of restrictions before
 ;;; we run out of result types, then we always win.
-(defun template-results-ok (template result-type)
+(defun template-results-ok (template result-type &optional single-value-p)
   (declare (type template template)
            (type ctype result-type))
   (when (template-more-results-type template)
@@ -591,19 +643,28 @@
   (let ((types (template-result-types template)))
     (cond
      ((values-type-p result-type)
-      (do ((ltypes (append (args-type-required result-type)
-                           (args-type-optional result-type))
-                   (rest ltypes))
-           (types types (rest types)))
-          ((null ltypes)
-           (dolist (type types t)
-             (unless (eq type '*)
-               (return nil))))
-        (when (null types) (return t))
-        (let ((type (first types)))
-          (unless (operand-restriction-ok type
-                                          (primitive-type (first ltypes)))
-            (return nil)))))
+      (if (and single-value-p
+               (let ((optional (vop-info-optional-results template)))
+                 (and optional
+                      (not (eql (car optional) 0))
+                      (= (length optional)
+                         (1- (length types))))))
+          (operand-restriction-ok (car types)
+                                  (primitive-type (or (car (args-type-required result-type))
+                                                      (car (args-type-optional result-type)))))
+          (do ((ltypes (append (args-type-required result-type)
+                               (args-type-optional result-type))
+                       (rest ltypes))
+               (types types (rest types)))
+              ((null ltypes)
+               (dolist (type types t)
+                 (unless (eq type '*)
+                   (return nil))))
+            (when (null types) (return t))
+            (let ((type (first types)))
+              (unless (operand-restriction-ok type
+                                              (primitive-type (first ltypes)))
+                (return nil))))))
      (types
       (operand-restriction-ok (first types) (primitive-type result-type)))
      (t t))))
@@ -629,7 +690,7 @@
   (let* ((guard (template-guard template))
          (lvar (node-lvar call))
          (dtype (node-derived-type call)))
-    (cond ((and guard (not (funcall guard)))
+    (cond ((and guard (not (funcall guard call)))
            (values nil :guard))
           ((not (template-args-ok template call safe-p))
            (values nil
@@ -637,12 +698,13 @@
                        :arg-check
                        :arg-types)))
           ((template-conditional-p template)
-           (let ((dest (lvar-dest lvar)))
-             (if (and (if-p dest)
-                      (immediately-used-p (if-test dest) call))
-                 (values t nil)
-                 (values nil :conditional))))
-          ((template-results-ok template dtype)
+           (or (vop-existsp :named sb-vm::move-conditional-result)
+               (let ((dest (lvar-dest lvar)))
+                 (if (and (if-p dest)
+                          (immediately-used-p (if-test dest) call))
+                     (values t nil)
+                     (values nil :conditional)))))
+          ((template-results-ok template dtype (lvar-single-value-p (node-lvar call)))
            (values t nil))
           (t
            (values nil :result-types)))))
@@ -794,9 +856,9 @@
                             (template-or-lose 'call-named)))
                        *efficiency-note-cost-threshold*)))
       (dolist (try (fun-info-templates (basic-combination-fun-info call)))
-        (when (> (template-cost try) max-cost) (return)) ; FIXME: UNLESS'd be cleaner.
+        (when (> (template-cost try) max-cost) (return))
         (let ((guard (template-guard try)))
-          (when (and (or (not guard) (funcall guard))
+          (when (and (or (not guard) (funcall guard call))
                      (or (not safe-p)
                          (ltn-policy-safe-p (template-ltn-policy try)))
                      (not (and (eq ltn-policy :safe)
@@ -884,7 +946,7 @@
       ;; transforms or VOPs or whatever.
       (unless template
         (ltn-default-call call)
-        (when (let ((funleaf (physenv-lambda (node-physenv call)))
+        (when (let ((funleaf (environment-lambda (node-environment call)))
                     (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
                      (eq name (leaf-source-name funleaf))
@@ -979,11 +1041,14 @@
          (:known
           (ltn-analyze-known-call node))))
       (cif (ltn-analyze-if node))
+      (jump-table (ltn-analyze-jump-table node))
       (creturn) ;; delay to FLUSH-FULL-CALL-TAIL-TRANSFERS
       ((or bind entry))
       (exit (ltn-analyze-exit node))
       (cset (ltn-analyze-set node))
       (cast (ltn-analyze-cast node))
+      (enclose)
+      (cdynamic-extent (ltn-analyze-dynamic-extent node))
       (mv-combination
        (ecase (basic-combination-kind node)
          (:local

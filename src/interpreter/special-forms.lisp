@@ -9,9 +9,6 @@
 
 (in-package "SB-INTERPRETER")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (shadow "SYMEVAL"))
-
 ;;; Return a THE form that wraps EXPRESSION, but if CTYPE is NIL,
 ;;; just return EXPRESSION.
 (defun cast-to (ctype expression)
@@ -308,7 +305,7 @@
     (if (policy env (> speed safety))
         (%eval form env)
         (let ((type (parse-type type-specifier)))
-          (multiple-value-call (if (sb-kernel::%values-type-p type)
+          (multiple-value-call (if (sb-kernel::values-type-p type)
                                    #'enforce-values-types
                                    #'enforce-single-type)
             type (%eval form env))))
@@ -319,7 +316,7 @@
           (if (eq type *universal-type*) ; don't type-check if T
               (handler #'digest-form form)
               (let ((form (%sexpr form)))
-                (if (sb-kernel::%values-type-p type)
+                (if (sb-kernel::values-type-p type)
                     (hlambda THE/MULTI (type form) (env)
                        (multiple-value-call #'enforce-values-types
                          type (dispatch form env)))
@@ -385,12 +382,12 @@
 
 (defspecial progv (symbols values &body forms)
   :immediate (env)
-  (progv (%eval symbols env) (%eval values env) (eval-progn forms env))
+  (checking-progv (%eval symbols env) (%eval values env) (eval-progn forms env))
   :deferred ()
   (let ((symbols (%sexpr symbols)) (values (%sexpr values))
         (forms (%progn forms)))
     (hlambda PROGV (symbols values forms) (env)
-      (progv (dispatch symbols env) (dispatch values env)
+      (checking-progv (dispatch symbols env) (dispatch values env)
         (dispatch forms env)))))
 
 (defspecial load-time-value (form &optional read-only-p)
@@ -678,13 +675,10 @@
   :deferred ()
   (let ((objects (mapcar #'%sexpr objects)) (forms (%progn forms)))
     (hlambda sb-sys:with-pinned-objects (objects forms) (env)
-      (labels ((recurse (list forms)
-                 (if (not list)
-                     (dispatch forms env)
-                     (let ((obj (dispatch (car list) env)))
-                       (sb-sys:with-pinned-objects (obj)
-                         (recurse (cdr list) forms))))))
-        (recurse objects forms)))))
+      (let ((sb-vm::*pinned-objects*
+             (nconc (mapcar (lambda (x) (dispatch x env)) objects)
+                    sb-vm::*pinned-objects*)))
+        (dispatch forms env)))))
 
 ;;; Now for the complicated stuff, starting with the simplest
 ;;; of the complicated ...
@@ -806,7 +800,7 @@
           ,@(when (eq operator 'let*)
               `((when (singleton-p bindings)
                   (return-from let*
-                    (funcall (info :function :interpreter 'let)
+                    (funcall (car (special-form-handler 'let))
                              `(,bindings ,@body) env)))))
           ;; FIXME: aren't MAKE-LET*-FRAME and MAKE-LET-FRAME essentially
           ;; the same now?
@@ -1151,22 +1145,23 @@
                  (make-proto-fn name))
         (multiple-value-bind (kind definition frame-ptr)
             (find-lexical-fun env name)
-          (if definition
-              (if (eq kind :macro)
-                  (not-a-function name)
-                  (hlambda FUNCTION (frame-ptr) (env)
-                    (local-fdefinition frame-ptr env)))
+          (cond (definition ; lexical function
+                 (if (eq kind :macro)
+                     (not-a-function name)
+                     (hlambda FUNCTION (frame-ptr) (env)
+                       (local-fdefinition frame-ptr env))))
               ;; Consider (DEFUN GET-THING () #'THING) - it shouldn't return
               ;; THING's error trampoline if THING is redefined after
               ;; GET-THING was called once.
-              (let ((fdefn (find-or-create-fdefn name)))
-                (if (symbolp name) ; could be a macro
-                    (hlambda FUNCTION (fdefn) (env)
-                      (declare (ignore env))
-                      (let ((fun (sb-c:safe-fdefn-fun fdefn)))
-                        (if (sb-impl::macro/special-guard-fun-p fun)
-                            (not-a-function (fdefn-name fdefn))
-                            fun)))
+                ((symbolp name) ; could be a macro
+                     (hlambda FUNCTION (name) (env)
+                       (declare (ignore env))
+                       (let ((fun (%symbol-function name)))
+                         (if (or (not fun) (sb-impl::macro/special-guard-fun-p fun))
+                             (not-a-function name)
+                             fun))))
+                (t
+                  (let ((fdefn (find-or-create-fdefn name)))
                     (hlambda FUNCTION (fdefn) (env) ; could not be a macro
                       (declare (ignore env))
                       (sb-c:safe-fdefn-fun fdefn)))))))))

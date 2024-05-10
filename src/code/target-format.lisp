@@ -20,7 +20,7 @@
 ;;; And it's possible that we could decide to install a closure as
 ;;; the fin-fun but I don't think that's necessary.
 (sb-kernel:!defstruct-with-alternate-metaclass fmt-control
-  :slot-names (string symbols memo)
+  :slot-names ((string simple-string) symbols memo)
   :constructor %make-fmt-control
   :superclass-name function
   :metaclass-name static-classoid
@@ -102,7 +102,8 @@
        (%format stream control-string format-arguments)))
     (string
      (with-output-to-string (stream destination)
-       (%format stream control-string format-arguments)))
+       (%format stream control-string format-arguments))
+     nil)
     ((member t)
      (%format *standard-output* control-string format-arguments)
      nil)
@@ -113,26 +114,37 @@
 (defun %format (stream string-or-fun orig-args &optional (args orig-args))
   (if (and (functionp string-or-fun) (not (typep string-or-fun 'fmt-control)))
       (apply string-or-fun stream args)
-      (catch 'up-and-out
-        (let* ((string (etypecase string-or-fun
-                         (simple-string
-                          string-or-fun)
-                         (string
-                          (coerce string-or-fun 'simple-string))
-                         (fmt-control
-                          (fmt-control-string string-or-fun))))
-               (*default-format-error-control-string* string)
-               (*logical-block-popper* nil)
-               (tokens
-                (if (functionp string-or-fun)
-                    (or (fmt-control-memo string-or-fun)
-                        ;; Memoize the parse back into the object
-                        (setf (fmt-control-memo string-or-fun)
-                              (%tokenize-control-string
-                               string 0 (length string)
-                               (fmt-control-symbols string-or-fun))))
-                    (tokenize-control-string string))))
-          (interpret-directive-list stream tokens orig-args args)))))
+      (truly-the
+       (values t &optional)
+       (catch 'up-and-out
+         (let* ((string (etypecase string-or-fun
+                          (simple-string
+                           string-or-fun)
+                          (string
+                           (coerce string-or-fun 'simple-string))
+                          ;; Not just more compact than testing for fmt-control
+                          ;; but also produces a better error message.
+                          (function
+                           (fmt-control-string string-or-fun))))
+                (*default-format-error-control-string* string)
+                (*logical-block-popper* nil)
+                (tokens
+                  (if (functionp string-or-fun)
+                      (or (fmt-control-memo string-or-fun)
+                          ;; Memoize the parse back into the object
+                          (setf (fmt-control-memo string-or-fun)
+                                (%tokenize-control-string
+                                 string 0 (length string)
+                                 (fmt-control-symbols string-or-fun))))
+                      (tokenize-control-string string))))
+           (interpret-directive-list stream tokens orig-args args))))))
+
+(!begin-collecting-cold-init-forms)
+(define-load-time-global *format-directive-interpreters* nil)
+(!cold-init-forms
+ (setq *format-directive-interpreters* (make-array 128 :initial-element nil)))
+(declaim (type (simple-vector 128)
+               *format-directive-interpreters*))
 
 (defun interpret-directive-list (stream directives orig-args args)
   (loop
@@ -172,18 +184,12 @@
      (pop args)))
 
 (defmacro def-complex-format-interpreter (char lambda-list &body body)
-  (let ((defun-name
-            (intern (format nil
-                            "~:@(~:C~)-FORMAT-DIRECTIVE-INTERPRETER"
-                            char)))
+  (aver (not (lower-case-p char)))
+  (let ((defun-name (directive-handler-name char "-INTERPRETER"))
         (directive '.directive) ; expose this var to the lambda. it's easiest
-        (directives (if lambda-list (car (last lambda-list)) (sb-xc:gensym "DIRECTIVES"))))
-    `(%svset ;; a cold-loadable form
-       *format-directive-interpreters*
-       ;; Using the host's char-upcase should be fine here.
-       ;; (Do we even need to use it? Why not just spell the source code as desired?)
-       ,(sb-xc:char-code (char-upcase char))
-       (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
+        (directives (if lambda-list (car (last lambda-list)) (gensym "DIRECTIVES"))))
+    `(progn
+       (defun ,defun-name (stream ,directive ,directives orig-args args)
          (declare (ignorable stream orig-args args))
          ,@(if lambda-list
                `((let ,(mapcar (lambda (var)
@@ -192,10 +198,13 @@
                                (butlast lambda-list))
                    (values (progn ,@body) args)))
                `((declare (ignore ,directive ,directives))
-                 ,@body))))))
+                 ,@body)))
+       (!cold-init-forms
+        (setf (aref *format-directive-interpreters* (char-code ,char))
+              #',defun-name)))))
 
 (defmacro def-format-interpreter (char lambda-list &body body)
-  (let ((directives (sb-xc:gensym "DIRECTIVES")))
+  (let ((directives (gensym "DIRECTIVES")))
     `(def-complex-format-interpreter ,char (,@lambda-list ,directives)
        ,@body
        ,directives)))
@@ -391,36 +400,22 @@
                   (format-print-ordinal stream arg)
                   (format-print-cardinal stream arg)))))))
 
-(defconstant +cardinal-ones+
-  #(nil "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"))
-
-(defconstant +cardinal-tens+
+(defconstant-eqx +cardinal-tens+
   #(nil nil "twenty" "thirty" "forty"
-        "fifty" "sixty" "seventy" "eighty" "ninety"))
+        "fifty" "sixty" "seventy" "eighty" "ninety")
+  #'equalp)
 
-(defconstant +cardinal-teens+
+(defconstant-eqx +cardinal-teens+
   #("ten" "eleven" "twelve" "thirteen" "fourteen"  ;;; RAD
-    "fifteen" "sixteen" "seventeen" "eighteen" "nineteen"))
+    "fifteen" "sixteen" "seventeen" "eighteen" "nineteen")
+  #'equalp)
 
-(defconstant +cardinal-periods+
-  #("" " thousand" " million" " billion" " trillion" " quadrillion"
-    " quintillion" " sextillion" " septillion" " octillion" " nonillion"
-    " decillion" " undecillion" " duodecillion" " tredecillion"
-    " quattuordecillion" " quindecillion" " sexdecillion" " septendecillion"
-    " octodecillion" " novemdecillion" " vigintillion"))
-
-(defconstant +ordinal-ones+
-  #(nil "first" "second" "third" "fourth"
-        "fifth" "sixth" "seventh" "eighth" "ninth"))
-
-(defconstant +ordinal-tens+
-  #(nil "tenth" "twentieth" "thirtieth" "fortieth"
-        "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
-
-(defun format-print-small-cardinal (stream n)
+(defun format-print-small-cardinal
+    (stream n &aux (.cardinal-ones.
+                    #(nil "one" "two" "three" "four" "five" "six" "seven" "eight" "nine")))
   (multiple-value-bind (hundreds rem) (truncate n 100)
     (when (plusp hundreds)
-      (write-string (svref +cardinal-ones+ hundreds) stream)
+      (write-string (svref .cardinal-ones. hundreds) stream)
       (write-string " hundred" stream)
       (when (plusp rem)
         (write-char #\space stream)))
@@ -430,11 +425,11 @@
               (write-string (svref +cardinal-tens+ tens) stream)
               (when (plusp ones)
                 (write-char #\- stream)
-                (write-string (svref +cardinal-ones+ ones) stream)))
+                (write-string (svref .cardinal-ones. ones) stream)))
              ((= tens 1)
               (write-string (svref +cardinal-teens+ ones) stream))
              ((plusp ones)
-              (write-string (svref +cardinal-ones+ ones) stream)))))))
+              (write-string (svref .cardinal-ones. ones) stream)))))))
 
 (defun format-print-cardinal (stream n)
   (cond ((minusp n)
@@ -445,7 +440,14 @@
         (t
          (format-print-cardinal-aux stream n 0 n))))
 
-(defun format-print-cardinal-aux (stream n period err)
+(defun format-print-cardinal-aux
+    (stream n period err
+     &aux (.cardinal-periods.
+           #("" " thousand" " million" " billion" " trillion" " quadrillion"
+             " quintillion" " sextillion" " septillion" " octillion" " nonillion"
+             " decillion" " undecillion" " duodecillion" " tredecillion"
+             " quattuordecillion" " quindecillion" " sexdecillion" " septendecillion"
+             " octodecillion" " novemdecillion" " vigintillion")))
   (multiple-value-bind (beyond here) (truncate n 1000)
     (unless (<= period 21)
       (error "Number too large to print in English: ~:D" err))
@@ -455,9 +457,15 @@
       (unless (zerop beyond)
         (write-char #\space stream))
       (format-print-small-cardinal stream here)
-      (write-string (svref +cardinal-periods+ period) stream))))
+      (write-string (svref .cardinal-periods. period) stream))))
 
-(defun format-print-ordinal (stream n)
+(defun format-print-ordinal
+    (stream n &aux (.ordinal-ones.
+                    #(nil "first" "second" "third" "fourth"
+                      "fifth" "sixth" "seventh" "eighth" "ninth"))
+                   (.ordinal-tens.
+                    #(nil "tenth" "twentieth" "thirtieth" "fortieth"
+                      "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth")))
   (when (minusp n)
     (write-string "negative " stream))
   (let ((number (abs n)))
@@ -472,13 +480,13 @@
                (write-string (svref +cardinal-teens+ ones) stream);;;RAD
                (write-string "th" stream))
               ((and (zerop tens) (plusp ones))
-               (write-string (svref +ordinal-ones+ ones) stream))
+               (write-string (svref .ordinal-ones. ones) stream))
               ((and (zerop ones)(plusp tens))
-               (write-string (svref +ordinal-tens+ tens) stream))
+               (write-string (svref .ordinal-tens. tens) stream))
               ((plusp bot)
                (write-string (svref +cardinal-tens+ tens) stream)
                (write-char #\- stream)
-               (write-string (svref +ordinal-ones+ ones) stream))
+               (write-string (svref .ordinal-ones. ones) stream))
               ((plusp number)
                (write-string "th" stream))
               (t
@@ -578,7 +586,7 @@
      (sb-impl::string-dispatch (single-float double-float)
          number
        (let ((spaceleft w))
-         (when (and w (or atsign (= (float-sign-bit number) 1)))
+         (when (and w (or atsign (float-sign-bit-set-p number)))
            (decf spaceleft))
          (multiple-value-bind (str len lpoint tpoint)
              (sb-impl::flonum-to-string (abs number) spaceleft d k)
@@ -607,7 +615,7 @@
                   (when w
                     (dotimes (i spaceleft)
                       (write-char pad stream)))
-                  (if (= (float-sign-bit number) 1)
+                  (if (float-sign-bit-set-p number)
                       (write-char #\- stream)
                       (when atsign
                         (write-char #\+ stream)))
@@ -680,7 +688,7 @@
                spaceleft)
           (when w
             (setf spaceleft (- w 2 elen))
-            (when (or atsign (= (float-sign-bit number) 1))
+            (when (or atsign (float-sign-bit-set-p number))
               (decf spaceleft)))
           (if (and w ovf e (> elen e))  ;exponent overflow
               (dotimes (i w) (write-char ovf stream))
@@ -688,25 +696,28 @@
                      (fmin (if (minusp k) 1 fdig)))
                 (multiple-value-bind (fstr flen lpoint tpoint)
                     (sb-impl::flonum-to-string num spaceleft fdig k fmin)
-                  (when (and d (zerop d)) (setq tpoint nil))
+                  (when (eql fdig 0) (setq tpoint nil))
                   (when w
                     (decf spaceleft flen)
                     (when lpoint
                       (if (or (> spaceleft 0) tpoint)
                           (decf spaceleft)
                           (setq lpoint nil)))
-                    (when (and tpoint (<= spaceleft 0))
-                      (setq tpoint nil)))
+                    (when tpoint
+                      (if (<= spaceleft 0)
+                          (setq tpoint nil)
+                          (decf spaceleft))))
                   (cond ((and w (< spaceleft 0) ovf)
                          ;;significand overflow
                          (dotimes (i w) (write-char ovf stream)))
                         (t (when w
                              (dotimes (i spaceleft) (write-char pad stream)))
-                           (if (= (float-sign-bit number) 1)
+                           (if (float-sign-bit-set-p number)
                                (write-char #\- stream)
                                (if atsign (write-char #\+ stream)))
                            (when lpoint (write-char #\0 stream))
                            (write-string fstr stream)
+                           (when tpoint (write-char #\0 stream))
                            (write-char (if marker
                                            marker
                                            (format-exponent-marker number))
@@ -782,7 +793,7 @@
     ;; thing, and at least the user shouldn't be surprised.
     (setq number (coerce number 'single-float)))
   (if (floatp number)
-      (let* ((signstr (if (= (float-sign-bit number) 1)
+      (let* ((signstr (if (float-sign-bit-set-p number)
                           "-"
                           (if atsign "+" "")))
              (signlen (length signstr)))
@@ -1217,6 +1228,19 @@
                                         (if atsignp orig-args arg)
                                         arg))))))
   (if atsignp nil args))
+
+(defun princ-multiple-to-string (&rest args)
+  (%with-output-to-string (str)
+    (let ((*print-escape* nil)
+          (*print-readably* nil))
+      (do-rest-arg ((arg) args)
+        (typecase arg
+          (string
+           (write-string arg str))
+          (character
+           (write-char arg str))
+          (t
+           (output-object arg str)))))))
 
 ;;;; format interpreter and support functions for user-defined method
 
@@ -1232,9 +1256,19 @@
             (t (args param)))))
       (apply symbol stream (next-arg) colonp atsignp (args)))))
 
+(!defun-from-collected-cold-init-forms !format-directives-init)
+
+(defvar sb-int::**tokenize-control-string-cache-vector**-stats) ; might not be DEFVARed
+(defun sb-impl::!format-cold-init ()
+  (!late-format-init)
+  (!format-directives-init)
+  ;; cold-init requires these assignments if hash-cache profiling is enabled
+  (setq **tokenize-control-string-cache-vector** (make-array 128 :initial-element 0))
+  (setq sb-int::**tokenize-control-string-cache-vector**-stats
+        (make-array 3 :initial-element 0 :element-type 'fixnum)))
+
 (push '("SB-FORMAT"
         def-format-directive def-complex-format-directive
         def-format-interpreter def-complex-format-interpreter
-        interpret-bind-defaults interpret-format-integer next-arg
-        %set-format-directive-expander)
+        interpret-bind-defaults interpret-format-integer next-arg)
       *!removable-symbols*)

@@ -11,21 +11,23 @@
 
 (enable-test-parallelism)
 
+(assert (not (sb-kernel:member-type-p (sb-kernel:make-eql-type #\z))))
+(assert (not (sb-kernel:member-type-p (sb-kernel:make-eql-type 1.0))))
+(assert (sb-kernel:member-type-p (sb-kernel:make-eql-type -0.0s0)))
+
 (with-test (:name (typexpand-1 typexpand typexpand-all :check-lexenv))
   (flet ((try (f) (assert-error (funcall f 'hash-table 3))))
     (mapc #'try '(typexpand-1 typexpand typexpand-all))))
 
-(with-test (:name :stream-layout-bits)
-  (loop for layout being each hash-value
-        of (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't))
-        do (flet ((check-bit (bit ancestor-type)
-                    (let ((ancestor (sb-kernel:find-layout ancestor-type)))
-                      (when (or (eq layout ancestor)
-                                (find ancestor (sb-kernel:layout-inherits layout)))
-                        (assert (logtest bit (sb-kernel:layout-flags layout)))))))
-              (check-bit sb-kernel:+stream-layout-flag+ 'stream)
-              (check-bit sb-kernel:+string-stream-layout-flag+ 'string-stream)
-              (check-bit sb-kernel:+file-stream-layout-flag+ 'file-stream))))
+(with-test (:name :no-*-as-t) ; lp#1860919
+  (assert-signal (sb-kernel:specifier-type '(function (*) t)) warning)
+  (dolist (f '((lambda (x) (the * x))
+               (lambda (x) (declare (* x)) x)
+               (lambda (x) (declare (type * x)) x)))
+    (multiple-value-bind (f warn err)
+        (let ((*error-output* (make-broadcast-stream))) (compile nil f))
+      (declare (ignore f))
+      (assert (and warn err)))))
 
 (with-test (:name (typep sb-kernel:ctypep))
   (locally
@@ -169,7 +171,7 @@
   (assert-tri-eq t   t (subtypep '(function ()) '(function (&rest t))))
   (assert-tri-eq nil t (subtypep '(function (&rest t)) '(function ())))
   (assert-tri-eq t   t (subtypep '(function)
-                                 '(function (&optional * &rest t))))
+                                 '(function (&optional t &rest t))))
   (assert-tri-eq nil t (subtypep '(function) '(function (t &rest t))))
   (assert-tri-eq t   t (subtypep 'function '(function)))
   (assert-tri-eq t   t (subtypep '(function) 'function)))
@@ -505,16 +507,16 @@
     (flet ((our-type-of (x) (sb-kernel:type-specifier (sb-kernel:ctype-of x))))
       (let ((hairy-t (make-array 3 :displaced-to simp-t)))
         (assert (equal (our-type-of hairy-t)
-                       '(and (vector t 3) (not simple-array))))
+                       '(vector t)))
         (assert (equal (type-of hairy-t) '(vector t 3))))
       (let ((hairy-t (make-array '(3 2) :displaced-to simp-t)))
         (assert (equal (our-type-of hairy-t)
-                       '(and (array t (3 2)) (not simple-array))))
+                       '(array t (* *))))
         (assert (equal (type-of hairy-t) '(array t (3 2)))))
       (let ((hairy-bit
-             (make-array 5 :displaced-to simp-bit :element-type 'bit)))
+              (make-array 5 :displaced-to simp-bit :element-type 'bit)))
         (assert (equal (our-type-of hairy-bit)
-                       '(and (bit-vector 5) (not simple-array))))
+                       'bit-vector))
         (assert (equal (type-of hairy-bit) '(bit-vector 5)))))))
 
 (with-test (:name (subtypep array :bug-309098))
@@ -551,7 +553,9 @@
 
 ;; lp#1333731
 (with-test (:name (adjust-array :changes type-of))
-  (let ((a (make-array 10 :adjustable t)))
+  ;; I think adjusting an array to enlarge it must read all the old data,
+  ;; which would be undefined behavior if you hadn't initialized the array.
+  (let ((a (make-array 10 :adjustable t :initial-element 0)))
     (assert (equal (type-of a) '(vector t 10)))
     (adjust-array a 20)
     (assert (equal (type-of a) '(vector t 20)))))
@@ -636,7 +640,7 @@
                (values bit &optional *)
                (values bit &rest *)
                (values bit &rest *)))
-    (assert-error (sb-kernel:values-specifier-type x))))
+    (assert-signal (sb-kernel:values-specifier-type x) warning)))
 
 (with-test (:name :classoids-as-type-specifiers)
   (dolist (classoid (list (find-classoid 'integer)
@@ -670,9 +674,52 @@
             (assert (eq (sb-int:info :type :kind s) :primitive))
             (assert (eq (sb-int:info :type :kind s) :instance)))))))
 
-(with-test (:name :make-numeric-type)
+(with-test (:name (make-numeric-type :smoke))
   (assert (eq (make-numeric-type :class 'integer :low '(4) :high '(5))
               *empty-type*)))
+
+(with-test (:name (make-numeric-type :union))
+  (assert (equal (type-specifier (make-numeric-type :low '(-79106810381456307)))
+                 `(or (rational (-79106810381456307))
+                      (single-float (-7.910681e16))
+                      (double-float (-7.91068103814563d16))))))
+
+(with-test (:name (make-numeric-type :infinities))
+  ;; Without class
+  (assert (equal (type-specifier
+                  (make-numeric-type :low sb-ext:single-float-negative-infinity
+                                     :high sb-ext:single-float-negative-infinity))
+                 `(or (single-float ,sb-ext:single-float-negative-infinity
+                                    ,sb-ext:single-float-negative-infinity)
+                      (double-float ,sb-ext:double-float-negative-infinity
+                                    ,sb-ext:double-float-negative-infinity))))
+  (assert (equal (type-specifier
+                  (make-numeric-type :low sb-ext:single-float-negative-infinity))
+                 'real))
+  ;; With FLOAT class
+  (assert (equal (type-specifier
+                  (make-numeric-type :class 'float
+                                     :low sb-ext:single-float-negative-infinity
+                                     :high sb-ext:single-float-negative-infinity))
+                 `(or (single-float ,sb-ext:single-float-negative-infinity
+                                    ,sb-ext:single-float-negative-infinity)
+                      (double-float ,sb-ext:double-float-negative-infinity
+                                    ,sb-ext:double-float-negative-infinity))))
+  (assert (equal (type-specifier
+                  (make-numeric-type :class 'float
+                                     :low sb-ext:single-float-negative-infinity))
+                 `float)))
+
+(with-test (:name :prettier-union-types :skipped-on (not :sb-unicode))
+  ;; (OR STRING BIGNUM) used to unparse as
+  ;; (OR (VECTOR CHARACTER) BASE-STRING (INTEGER * -4611686018427387905)
+  ;;     (INTEGER 4611686018427387904)) etc
+  (dolist (other '(float real bignum))
+    (let* ((spec `(or string ,other))
+           (parse (sb-kernel:specifier-type spec))
+           (unparse (sb-kernel:type-specifier parse)))
+      (assert (or (equal unparse `(or string ,other))
+                  (equal unparse `(or ,other string)))))))
 
 (with-test (:name :unparse-string)
   (assert (equal (type-specifier (specifier-type '(string 10)))
@@ -718,16 +765,178 @@
                                           ,(sb-kernel:find-layout what))))))
 
 (with-test (:name :type-of-empty-instance)
+  (assert (eq (type-of (test-util::make-funcallable-instance 6))
+              'sb-kernel:funcallable-instance))
   (assert (eq (type-of (eval '(sb-kernel:%make-instance 12)))
               'sb-kernel:instance)))
-
-(with-test (:name :make-numeric-type-union)
-  (assert (equal (sb-kernel:type-specifier
-                  (sb-kernel:make-numeric-type :low '(-79106810381456307)))
-                 '(or (double-float (-7.91068103814563d16)) (single-float (-7.910681e16))
-                   (rational (-79106810381456307))))))
 
 (with-test (:name (:cons-union :lp1912863))
   (let ((c (cons 2 4)))
     (assert (not (typep c '(or (cons (integer 0 8) (integer 5 15))
-                               (cons (integer 3 15) (integer 4 14))))))))
+                            (cons (integer 3 15) (integer 4 14))))))))
+
+(with-test (:name (:rational-union :equivalent-to-t))
+  (let ((type '(or (integer * -1) (rational -1/2 1/2) (integer 1) (not integer))))
+    (assert-tri-eq t t (subtypep t type))))
+
+(with-test (:name (:rational-union :wider-equivalent-to-t))
+  (let ((type '(or (integer * -2) (rational -3/2 3/2) (integer 2) (not integer))))
+    (assert-tri-eq t t (subtypep t type))))
+
+(with-test (:name (:rational-union :no-integers-in-rational))
+  (let ((type '(or (integer 1 1) (rational 1/2 1/2))))
+    (assert-tri-eq t t (subtypep type 'rational))
+    (assert-tri-eq nil t (subtypep 'rational type))
+    (assert-tri-eq nil t (subtypep type 'integer))
+    (assert-tri-eq nil t (subtypep 'integer type))
+    (assert (typep 1 type))
+    (assert (typep 1/2 type))
+    (assert (not (typep 3/4 type)))))
+
+(with-test (:name (:rational-union :open-bounds-closed))
+  (let ((t1 '(rational -1 1))
+        (t2 '(or (integer -1 1) (rational (-1) (1)))))
+    (assert-tri-eq t t (subtypep t1 t2))
+    (assert-tri-eq t t (subtypep t2 t1))))
+
+(with-test (:name (:rational-union :lp1912863 :bug039))
+  (flet ((bug039 ()
+           (let ((t1 'cons)
+                 (t2 '(or (not (cons t (real -1 1)))
+                       (not (cons sequence (eql 2))))))
+             (assert-tri-eq t t (subtypep t1 t2))
+             (assert-tri-eq t t (subtypep `(not ,t2) `(not ,t1))))))
+    (bug039)))
+
+(with-test (:name (:rational-union :lp1912863 :bug041))
+  (flet ((bug041 ()
+           (let ((t1 '(not (cons t integer)))
+                 (t2 '(not (cons (array nil) (eql 0))))
+                 (t3 '(cons simple-array t)))
+             (assert-tri-eq t t (subtypep t1 t2))
+             (assert-tri-eq t t (subtypep `(not (or ,t2 ,t3)) `(not ,t1)))
+             (assert-tri-eq t t (subtypep `(and (not ,t2) (not ,t3)) `(not ,t1))))))
+    (bug041)))
+
+(with-test (:name (:lp1916040 :answer))
+  (let* ((t1 '(cons sequence short-float))
+         (t2 '(or (cons t atom) (cons function t)))
+         (answer (multiple-value-list (subtypep t1 t2))))
+    (assert (member answer '((nil nil) (t t)) :test 'equal))))
+
+(with-test (:name (:lp1916233))
+  (assert-tri-eq t t (subtypep '(cons (or (simple-array ratio) simple-array) nil) nil))
+  (assert-tri-eq t t (subtypep '(or (array ratio) sequence) t)))
+
+(defun my-widetag-of (x)
+  (sb-sys:sap-ref-8 (sb-sys:int-sap (sb-kernel:get-lisp-obj-address x))
+                    (- sb-vm:other-pointer-lowtag)))
+;;; I'll bet that nothing anywhere tests this
+(with-test (:name :nil-has-symbol-widetag
+            :skipped-on (:or :ppc64 :big-endian))
+  (assert (= (my-widetag-of nil) (my-widetag-of t))))
+
+(with-test (:name :array-rank-deriver-negation)
+  (assert
+   (ctype= (caddr
+            (sb-kernel:%simple-fun-type
+             (checked-compile
+              `(lambda (a) (array-rank (the (not (array t)) a))))))
+           `(values (mod 129) &optional))))
+
+(with-test (:name (:rational-intersection :lp1998008))
+  (flet ((bug101 ()
+           (let ((t1 '(or (not (real 1 3)) (eql 2))))
+             (assert-tri-eq t t (subtypep `(not (not ,t1)) t1))
+             (assert-tri-eq t t (subtypep t1 `(not (not ,t1)))))))
+    (bug101)))
+
+(with-test (:name (:rational-intersection :integer-bounds))
+  (let ((t1 '(and (not integer) (rational 3 5)))
+        (t2 '(and (not integer) (rational (3) (5)))))
+    (assert-tri-eq t t (subtypep t1 t2))
+    (assert-tri-eq t t (subtypep t2 t1))
+    (assert-tri-eq t t (subtypep `(not ,t1) `(not ,t2)))
+    (assert-tri-eq t t (subtypep `(not ,t2) `(not ,t1)))))
+
+(with-test (:name (:cons-union :lp1999352))
+  (let* ((v (list :a))
+         (type1 `(cons (or atom (eql ,v))))
+         (type2 `(cons (or (member :a 2) cons) list)))
+    (let ((bug103 (compile nil
+                           `(lambda (val)
+                              (declare (type ,type1 val))
+                              (the ,type2 val)))))
+      (assert (equal (funcall bug103 (list v)) '((:a)))))))
+
+(with-test (:name :union-type-checks)
+  (assert (not (find 'integerp
+                     (ctu:ir1-named-calls `(lambda (x)
+                                             (declare ((or list fixnum) x))
+                                             (typep x 'integer))
+                                          nil)))))
+
+(with-test (:name :union-intersection-simplification)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (typep a '(or
+                 (and symbol (not null))
+                 (and array (not string)))))
+   ((#()) t)
+   (("") nil)
+   ((t) t)
+   ((nil) nil)))
+
+(with-test (:name :union-integer-complex)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(or (integer 36757953510256822604)
+                 (complex fixnum))))
+   ((-1) nil)
+   ((36757953510256822603) nil)
+   ((36757953510256822604) t)
+   ((36757953510256822605) t)
+   ((#C(1d0 1d0)) nil)
+   ((#C(1 1)) t)
+   ((#C(1 #.(expt 2 300))) nil)))
+
+#+(or arm64 x86-64)
+(with-test (:name :structure-typep-fold)
+  (assert-type
+   (lambda (a b)
+     (declare (character a))
+       (sb-c::structure-typep a b))
+   null)
+  (assert-type
+   (lambda (a)
+     (declare (hash-table a))
+     (sb-c::structure-typep a #.(sb-kernel:find-layout 'condition)))
+   null)
+  (assert-type
+   (lambda (a)
+     (declare (pathname a))
+     (sb-c::structure-typep a #.(sb-kernel:find-layout 'pathname)))
+   (eql t)))
+
+(with-test (:name :typep-vector-folding)
+  (assert-type
+   (lambda (p)
+     (declare (integer p))
+     (typep p '(vector t 1)))
+   null))
+
+(with-test (:name :non-null-symbol-load-widetag)
+  (checked-compile-and-assert
+   ()
+   `(lambda (p)
+     (declare ((or symbol array) p))
+     (typecase  p
+       ((and symbol (not null)) 1)
+       (simple-array 2)))
+   ((nil) nil)
+   ((t) 1)
+   ((:a) 1)
+   (("") 2)
+   (((make-array 10 :adjustable t)) nil)))

@@ -14,7 +14,12 @@
        (load-symbol y val))
       (character
        (inst li y (logior (ash (char-code val) n-widetag-bits)
-                          character-widetag))))))
+                          character-widetag)))
+      (structure-object
+       (if (eq val sb-lockless:+tail+)
+           (inst add y null-tn (- lockfree-list-tail-value-offset
+                                  nil-value-offset))
+           (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
   ((zero immediate)
@@ -185,6 +190,7 @@
 
     (with-fixed-allocation
         (y pa-flag temp bignum-widetag (1+ bignum-digits-offset) nil)
+      ;; FIXME: could this store be moved forward into the branch delay slot?
       (storew x y bignum-digits-offset other-pointer-lowtag))
     (inst b done)
     (inst nop)
@@ -249,9 +255,9 @@
     (inst beq temp done)
     (inst sll y x n-fixnum-tag-bits)
 
-    (pseudo-atomic
-      (pa-flag :extra (pad-data-block (+ bignum-digits-offset 2)))
-      (inst or y alloc-tn other-pointer-lowtag)
+    (pseudo-atomic (pa-flag)
+      (allocation bignum-widetag (pad-data-block (+ bignum-digits-offset 2)) y
+        other-pointer-lowtag `(,pa-flag ,temp))
       (inst slt temp x zero-tn)
       (inst sll temp n-widetag-bits)
       (inst addu temp (logior (ash 1 n-widetag-bits) bignum-widetag))

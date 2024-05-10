@@ -1,12 +1,9 @@
 #include "lispregs.h"
 #include "globals.h"
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 
 #include "genesis/closure.h"
-#include "genesis/funcallable-instance.h"
-#include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
-#include "genesis/simple-fun.h"
 #include "genesis/symbol.h"
 
 #define STATIC_SYMBOL_VALUE(sym) [reg_NULL, #(((sym)-NIL)+SYMBOL_VALUE_OFFSET)]
@@ -287,7 +284,7 @@ fun_end_breakpoint_trap:
 fun_end_breakpoint_end:
 
 @@ FIXME: writing this as a lisp assembly routine would eliminate all the
-@@ preprocessor noise. There's no reasom it can't be done, but we lack
+@@ preprocessor noise. There's no reason it can't be done, but we lack
 @@ instruction encoders for: stmfd, ldmfd, stmea, ldmea, fstmfdd, fldfdd.
 
 #define DEFINE_TRAMPOLINE(name, entry) \

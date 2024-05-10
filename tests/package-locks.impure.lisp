@@ -11,6 +11,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+#+(and sb-devel (not sb-devel-lock-packages))
+(invoke-restart 'run-tests::skip-file) ; packages are not locked for devs
+
 (load "compiler-test-util.lisp")
 
 ;;;; Our little labrats and a few utilities
@@ -565,18 +568,18 @@
 
 (with-test (:name :compile-time-defun-package-locked)
   ;; Make sure compile-time side-effects of DEFUN are protected against.
-  (let ((inline-lambda (function-lambda-expression #'fill-pointer)))
+  (let ((inline-lambda (function-lambda-expression #'adjustable-array-p)))
     ;; Make sure it's actually inlined...
     (assert inline-lambda)
     (assert (eq :ok
                 (handler-case
-                    (ctu:file-compile `((defun fill-pointer (x) x)))
+                    (ctu:file-compile `((defun adjustable-array-p (x) x)))
                   (sb-ext:symbol-package-locked-error (e)
-                    (when (eq 'fill-pointer
+                    (when (eq 'adjustable-array-p
                               (sb-ext:package-locked-error-symbol e))
                       :ok)))))
     (assert (equal inline-lambda
-                   (function-lambda-expression #'fill-pointer)))))
+                   (function-lambda-expression #'adjustable-array-p)))))
 
 (with-test (:name :compile-time-defclass-package-locked)
   ;; Compiling (DEFCLASS FTYPE ...) used to break SBCL, but the package

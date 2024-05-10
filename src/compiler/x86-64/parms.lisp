@@ -17,43 +17,33 @@
 (defconstant sb-assem:+inst-alignment-bytes+ 1)
 
 (defconstant +backend-fasl-file-implementation+ :x86-64)
-(defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
-  #'equalp)
+(defconstant-eqx +fixup-kinds+ #(:abs32 :rel32 :absolute) #'equalp)
 
-;;; KLUDGE: It would seem natural to set this by asking our C runtime
-;;; code for it, but mostly we need it for GENESIS, which doesn't in
-;;; general have our C runtime code running to ask, so instead we set
-;;; it by hand. -- WHN 2001-04-15
-;;;
-;;; Actually any information that we can retrieve C-side would be
-;;; useless in SBCL, since it's possible for otherwise binary
-;;; compatible systems to return different values for getpagesize().
-;;; -- JES, 2007-01-06
+;;; This size is supposed to indicate something about the actual granularity
+;;; at which you can map memory.  We just hardwire it, but that may or may not
+;;; be necessary any more.
 (defconstant +backend-page-bytes+ #+win32 65536 #-win32 32768)
 
-;;; The size in bytes of GENCGC cards, i.e. the granularity at which
-;;; writes to old generations are logged.  With mprotect-based write
-;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The size in bytes of GENCGC pages. A page is the smallest amount of memory
+;;; that a thread can claim for a thread-local region, and also determines
+;;; the granularity at which we can find the start of a sequence of objects.
+(defconstant gencgc-page-bytes 32768)
+;;; The divisor relative to page-bytes which computes the granularity
+;;; at which writes to old generations are logged.
+#+soft-card-marks (defconstant cards-per-page
+                               #+mark-region-gc (/ gencgc-page-bytes 128)
+                               #-mark-region-gc 32)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 ;;; The card size for immobile/low space
 (defconstant immobile-card-bytes 4096)
 
-;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
-;;; and a 16 bit quantity depending on context. This is because Intel
-;;; insists on calling 16 bit things words and 32 bit things
-;;; double-words (or dwords). Therefore, in the instruction definition
-;;; and register specs, we use the Intel convention. But whenever we
-;;; are talking about stuff the rest of the lisp system might be
-;;; interested in, we use ``word'' to mean the size of a descriptor
-;;; object, which is 64 bits.
+;;; ### Note: 'lispword' always means 8 bytes, and 'word' usually means
+;;; the same as 'lispword', except in the assembler and disassembler,
+;;; where 'word' means 2 bytes to match AMD/Intel terminology.
 
 ;;;; machine architecture parameters
 
@@ -63,35 +53,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 64)
-
-(defconstant float-sign-shift 31)
-
-;;; comment from CMU CL:
-;;;   These values were taken from the alpha code. The values for
-;;;   bias and exponent min/max are not the same as shown in the 486 book.
-;;;   They may be correct for how Python uses them.
-(defconstant single-float-bias 126)    ; Intel says 127.
-(defconstant-eqx single-float-exponent-byte    (byte 8 23) #'equalp)
-(defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-;;; comment from CMU CL:
-;;;   The 486 book shows the exponent range -126 to +127. The Lisp
-;;;   code that uses these values seems to want already biased numbers.
-(defconstant single-float-normal-exponent-min 1)
-(defconstant single-float-normal-exponent-max 254)
-(defconstant single-float-hidden-bit (ash 1 23))
-
-(defconstant double-float-bias 1022)
-(defconstant-eqx double-float-exponent-byte    (byte 11 20) #'equalp)
-(defconstant-eqx double-float-significand-byte (byte 20 0)  #'equalp)
-(defconstant double-float-normal-exponent-min 1)
-(defconstant double-float-normal-exponent-max #x7FE)
-(defconstant double-float-hidden-bit (ash 1 20))
-
-(defconstant single-float-digits
-  (+ (byte-size single-float-significand-byte) 1))
-
-(defconstant double-float-digits
-  (+ (byte-size double-float-significand-byte) 32 1))
 
 ;;; from AMD64 Architecture manual
 (defconstant float-invalid-trap-bit       (ash 1 0))
@@ -125,23 +86,23 @@
 ;;; it would cause. -- JES, 2005-12-11
 
 #+(or linux darwin)
-(!gencgc-space-setup #x50000000
+(gc-space-setup #x50000000
                      :read-only-space-size 0
-                     :fixedobj-space-size #.(* 30 1024 1024)
-                     :varyobj-space-size #.(* 130 1024 1024)
+                     :fixedobj-space-size #.(* 60 1024 1024)
+                     :text-space-size #.(* 130 1024 1024)
                      :dynamic-space-start #x1000000000)
 
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
-;;; run under the default 512M data size limit.
+;;; run under the default 1G data size limit.
 
 #-(or linux darwin)
-(!gencgc-space-setup #x20000000
-                     #-win32 :read-only-space-size #-win32 0
+(gc-space-setup #x20000000
+                     :read-only-space-size 0
                      :dynamic-space-start #x1000000000
-                     #+openbsd :dynamic-space-size #+openbsd #x1bcf0000)
+                     #+openbsd :dynamic-space-size #+openbsd #x2fff0000)
 
-(defconstant linkage-table-growth-direction :up)
-(defconstant linkage-table-entry-size 16)
+(defconstant alien-linkage-table-growth-direction :up)
+(defconstant alien-linkage-table-entry-size 16)
 
 
 (defenum (:start 8)
@@ -188,33 +149,43 @@
      ;; interrupt handling
     #-sb-thread *pseudo-atomic-bits*     ; ditto
     #-sb-thread *binding-stack-pointer* ; ditto
+    ;; Since the text space and alien linkage table might both get relocated on startup
+    ;; under #+immobile-space, an alien callback wrapper can't wire in the address
+    ;; of a word that holds the C function pointer to callback_wrapper_trampoline.
+    ;; (There is no register that points to a known address when entering the callback)
+    ;; A static symbol works well for this, and is sensible considering that
+    ;; the assembled wrappers also reside in static space.
+    #+(and sb-thread immobile-space) callback-wrapper-trampoline
     *cpu-feature-bits*)
   #'equalp)
 
 (defconstant-eqx +static-fdefns+
-  #(length
-    two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    eql
-    %negate
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    two-arg-gcd
-    two-arg-lcm
-    ensure-symbol-hash
-    sb-impl::install-hash-table-lock
-    update-object-layout
-    %coerce-callable-to-fun)
+    `#(sb-impl::install-hash-table-lock update-object-layout
+       ,@common-static-fdefns)
   #'equalp)
 
 #+sb-simd-pack
-(defglobal *simd-pack-element-types* '(integer single-float double-float))
+(progn
+  (defconstant-eqx +simd-pack-element-types+
+      (coerce
+       (hash-cons
+        '(single-float double-float
+          (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32) (unsigned-byte 64)
+          (signed-byte 8) (signed-byte 16) (signed-byte 32) (signed-byte 64)))
+       'vector)
+    #'equalp)
+  (defconstant sb-kernel::+simd-pack-wild+
+    (ldb (byte (length +simd-pack-element-types+) 0) -1))
+  (defconstant-eqx +simd-pack-128-primtypes+
+      #(simd-pack-single simd-pack-double
+        simd-pack-ub8 simd-pack-ub16 simd-pack-ub32 simd-pack-ub64
+        simd-pack-sb8 simd-pack-sb16 simd-pack-sb32 simd-pack-sb64)
+    #'equalp)
+  (defconstant-eqx +simd-pack-256-primtypes+
+      #(simd-pack-256-single simd-pack-256-double
+        simd-pack-256-ub8 simd-pack-256-ub16 simd-pack-256-ub32 simd-pack-256-ub64
+        simd-pack-256-sb8 simd-pack-256-sb16 simd-pack-256-sb32 simd-pack-256-sb64)
+    #'equalp))
 
 (defconstant undefined-fdefn-header
   ;; This constant is constructed as follows: Take the INT opcode

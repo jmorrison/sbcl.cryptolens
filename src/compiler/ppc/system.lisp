@@ -59,9 +59,7 @@
   (:temporary (:scs (non-descriptor-reg)) this-id that-id)
   (:generator 4
     (let ((test-id (layout-id test-layout))
-          (offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                             instance-slots-offset)
-                          word-shift)
+          (offset (+ (id-bits-offset)
                      (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lwz this-id x offset)
@@ -86,8 +84,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -108,10 +106,9 @@
 (define-vop (set-header-data)
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res)
+  (:args (x :scs (descriptor-reg))
          (data :scs (any-reg immediate zero)))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) t1 t2)
   (:generator 6
     (loadw t1 x 0 other-pointer-lowtag)
@@ -128,8 +125,7 @@
                 (inst lr t2 val)
                 (inst or t1 t1 t2)))))
       (zero))
-    (storew t1 x 0 other-pointer-lowtag)
-    (move res x)))
+    (storew t1 x 0 other-pointer-lowtag)))
 
 
 (define-vop (pointer-hash)
@@ -142,14 +138,6 @@
 
 
 ;;;; Allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (move int alloc-tn)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
@@ -296,3 +284,18 @@
    ;; Can't convert index to a code-relative index until the boxed header length
    ;; has been determined.
    (inst store-coverage-mark index tmp)))
+
+(define-vop ()
+  (:translate sb-lockless:get-next)
+  (:policy :fast-safe)
+  (:args (node :scs (descriptor-reg)))
+  (:results (next-tagged :scs (descriptor-reg))
+            (next-bits :scs (descriptor-reg)))
+  (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
+  (:generator 10
+    ;; Read the first user-data slot and convert to a tagged pointer,
+    ;; also returning the raw value as a secondary result
+    (pseudo-atomic (pa-flag)
+      (loadw next-bits node (+ instance-slots-offset instance-data-start)
+             instance-pointer-lowtag)
+      (inst ori next-tagged next-bits instance-pointer-lowtag))))

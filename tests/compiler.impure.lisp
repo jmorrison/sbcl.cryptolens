@@ -20,7 +20,7 @@
 ;; or actually reasonable things to test.
 (when (and (eq sb-ext:*evaluator-mode* :interpret)
            (not (member :sb-fasteval *features*)))
-  (sb-ext:exit :code 104))
+  (invoke-restart 'run-tests::skip-file))
 
 (load "compiler-test-util.lisp")
 
@@ -72,7 +72,7 @@
 
 ;;; As reported by Alexey Dejneka (sbcl-devel 2002-01-30), in
 ;;; sbcl-0.7.1 plus his patch (i.e. essentially sbcl-0.7.1.2), the
-;;; compiler barfed on this, blowing up in FIND-IN-PHYSENV looking for
+;;; compiler barfed on this, blowing up in FIND-IN-ENVIRONMENT looking for
 ;;; the LAMBDA-VAR named NUM. That was fixed in sbcl-0.7.1.3.
 (defun parse-num (index)
   (let (num x)
@@ -1007,35 +1007,31 @@
 (defun foo-maybe-inline (x) (quux-marker x))
 
 (with-test (:name :nested-inline-calls)
-  (let ((fun (checked-compile `(lambda (x)
-                               (foo-inline (foo-inline (foo-inline x)))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-INLINE" fun)))
-    (assert (= 3 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+  (let ((fun '(lambda (x) (foo-inline (foo-inline (foo-inline x))))))
+    (assert (= 0 (ctu:count-full-calls 'foo-inline fun)))
+    (assert (= 3 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :nested-maybe-inline-calls)
-  (let ((fun (checked-compile
-              `(lambda (x)
+  (let ((fun `(lambda (x)
                  (declare (optimize (space 0)))
-                 (foo-maybe-inline (foo-maybe-inline (foo-maybe-inline x)))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
-    (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+                 (foo-maybe-inline (foo-maybe-inline (foo-maybe-inline x))))))
+    (assert (= 0 (ctu:count-full-calls 'foo-maybe-inline fun)))
+    (assert (= 1 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :inline-calls)
-  (let ((fun (checked-compile `(lambda (x)
-                                 (list (foo-inline x)
-                                       (foo-inline x)
-                                       (foo-inline x))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-INLINE" fun)))
-    (assert (= 3 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+  (let ((fun `(lambda (x)
+                (list (foo-inline x) (foo-inline x) (foo-inline x)))))
+    (assert (= 0 (ctu:count-full-calls 'foo-inline fun)))
+    (assert (= 3 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :maybe-inline-calls)
-  (let ((fun (checked-compile `(lambda (x)
-                                 (declare (optimize (space 0)))
-                                 (list (foo-maybe-inline x)
-                                       (foo-maybe-inline x)
-                                       (foo-maybe-inline x))))))
-    (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
-    (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
+  (let ((fun `(lambda (x)
+                (declare (optimize (space 0)))
+                (list (foo-maybe-inline x)
+                      (foo-maybe-inline x)
+                      (foo-maybe-inline x)))))
+    (assert (= 0 (ctu:count-full-calls 'foo-maybe-inline fun)))
+    (assert (= 1 (ctu:count-full-calls 'quux-marker fun)))))
 
 (with-test (:name :maybe-inline-let-calls)
   (checked-compile `(lambda (x)
@@ -1045,7 +1041,7 @@
 
 (with-test (:name :bug-405)
   ;; These used to break with a TYPE-ERROR
-  ;;     The value NIL is not of type SB-C::PHYSENV.
+  ;;     The value NIL is not of type SB-C::ENVIRONMENT.
   ;; in MERGE-LETS.
   (ctu:file-compile
    '((LET (outer-let-var)
@@ -1082,7 +1078,16 @@
              (assert (eq 'number (type-error-expected-type e)))
              :error))))))
 
-(with-test (:name :compiled-debug-funs-leak)
+;;; This tested something which is no longer a thing. There was a hash-table
+;;; named *COMPILED-DEBUG-FUNS* which held on to an arbitrary number of code blobs,
+;;; and it was made weak in git rev 9abfd1a2b2 and then removed in rev a2aa5eceb5
+;;; (except for cheneygc - and I'm not entirely sure that there isn't a way to
+;;; remove it from cheneygc as well, but it wasn't interesting).
+;;; So really it's testing nothing, except that maybe it is.
+;;; But the test doesn't pass with parallel-exec because profiling the code causes
+;;; potentially any and every lambda to be retained when a stack sample is taken.
+;;; So I'm not sure whether to delete or disable this. I guess disable.
+(with-test (:name :compiled-debug-funs-leak :fails-on :parallel-test-runner)
   (sb-ext:gc :full t)
   (let ((usage-before (sb-kernel::dynamic-usage)))
     (dotimes (x 10000)
@@ -1166,22 +1171,24 @@
   (assert (every #'=
                  '(-1.0 0.0 0.0 0.0 0.0 -1.0 0.0 0.0 0.0 0.0 -1.0 0.0 0.0 0.0 0.0 1.0)
                  (rotate-around
-                  (make-array 3 :element-type 'single-float) (coerce pi 'single-float))))
+                  (make-array 3 :element-type 'single-float :initial-element 0f0)
+                  (coerce pi 'single-float))))
   ;; Same bug manifests in COMPLEX-ATANH as well.
   (assert (= (atanh #C(-0.7d0 1.1d0)) #C(-0.28715567731069275d0 0.9394245539093365d0))))
 
 (with-test (:name :slot-value-on-structure)
-  (let ((f (checked-compile `(lambda (x a b)
+  (multiple-value-bind (callees f)
+      (ctu:ir1-named-calls  `(lambda (x a b)
                                (declare (something-known-to-be-a-struct x))
                                (setf (slot-value x 'x) a
                                      (slot-value x 'y) b)
                                (list (slot-value x 'x)
-                                     (slot-value x 'y))))))
+                                     (slot-value x 'y))))
     (assert (equal '(#\x #\y)
                    (funcall f
                             (make-something-known-to-be-a-struct :x "X" :y "Y")
                             #\x #\y)))
-    (assert (not (ctu:find-named-callees f)))))
+    (assert (not callees))))
 
 (defclass some-slot-thing ()
   ((slot :initarg :slot)))
@@ -1311,12 +1318,15 @@
 
 (with-test (:name (load-time-value :errors))
   (multiple-value-bind (warn fail)
-      (ctu:file-compile
-       `((defvar *load-time-value-error-value* 10)
-         (declaim (fixnum *load-time-value-error-value*))
-         (defun load-time-value-error-test-1 ()
-           (the list (load-time-value *load-time-value-error-value*))))
-       :load t)
+      (progn
+        (ctu:file-compile
+         `((defvar *load-time-value-error-value* 10)
+           (declaim (fixnum *load-time-value-error-value*)))
+         :load t)
+        (ctu:file-compile
+         `((defun load-time-value-error-test-1 ()
+              (the list (load-time-value *load-time-value-error-value*))))
+         :load t))
     (assert warn)
     (assert fail))
   (handler-case (load-time-value-error-test-1)
@@ -2190,23 +2200,12 @@
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 
-;; named and unnamed
-(defconstant +born-to-coalesce+ '.born-to-coalesce.)
-(test-util:with-test (:name (compile compile-file :coalescing symbol))
-  (multiple-value-bind (file-fun core-fun)
-      (compile2 '(lambda ()
-                  (let ((x (cons +born-to-coalesce+ nil))
-                        (y (cons '.born-to-coalesce. nil)))
-                    (list x y))))
-    (assert (= 1 (count-code-constants '.born-to-coalesce. file-fun)))
-    (assert (= 1 (count-code-constants '.born-to-coalesce. core-fun)))))
-
 ;; some things must retain identity under COMPILE, but we want to coalesce them under COMPILE-FILE
 (defun assert-coalescing (constant)
-  (let ((value (copy-seq (symbol-value constant))))
+  (let ((value (copy-seq constant)))
     (multiple-value-bind (file-fun core-fun)
         (compile2 `(lambda ()
-                     (let ((x (cons ,constant nil))
+                     (let ((x (cons ',constant nil))
                            (y (cons ',value nil)))
                        (list x y))))
       (assert (= 1 (count-code-constants value file-fun)))
@@ -2224,17 +2223,14 @@
                      (equal a b)
                      (not (eq a b))))))))
 
-(defconstant +born-to-coalesce2+ "maybe coalesce me!")
 (test-util:with-test (:name (compile compile-file :coalescing string))
-  (assert-coalescing '+born-to-coalesce2+))
+  (assert-coalescing "maybe coalesce me!"))
 
-(defconstant +born-to-coalesce3+ #*01101001011101110100011)
 (test-util:with-test (:name (compile compile-file :coalescing bit-vector))
-  (assert-coalescing '+born-to-coalesce3+))
+  (assert-coalescing #*01101001011101110100011))
 
-(defconstant +born-to-coalesce4+ '(foo bar "zot" 123 (nested "quux") #*0101110010))
 (test-util:with-test (:name (compile compile-file :coalescing :mixed))
-  (assert-coalescing '+born-to-coalesce4+))
+  (assert-coalescing '(foo bar "zot" 123 (nested "quux") #*0101110010)))
 
 (defclass some-constant-thing () ())
 
@@ -2257,33 +2253,50 @@
 (assert (not (sneak-set-dont-set-me2 13)))
 (assert (typep dont-set-me2 'some-constant-thing))
 
-;;; check that non-trivial constants are EQ across different files: this is
-;;; not something ANSI either guarantees or requires, but we want to do it
-;;; anyways.
-(when (find-symbol "SORT-INLINE-CONSTANTS" "SB-VM")
-  (push :inline-constants *features*))
-(defconstant +share-me-1+ #-inline-constants 123.456d0 #+inline-constants nil)
+;;; Check that non-trivial constants are EQL across different files, as required by the spec:
+;;; From the CLHS glossary (note that `same' without any qualifiers
+;;; means EQL):
+;;; named constant n. a variable that is defined by Common Lisp, by
+;;; the implementation, or by user code (see the macro defconstant) to
+;;; always yield the same value when evaluated. ``The value of a named
+;;; constant may not be changed by assignment or by binding.''
+(defconstant +share-me-1+ 123.456d0)
 (defconstant +share-me-2+ "a string to share")
 (defconstant +share-me-3+ (vector 1 2 3))
 (defconstant +share-me-4+ (* 2 most-positive-fixnum))
-(multiple-value-bind (f1 c1) (compile2 '(lambda () (values +share-me-1+
+(multiple-value-bind (f1 c1) (compile2 `(lambda () (values +share-me-1+
                                                            +share-me-2+
                                                            +share-me-3+
                                                            +share-me-4+
-                                                           #-inline-constants pi)))
-  (multiple-value-bind (f2 c2) (compile2 '(lambda () (values +share-me-1+
+                                                           pi)))
+  (multiple-value-bind (f2 c2) (compile2 `(lambda () (values +share-me-1+
                                                              +share-me-2+
                                                              +share-me-3+
                                                              +share-me-4+
-                                                             #-inline-constants pi)))
+                                                             pi)))
     (flet ((test (fa fb)
              (mapc (lambda (a b)
-                     (assert (eq a b)))
+                     (assert (eql a b)))
                    (multiple-value-list (funcall fa))
                    (multiple-value-list (funcall fb)))))
       (test f1 c1)
       (test f1 f2)
       (test f1 c2))))
+
+;;;; backq const folding tests
+(test-util:with-test (:name :backq-const-named-reference-folding)
+  (ctu:file-compile
+   `((defconstant +izero+ 0)
+     (defconstant +fzero+ 0f0)
+     (defconstant +dzero+ 0d0)
+     (defparameter *dzero* 0d0)
+     (defun test-1 () `(,+izero+ ,+fzero+ ,+dzero+))
+     (defun test-2 () `(,+izero+ ,+fzero+ ,+dzero+ ,*dzero*))
+     (defun test-3 () (list +izero+ +fzero+ +dzero+)))
+   :load t)
+  (assert (equal (test-1) '(0 0.0 0.0d0)))
+  (assert (equal (test-2) '(0 0.0 0.0d0 0.0d0)))
+  (assert (equal (test-3) '(0 0.0 0.0d0))))
 
 ;;; user-defined satisfies-types cannot be folded
 (deftype mystery () '(satisfies mysteryp))
@@ -2466,10 +2479,7 @@
     (assert (equal type1 (sb-kernel:%simple-fun-type g)))
     (assert (equal type0 (sb-kernel:%simple-fun-type h)))))
 
-;;; I think *CHECK-CONSISTENCY* is confused in the presence of dynamic-extent.
-;;; A simpler example not involving package iteration also fails in COMPILE-FILE:
-;;;   (let ((l (mapcar #'string *features*))) (defun g () l))
-(test-util:with-test (:name :bug-308921 :fails-on :sbcl)
+(test-util:with-test (:name :bug-308921)
   (let ((*check-consistency* t))
     (ctu:file-compile
      `((let ((exported-symbols-alist
@@ -2484,18 +2494,19 @@
 
 (test-util:with-test (:name :bug-308941)
   (multiple-value-bind (warn fail)
-      (let ((*check-consistency* t))
-        (ctu:file-compile
-         "(eval-when (:compile-toplevel :load-toplevel :execute)
+      (ctu:file-compile
+       "(eval-when (:compile-toplevel :load-toplevel :execute)
             (defstruct foo3))
           (defstruct bar
             (foo #.(make-foo3)))"
-         :load nil))
+       :load nil)
     ;; ...but the compiler should not break.
     (assert (and warn fail))))
 
 (test-util:with-test (:name :bug-903821)
-  (let* ((fun (test-util:checked-compile
+  (sb-int:binding*
+       (((calls fun)
+          (ctu:ir1-named-calls
                '(lambda (x n)
                  (declare (sb-ext:word x)
                   (type (integer 0 #.(1- sb-vm:n-machine-word-bits)) n)
@@ -2503,8 +2514,7 @@
                  (logandc2 x (ash -1 n)))))
          (thing-not-to-call
           (intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits) "SB-VM")))
-    (assert (not (member (symbol-function thing-not-to-call)
-                         (ctu:find-named-callees fun))))
+    (assert (not (member thing-not-to-call calls)))
     (assert (= 7 (funcall fun 15 3)))))
 
 (test-util:with-test (:name :bug-997528)
@@ -2605,42 +2615,6 @@
     (assert (string= (funcall f)
                      "Weird transform answer is 14"))))
 
-(defun skip-1-passthrough (a b sb-int:&more context count)
-  (declare (ignore a b))
-  (multiple-value-call 'list
-    'start
-    (sb-c:%more-arg-values context 1 (1- (truly-the fixnum count)))
-    'end))
-(defun skip-2-passthrough (a b sb-int:&more context count)
-  (declare (ignore a b))
-  (multiple-value-call 'list
-    'start
-    (sb-c:%more-arg-values context 2 (- (truly-the fixnum count) 2))
-    'end))
-(defun skip-n-passthrough (n-skip n-copy sb-int:&more context count)
-  (assert (>= count (+ n-copy n-skip))) ; prevent crashes
-  (multiple-value-call 'list
-    'start
-    (sb-c:%more-arg-values context n-skip n-copy)
-    'end))
-
-;; %MORE-ARG-VALUES was wrong on x86 and x86-64 with nonzero 'skip'.
-;; It's entirely possible that other backends are also not working.
-(test-util:with-test (:name :more-arg-fancy
-                      :skipped-on :interpreter)
-  (assert (equal (skip-1-passthrough 0 0 'a 'b 'c 'd 'e 'f)
-                 '(start b c d e f end)))
-  (assert (equal (skip-2-passthrough 0 0 'a 'b 'c 'd 'e 'f)
-                 '(start c d e f end)))
-  (assert (equal (skip-n-passthrough 1 5 'a 'b 'c 'd 'e 'f)
-                 '(start b c d e f end)))
-  (assert (equal (skip-n-passthrough 1 5 'a 'b 'c 'd 'e 'f 'g)
-                 '(start b c d e f end)))
-  (assert (equal (skip-n-passthrough 2 5 'a 'b 'c 'd 'e 'f 'g)
-                 '(start c d e f g end)))
-  (assert (equal (skip-n-passthrough 2 5 'a 'b 'c 'd 'e 'f 'g 'h)
-                 '(start c d e f g end))))
-
 (test-util:with-test (:name :macro-policy)
   (flet ((count-notes ()
           (let ((count 0))
@@ -2681,11 +2655,11 @@
      (lambda (arg) (funcall f (funcall g arg)))))
 
 (with-test (:name :coerce-to-function-smarter)
-  (let ((f (checked-compile
+  (let ((calls (ctu:ir1-named-calls
             '(lambda (x)
               (funcall (compose2 #'integerp #'car) x)))))
     ;; should be completely inlined
-    (assert (null (ctu:find-named-callees f)))))
+    (assert (null calls))))
 
 (with-test (:name :derived-function-type-casts)
   (let ((fasl (compile-file "derived-function-type-casts.lisp"
@@ -2777,8 +2751,21 @@
      #'test-case
      `(((function ())                 "(FUNCTION NIL)")
        ((function *)                  "(FUNCTION *)")
-       ((function (function *))       "(FUNCTION (FUNCTION *))")
+       ((function (function t))       "(FUNCTION (FUNCTION T))")
        ((function (function (eql 1))) "(FUNCTION (FUNCTION (EQL 1))")))))
+
+(with-test (:name (:compiler-messages function :lambda-list))
+  ;; Previously, function lambda lists were sometimes printed
+  ;; confusingly, e.g.:
+  ;;
+  ;;   (function collection) => #'COLLECTION
+  ;;   ((function t))        => (#'T)
+  ;;
+  (handler-case
+      (sb-c::parse-lambda-list '((function t) . a) :context 'defmethod)
+    (error (condition)
+      (assert (search "illegal dotted lambda list: ((FUNCTION T) . A)"
+                      (princ-to-string condition))))))
 
 (with-test (:name :boxed-ref-setf-special
             :skipped-on :interpreter)
@@ -3072,4 +3059,206 @@
 (with-test (:name :local-call-context)
   (ctu:file-compile
    "(lambda (&optional b) (declare (type integer b)) b)"
+   :load t))
+
+(defstruct entry-info-type-struct)
+
+(defvar *entry-info-type-struct* (make-entry-info-type-struct))
+
+(defmethod make-load-form ((struct entry-info-type-struct) &optional env)
+  (declare (ignore env))
+  '*entry-info-type-struct*)
+
+(declaim (ftype (function () (member #.*entry-info-type-struct*)) entry-info-type-func))
+
+(with-test (:name :dump-entry-info-type)
+  (ctu:file-compile
+   "(lambda () (entry-info-type-func))"
+   :load t))
+
+(deftype member-abc () '(member #\a #\b #\c))
+(with-test (:name (make-array :initial-element style-warning))
+  (multiple-value-bind (warnp failp)
+      (ctu:file-compile
+       "(defun make-... (len) (make-array len :element-type '(or member-abc condition) :initial-element #\\e))")
+    (assert warnp)
+    (assert (not failp))))
+
+(let ((false #\a)
+      (true #\z))
+  (defun is-probability? (inp)
+    (and (characterp inp) (char<= false inp true)))
+  (deftype probability () '(satisfies is-probability?)))
+(with-test (:name (make-array :initial-element satisfies))
+  (multiple-value-bind (warnp failp)
+      (ctu:file-compile
+       "(defun make-... (len) (make-array len :element-type '(or probability condition) :initial-element #\\e))")
+    (assert (not warnp))
+    (assert (not failp))))
+(with-test (:name (make-sequence :initial-element satisfies))
+  (multiple-value-bind (warnp failp)
+      (ctu:file-compile
+       "(defun make-... (len) (make-sequence '(simple-array (or probability condition) (*)) len :initial-element #\\e))")
+    (assert (not warnp))
+    (assert (not failp))))
+
+;;; Test from git rev 0b39d68b05ef669f812a6bf570126505d931bf96
+;;; I do not understand why, if placed in a '.pure' file, it causes:
+;;;  There is no applicable method for the generic function
+;;;    #<STANDARD-GENERIC-FUNCTION SB-MOP:REMOVE-DIRECT-SUBCLASS (1)>
+;;;  when called with arguments
+;;;    (#<STRUCTURE-CLASS COMMON-LISP:STRUCTURE-OBJECT> NIL).
+;;; when the test runner attempts to purge the classoid namespace
+;;; of test artifacts.
+;;; (It does define structures, but that's supposed to be allowed now)
+(with-test (:name :bug-255)
+  (with-scratch-file (fasl "fasl")
+    (compile-file "bug-255" :output-file fasl))
+  (delete-package :bug255))
+
+(with-test (:name :non-top-level-type-derive)
+  (ctu:file-compile
+   "(defun non-top-level-type-derive () 0)"
+   :load t)
+  (flet ((test (load)
+           (ctu:file-compile
+            "(when nil (defun non-top-level-type-derive () 1))"
+            :load load)
+           (assert (equal (sb-kernel:type-specifier
+                           (sb-int:info :function :type 'non-top-level-type-derive))
+                          '(function () (values (integer 0 0) &optional))))))
+    (test nil)
+    (test t)
+    (assert (eql (funcall 'non-top-level-type-derive) 0)))
+  (ctu:file-compile
+   "(when t (defun non-top-level-type-derive () 1))"
+   :load t)
+  (assert (equal (sb-kernel:type-specifier
+                  (sb-int:info :function :type 'non-top-level-type-derive))
+                 '(function () (values (integer 1 1) &optional))))
+  (assert (eql (funcall 'non-top-level-type-derive) 1)))
+
+(with-test (:name :delete-optional-dispatch-xep)
+  (ctu:file-compile
+   "(defun delete-optional-dispatch-xep (&optional x)
+      (if (= x 0)
+          10
+          (multiple-value-call #'delete-optional-dispatch-xep (1- x))))"
+   :block-compile t ; so the self call is recognized
+   :load t)
+  (assert (= (funcall 'delete-optional-dispatch-xep 3) 10)))
+
+
+(with-test (:name :dx-dont-propagate)
+  (ctu:file-compile
+   `((defmacro generalized-delete (item list test)
+       `(let ((the-list ,list))
+          (flet ((fun (y) (funcall ,test ,item y)))
+            (let ((input the-list))
+              (%%delete-impl #'fun input)))))
+
+     (defmacro %%delete-impl (predicate list)
+       `(let ((dummy (cons nil ,list)))
+          (declare (dynamic-extent dummy))
+          (do* ((prev dummy)
+                (cur (cdr prev) (cdr prev)))
+               ((null cur) (cdr dummy))
+            (if (funcall ,predicate (car cur))
+                (rplacd prev (cdr cur))
+                (pop prev)))))
+
+     (defun foo-assert (test expect actual)
+       (unless (funcall test expect actual)
+         (format t "stack-allocated-p=~S~%" (sb-ext:stack-allocated-p actual))
+         (error "assertion failed")))
+
+     ;; The dummy cons made by the DELETE-IMPL algorithm (using
+     ;; essentially the same technique as many list traversal macros in
+     ;; SBCL such as COLLECT). But The list made by (LIST 1) in this assertion
+     ;; does not want to be dynamic-extent.
+     (foo-assert #'equal (list 1) (generalized-delete 0 (list 1) #'=)))
+   :load t))
+
+(with-test (:name :new-inline-functional-type-conflict)
+  (ctu:file-compile
+   `((declaim (inline inline-fun))
+     (defun inline-fun (x)
+       x)
+
+     (defun new-inline-functional-type-conflict (m)
+       (declare (optimize space)
+                (integer m))
+       (inline-fun m)
+       (inline-fun m)
+       (funcall (if t #'inline-fun) 'a)))
+   :load t)
+  (assert (null (ctu:find-named-callees (symbol-function 'new-inline-functional-type-conflict))))
+  ;; We want to share the functional on space > speed, so we should
+  ;; have 3 code segments: one for
+  ;; NEW-INLINE-FUNCTIONAL-TYPE-CONFLICT's XEP, one for
+  ;; NEW-INLINE-FUNCTIONAL-TYPE-CONFLICT, and one for INLINE-FUN.
+  (assert (= 3 (length (sb-disassem::get-code-segments (sb-kernel::fun-code-header #'new-inline-functional-type-conflict)))))
+  (let ((type (sb-kernel:%simple-fun-type
+               (symbol-function 'new-inline-functional-type-conflict))))
+    ;; Either of these types should be OK.
+    (assert (or (ctype= type
+                        '(function (integer) (values (member a) &optional)))
+                (ctype= type
+                        '(function (integer) (values (or integer (member a)) &optional)))))))
+
+(with-test (:name :new-inline-functional-type-conflict.2)
+  (ctu:file-compile
+   `((declaim (inline inline-fun))
+     (defun inline-fun (x)
+       x)
+
+     (defun new-inline-functional-type-conflict.2 (m)
+       (declare (optimize space))
+       (print (list (inline-fun m)
+                    (inline-fun m)))
+       (funcall (if t #'inline-fun) 'a)))
+   :load t)
+  (assert (equal (ctu:find-named-callees (symbol-function 'new-inline-functional-type-conflict.2))
+                 (list #'print)))
+  ;; We want to share the functional on space > speed, so we should
+  ;; have 3 code segments: one for
+  ;; NEW-INLINE-FUNCTIONAL-TYPE-CONFLICT.2's XEP, one for
+  ;; NEW-INLINE-FUNCTIONAL-TYPE-CONFLICT.2, and one for INLINE-FUN.
+  (assert (= 3 (length (sb-disassem::get-code-segments (sb-kernel::fun-code-header #'new-inline-functional-type-conflict.2)))))
+  ;; We should have no type information from the arguments, because
+  ;; the functional is shared.
+  (let ((type (sb-kernel:%simple-fun-type
+               (symbol-function 'new-inline-functional-type-conflict.2))))
+    (assert (ctype= type '(function (t) (values t &optional))))))
+
+(with-test (:name :new-inline-functional-type-conflict.3)
+  (ctu:file-compile
+   `((declaim (inline inline-fun))
+     (defun inline-fun (x)
+       x)
+
+     (defun new-inline-functional-type-conflict.3 (m)
+       (declare (optimize space))
+       (when (integerp m)
+         (inline-fun m)
+         (inline-fun m)
+         (funcall (if (integerp m) #'inline-fun) 1)))
+     (assert (= (new-inline-functional-type-conflict.3 1) 1)))
+   :load t))
+
+
+(with-test (:name :new-inline-functional-type-conflict.4)
+  (ctu:file-compile
+   `((declaim (inline inline-fun))
+     (defun inline-fun (x)
+       (eval x)
+       t)
+
+     (defun test (m j)
+       (declare (optimize space))
+       (when (integerp m)
+         (inline-fun j)
+         (inline-fun j)
+         (funcall (if (integerp m) #'inline-fun) 2)))
+     (assert (eq (test 1 2) t)))
    :load t))

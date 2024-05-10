@@ -20,19 +20,16 @@
 (in-package "SB-C")
 
 (labels ((functoid-simple-fun (functoid)
+           ;; looks like this is supposed to ignore INTERPRETED-FUNCTION ?
            (typecase functoid
-             (fdefn
-              (functoid-simple-fun (fdefn-fun functoid)))
+             (simple-fun functoid)
              (closure
               (let ((fun (%closure-fun functoid)))
                 (if (and (eq (%fun-name fun) 'sb-impl::encapsulation))
                     (functoid-simple-fun
                      (sb-impl::encapsulation-info-definition
                       (sb-impl::encapsulation-info functoid)))
-                    fun)))
-             ((and function (not funcallable-instance))
-              (%fun-fun functoid)))))
-
+                    fun))))))
   ;;; Note that this function is used by sb-introspect.
   (defun map-simple-funs (function)
     (let ((function (%coerce-callable-to-fun function)))
@@ -41,25 +38,31 @@
                    (funcall function name it))))
         (call-with-each-globaldb-name
          (lambda (name)
-           ;; In general it might be unsafe to call INFO with a NAME
-           ;; that is not valid for the kind of info being retrieved,
-           ;; as when the defaulting function tries to perform a
-           ;; sanity-check. But here it's safe.
-           (awhen (or (info :function :macro-function name)
-                      (info :function :definition name))
-             (cond
-               ((and (fdefn-p it)
-                     (typep (fdefn-fun it) 'generic-function))
-                (loop for method in (sb-mop:generic-function-methods (fdefn-fun it))
-                   for fun = (sb-pcl::safe-method-fast-function method)
-                   when fun do (process (sb-kernel:%fun-name fun) fun)))
-               ;; Methods are already processed above
-               ((and (fdefn-p it)
-                     (typep (fdefn-name it)
-                            '(cons (member sb-pcl::slow-method
-                                           sb-pcl::fast-method)))))
-               (t
-                (process name it))))))))))
+           ;; Methods are processed with their generic function
+           (unless (typep name '(cons (member sb-pcl::slow-method sb-pcl::fast-method)))
+             (let ((f (or (and (symbolp name) (macro-function name))
+                          (and (legal-fun-name-p name) (fboundp name)))))
+               (typecase f
+                 (generic-function
+                  (loop for method in (sb-mop:generic-function-methods f)
+                        for fun = (sb-pcl::safe-method-fast-function method)
+                        when fun do (process (sb-kernel:%fun-name fun) fun)))
+                 (function
+                  (process name f)))))
+           #+sb-xref-for-internals
+           (let ((info (info :function :info name)))
+             (when info
+               (loop for transform in (fun-info-transforms info)
+                     for fun = (transform-function transform)
+                     ;; Defined using :defun-only and a later %deftransform.
+                     unless (symbolp fun)
+                     do (process transform fun))))))
+        #+sb-xref-for-internals
+        (dohash ((name vop) *backend-template-names*)
+          (declare (ignore name))
+          (let ((fun (vop-info-generator-function vop)))
+            (when fun
+              (process vop fun))))))))
 
 ;;; Repack all xref data vectors in the system, potentially making
 ;;; them compact, but without changing their meaning:

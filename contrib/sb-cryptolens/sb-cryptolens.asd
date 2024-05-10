@@ -1,5 +1,7 @@
 ;;; -*-  Lisp -*-
 
+(error "Can't build contribs with ASDF")
+
 (defsystem "sb-cryptolens"
   :version "0.1"
   :depends-on ("asdf")

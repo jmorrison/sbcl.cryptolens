@@ -13,6 +13,21 @@
 
 (cl:in-package :cl-user)
 
+(defun bin-pwd-ignoring-result ()
+  (let ((initially-open-fds (directory "/proc/self/fd/*" :resolve-symlinks nil)))
+    (sb-ext:run-program "pwd" nil :search t :input :stream :output :stream :wait nil)
+    (length initially-open-fds)))
+
+(with-test (:name (run-program :autoclose-streams)
+            :broken-on :sbcl  ;; not reliable enough
+            :skipped-on (not :linux))
+  (let ((n-initially-open-fds (bin-pwd-ignoring-result)))
+    (gc)
+    (sb-sys:scrub-control-stack) ; Make sure we're not referencing the #<process>
+    (gc) ; now nothing should reference the streams
+    (assert (= (length (directory "/proc/self/fd/*" :resolve-symlinks nil))
+               n-initially-open-fds))))
+
 ;; In addition to definitions lower down the impurity we're avoiding
 ;; is the sigchld handler that RUN-PROGRAM sets up, which interfers
 ;; with the manual unix process control done by the test framework
@@ -34,7 +49,7 @@
 (with-test (:name (run-program :cat 2)
                   :skipped-on (or (not :sb-thread) :win32))
   ;; Tests that reading from a FIFO is interruptible.
-  (let* ((process (run-program "/bin/cat" '()
+  (let* ((process (run-program "cat" '() :search t
                                :wait nil :output :stream :input :stream))
          (in (process-input process))
          (out (process-output process))
@@ -152,7 +167,7 @@
   (defparameter *cat-out* (make-synonym-stream '*cat-out-pipe*)))
 
 (with-test (:name (run-program :cat 5) :fails-on :win32)
-  (let ((cat (run-program "/bin/cat" nil :input *cat-in* :output *cat-out*
+  (let ((cat (run-program "cat" nil :search t :input *cat-in* :output *cat-out*
                           :wait nil)))
     (dolist (test '("This is a test!"
                     "This is another test!"
@@ -166,14 +181,13 @@
 ;;; agressive about flushing them. So, here's another test using :PTY.
 
 #-win32
-(with-test (:name :is-/bin/ed-installed?)
-  (assert (probe-file "/bin/ed")))
+(unless (probe-file "/bin/ed") (push :no-bin-ed-installed *features*))
 
 #-win32
 (progn
   (defparameter *tmpfile* (scratch-file-name))
 
-  (with-test (:name (run-program :/bin/ed))
+  (with-test (:name (run-program :/bin/ed) :skipped-on :no-bin-ed-installed)
     (with-open-file (f *tmpfile*
                        :direction :output
                        :if-exists :supersede)
@@ -221,7 +235,8 @@
 
 ;;; This used to crash on Darwin and trigger recursive lock errors on
 ;;; every platform.
-(with-test (:name (run-program :stress))
+;;; ...and now it triggers recursive lock errors on safepoint + linux.
+(with-test (:name (run-program :stress) :skipped-on (:and :sb-safepoint :linux))
   ;; Do it a hundred times in batches of 10 so that with a low limit
   ;; of the number of processes the test can have a chance to pass.
   ;;
@@ -269,7 +284,8 @@
 ;; We can't check for the signal itself since run-program.c resets the
 ;; forked process' signal mask to defaults. But the default is `stop'
 ;; of which we can be notified asynchronously by providing a status hook.
-(with-test (:name (run-program :inherit-stdin) :fails-on :win32)
+(with-test (:name (run-program :inherit-stdin) :fails-on :win32
+                  :skipped-on :no-bin-ed-installed)
   (let (stopped)
     (flet ((status-hook (proc)
              (case (process-status proc)
@@ -294,14 +310,16 @@
   (let ((had-error-p nil))
     (flet ((barf (&optional (format :default))
              (with-output-to-string (stream)
-               (run-program #-netbsd "/usr/bin/perl" #+netbsd "/usr/pkg/bin/perl"
+               (run-program "perl"
                             '("-e" "print \"\\x20\\xfe\\xff\\x0a\"")
+                            :search t
                             :output stream
                             :external-format format)))
            (no-barf ()
              (with-output-to-string (stream)
-               (run-program "/bin/echo"
+               (run-program "echo"
                             '("This is a test")
+                            :search t
                             :output stream))))
       (handler-case
           (barf :utf-8)
@@ -337,9 +355,9 @@
                ;; If the permitted inputs are :ANY then leave it be
                (listp (symbol-value 'run-tests::*allowed-inputs*)))
       (push (namestring file) (symbol-value 'run-tests::*allowed-inputs*)))
-    (assert (null (run-program "/bin/cat" '() :input file)))
-    (assert (null (run-program "/bin/cat" '() :output #.(or *compile-file-truename*
-                                                            *load-truename*)
+    (assert (null (run-program "cat" '() :search t :input file)))
+    (assert (null (run-program "cat" '() :search t :output #.(or *compile-file-truename*
+                                                                 *load-truename*)
                                       :if-output-exists nil)))))
 
 
@@ -417,7 +435,7 @@
 
 (with-test (:name (run-program :malloc-deadlock)
             :broken-on :sb-safepoint
-            :skipped-on (or (not :sb-thread) :win32))
+            :skipped-on (or :ubsan (not :sb-thread) :win32))
   (let* (stop
          (delay-between-gc
           (or #+freebsd
@@ -436,7 +454,8 @@
               0))
          (threads (list*
                    (sb-thread:make-thread (lambda ()
-                                            (loop until stop
+                                            (loop until (progn (sb-thread:barrier (:read))
+                                                               stop)
                                                   do
                                                   (sleep delay-between-gc)
                                                   (gc :full t))))
@@ -444,13 +463,17 @@
                          collect
                          (sb-thread:make-thread
                           (lambda ()
-                            (loop until stop
+                            (loop until (progn (sb-thread:barrier (:read))
+                                               stop)
                                   do (malloc))))))))
-    (loop for time = (get-internal-real-time)
-          for end = (+ time (* internal-time-units-per-second 4)) then end
+    (loop with dot = (get-internal-real-time)
+          with end = (+ dot (* internal-time-units-per-second 4))
+          for time = (get-internal-real-time)
           while (> end time)
           do
-          (when (zerop (mod (- time end) (truncate internal-time-units-per-second 10)))
+          (when (> (- time dot)
+                   (/ internal-time-units-per-second 10))
+            (setf dot time)
             (write-char #\.)
             (finish-output))
           (with-output-to-string (str)
@@ -459,6 +482,7 @@
                          :search t
                          :wait t)))
     (setf stop t)
+    (sb-thread:barrier (:write))
     (mapc #'sb-thread:join-thread threads)))
 
 (with-test (:name (run-program :child-fd-leak)

@@ -16,19 +16,15 @@
 
 (defun record-component-xrefs (component)
   (declare (type component component))
-  (when (policy *lexenv* (zerop store-xref-data))
-    (return-from record-component-xrefs))
-  (do ((block (block-next (component-head component)) (block-next block)))
-      ((null (block-next block)))
-    (let ((start (block-start block)))
+  (unless (policy *lexenv* (zerop store-xref-data))
+    (do-blocks (block component)
       (flet ((handle-node (functional)
                ;; Record xref information for all nodes in the block.
                ;; Note that this code can get executed several times
                ;; for the same block, if the functional is referenced
                ;; from multiple XEPs.
-               (loop for ctran = start then (node-next (ctran-next ctran))
-                     while ctran
-                     do (record-node-xrefs (ctran-next ctran) functional))
+               (do-nodes (node nil block)
+                 (record-node-xrefs node functional))
                ;; Properly record the deferred macroexpansion and source
                ;; transform information that's been stored in the block.
                (loop for (kind what path) in (block-xrefs block)
@@ -51,25 +47,29 @@
                (and (consp name)
                     (member (car name)
                             '(flet labels lambda))))
+             (handle-refs (functional)
+               ;; Recurse only if we haven't already seen the
+               ;; functional.
+               (unless (memq functional seen)
+                 (push functional seen)
+                 (loop for ref in (functional-refs functional)
+                       thereis (handle-functional (node-home-lambda ref)))))
              (handle-functional (functional)
                ;; If a functional looks like a global function (has a
                ;; XEP, isn't a local function or a lambda) record xref
                ;; information for it. Otherwise recurse on the
                ;; home-lambdas of all references to the functional.
-               (when (eq (functional-kind functional) :external)
+               (when (functional-kind-eq functional external)
                  (let ((entry (functional-entry-fun functional)))
                    (when entry
                      (let ((name (functional-debug-name entry)))
-                       (unless (local-function-name-p name)
-                         (return-from handle-functional
-                           (funcall fun entry)))))))
-               ;; Recurse only if we haven't already seen the
-               ;; functional.
-               (unless (member functional seen)
-                 (push functional seen)
-                 (dolist (ref (functional-refs functional))
-                   (handle-functional (node-home-lambda ref))))))
-      (unless (or (eq :deleted (functional-kind functional))
+                       ;; Is it a lambda inside another function?
+                       (when (or (not (local-function-name-p name))
+                                 (not (handle-refs functional)))
+                         (funcall fun entry)
+                         (return-from handle-functional t))))))
+               (handle-refs functional)))
+      (unless (or (functional-kind-eq functional deleted)
                   ;; If the block came from an inlined global
                   ;; function, ignore it.
                   (and (functional-inline-expanded functional)
@@ -79,14 +79,8 @@
 (defun record-node-xrefs (node context)
   (declare (type node node))
   (etypecase node
-    ((or creturn cif entry mv-combination cast exit))
-    (combination
-     ;; Record references to globals made using SYMBOL-VALUE.
-     (let ((fun (principal-lvar-use (combination-fun node)))
-           (arg (car (combination-args node))))
-       (when (and (ref-p fun) (eq 'symeval (leaf-%source-name (ref-leaf fun)))
-                  (constant-lvar-p arg) (symbolp (lvar-value arg)))
-         (record-xref :references (lvar-value arg) context node nil))))
+    ((or creturn cif entry combination mv-combination cast exit
+         enclose combination cdynamic-extent jump-table))
     (ref
      (let ((leaf (ref-leaf node)))
        (typecase leaf
@@ -101,13 +95,14 @@
                (record-xref :calls name context node nil)))))
          ;; Inlined global function
          (clambda
-          (let ((inline-var (functional-inline-expanded leaf)))
-            (when (global-var-p inline-var)
+          (let ((fun (or (lambda-optional-dispatch leaf) leaf)))
+            (when (and (leaf-has-source-name-p fun)
+                       (functional-inline-expanded fun))
               ;; TODO: a WHO-INLINES xref-kind could be useful
-              (record-xref :calls (leaf-debug-name inline-var) context node nil))))
+              (record-xref :calls (leaf-source-name fun) context node nil))))
          ;; Reading a constant
          (constant
-          (record-xref :references (ref-%source-name node) context node nil)))))
+          (record-xref :references (leaf-%source-name leaf) context node nil)))))
     ;; Setting a special variable
     (cset
      (let ((var (set-var node)))
@@ -247,12 +242,14 @@
              (if (< index common-count)
                  (aref **most-common-xref-names-by-index** index)
                  (aref vector (+ index 1 (- common-count))))))))
+  (declare (inline decode-kind-and-count index-and-number-decoder index->name))
 
   ;;; Pack the xref table that was stored for a functional into a more
   ;;; space-efficient form, and return that packed form.
   (defun pack-xref-data (xref-data)
     (unless xref-data (return-from pack-xref-data))
-    (let* ((result (make-array 1 :adjustable t :fill-pointer 1))
+    (let* ((result (make-array 1 :adjustable t :fill-pointer 1
+                                 :initial-element 0))
            (ensure-index (name->index result))
            (entries '())
            (max-index 0)
@@ -287,7 +284,7 @@
              (number-bits (integer-length max-number))
              (encoder (index-and-number-encoder name-bits number-bits))
              (vector (make-array 0 :element-type '(unsigned-byte 8)
-                                 :adjustable t :fill-pointer 0)))
+                                 :adjustable t :fill-pointer 0 :initial-element 0)))
         (write-var-integer name-bits vector)
         (write-var-integer number-bits vector)
         (loop for (kind-number . kind-entries) in entries
@@ -312,6 +309,7 @@
   ;;; of the referenced thing and FORM-NUMBER is the number of the
   ;;; form in which the reference occurred.
   (defun map-packed-xref-data (function xref-data)
+    (declare (dynamic-extent function))
     (let* ((function (coerce function 'function))
            (lookup (index->name xref-data))
            (packed (aref xref-data 0))

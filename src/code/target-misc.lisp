@@ -16,7 +16,7 @@
 
 ;;; This is a tentative list of target features; many are removed later.
 ;;; :SB-XC is removed now, because it is plain wrong unless cross-compiling.
-(defparameter *features* '#.(remove :sb-xc sb-xc:*features*)
+(defvar *features* '#.(remove :sb-xc sb-xc:*features*)
   "a list of symbols that describe features provided by the
    implementation")
 (defconstant !sbcl-architecture #.(sb-cold::target-platform-keyword))
@@ -26,15 +26,16 @@
   #+win32 (sb-win32::get-computer-name)
   #-win32 (truly-the simple-string (sb-unix:unix-gethostname)))
 
-(declaim (type (or null string) *machine-version*))
-(defvar *machine-version*)
+(declaim (type (or null simple-string) *machine-version*))
+(declaim (global *machine-version*))
 
 (defun machine-version ()
   "Return a string describing the version of the computer hardware we
 are running on, or NIL if we can't find any useful information."
-  (unless (boundp '*machine-version*)
-    (setf *machine-version* (get-machine-version)))
-  *machine-version*)
+  (if (boundp '*machine-version*)
+      *machine-version*
+      (setf *machine-version*
+            (awhen (get-machine-version) (possibly-base-stringize it)))))
 
 ;;; FIXME: Don't forget to set these in a sample site-init file.
 ;;; FIXME: Perhaps the functions could be SETFable instead of having the
@@ -42,7 +43,7 @@ are running on, or NIL if we can't find any useful information."
 ;;; from ANSI 11.1.2.1.1 "Constraints on the COMMON-LISP Package
 ;;; for Conforming Implementations" it is kosher to add a SETF function for
 ;;; a symbol in COMMON-LISP..
-(declaim (type (or null string) *short-site-name* *long-site-name*))
+(declaim (type (or null simple-string) *short-site-name* *long-site-name*))
 (define-load-time-global *short-site-name* nil
   "The value of SHORT-SITE-NAME.")
 (define-load-time-global *long-site-name* nil
@@ -118,19 +119,8 @@ the file system."
            (close *dribble-stream*)
            (apply #'install-streams (pop *previous-dribble-streams*)))))
   (values))
-
-;;;; some *LOAD-FOO* variables
-
-(defvar *load-print* nil
-  "the default for the :PRINT argument to LOAD")
-
-(defvar *load-verbose* nil
-  ;; Note that CMU CL's default for this was T, and ANSI says it's
-  ;; implementation-dependent. We choose NIL on the theory that it's
-  ;; a nicer default behavior for Unix programs.
-  "the default for the :VERBOSE argument to LOAD")
-
-;;; DEFmumble helpers
+
+;;;; DEFmumble helpers
 
 (defun %defglobal (name value source-location &optional (doc nil docp))
   (%compiler-defglobal name :always-bound
@@ -170,7 +160,7 @@ the file system."
   (when (and (fboundp name)
              *type-system-initialized*)
     (handler-bind (((satisfies sb-c::handle-condition-p)
-                     #'sb-c::handle-condition-handler))
+                     'sb-c::handle-condition-handler))
       (warn 'redefinition-with-defun :name name :new-function def)))
   (sb-c:%compiler-defun name nil inline-lambda extra-info)
   (setf (fdefinition name) def)
@@ -182,33 +172,38 @@ the file system."
   (sb-c::note-name-defined name :function)
   name)
 
+(macrolet
+    ((cast-it ()
+       #-sb-unicode
+       '(if (and (simple-base-string-p s) (ok-space))
+           s
+           (replace (make-string (length s)) s))
+       #+sb-unicode
+       ;; whether a copy is needed depends both on contents and simplicity
+       '(let* ((base-p (base-string-p s))
+               (recast (and (not base-p) (every #'base-char-p s))))
+          (if (and (simple-string-p s) (not recast) (ok-space))
+              s
+              (let ((n (length s)))
+                ;; I think this could be done with a single allocator
+                ;; and a length calculation. I don't care to do that.
+                (replace (if (or base-p recast)
+                             (make-string n :element-type 'base-char)
+                             (make-string n))
+                         s))))))
+;;; Ensure basicness if possible, and simplicity always
+(defun possibly-base-stringize (s)
+  (declare (string s))
+  (macrolet ((ok-space () 't))
+    (cast-it)))
+;;; As above but copy dynamic-extent or other off-heap lisp strings
+(defun possibly-base-stringize-to-heap (s)
+  (declare (string s) (sb-c::tlab :system))
+  (macrolet ((ok-space () '(or (dynamic-space-obj-p s) (read-only-space-obj-p s))))
+    (cast-it)))
+) ; end MACROLET
+
 (in-package "SB-C")
-
-(defun real-function-name (name)
-  ;; Resolve the actual name of the function named by NAME
-  ;; e.g. (setf (name-function 'x) #'car)
-  ;; (real-function-name 'x) => CAR
-  (cond ((not (fboundp name))
-         nil)
-        ((and (symbolp name)
-              (macro-function name))
-         (let ((name (%fun-name (macro-function name))))
-           (and (consp name)
-                (eq (car name) 'macro-function)
-                (cadr name))))
-        (t
-         (%fun-name (fdefinition name)))))
-
-(defun random-documentation (name type)
-  (cdr (assoc type (info :random-documentation :stuff name))))
-
-(defun (setf random-documentation) (new-value name type)
-  (let ((pair (assoc type (info :random-documentation :stuff name))))
-    (if pair
-        (setf (cdr pair) new-value)
-        (push (cons type new-value)
-              (info :random-documentation :stuff name))))
-  new-value)
 
 (defun split-version-string (string)
   (loop with subversion and start = 0
@@ -250,29 +245,8 @@ version 1[.0.0...] or greater."
               (lisp-implementation-version)
               subversions))))
 
-(defparameter sb-pcl::*!docstrings* nil)
+(defvar sb-pcl::*!docstrings* nil)
 (defun (setf documentation) (string name doc-type)
   (declare (type (or null string) string))
   (push (list string name doc-type) sb-pcl::*!docstrings*)
   string)
-
-(in-package "SB-LOCKLESS")
-(defstruct (list-node
-            (:conc-name nil)
-            (:constructor %make-sentinel-node ())
-            (:copier nil))
-  (%node-next nil))
-
-;;; Specialized list variants will be created for
-;;;  fixnum, integer, real, string, generic "comparable"
-;;; but the node type and list type is the same regardless of key type.
-(defstruct (linked-list
-            (:constructor %make-lfl
-                          (head inserter deleter finder inequality equality))
-            (:conc-name list-))
-  (head       nil :type list-node :read-only t)
-  (inserter   nil :type function :read-only t)
-  (deleter    nil :type function :read-only t)
-  (finder     nil :type function :read-only t)
-  (inequality nil :type function :read-only t)
-  (equality   nil :type function :read-only t))

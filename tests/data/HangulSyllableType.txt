@@ -1,10 +1,11 @@
-# HangulSyllableType-7.0.0.txt
-# Date: 2013-11-27, 09:54:39 GMT [MD]
+# HangulSyllableType-15.0.0.txt
+# Date: 2022-02-02, 23:35:41 GMT
+# © 2022 Unicode®, Inc.
+# Unicode and the Unicode Logo are registered trademarks of Unicode, Inc. in the U.S. and other countries.
+# For terms of use, see https://www.unicode.org/terms_of_use.html
 #
 # Unicode Character Database
-# Copyright (c) 1991-2013 Unicode, Inc.
-# For terms of use, see http://www.unicode.org/terms_of_use.html
-# For documentation, see http://www.unicode.org/reports/tr44/
+#   For documentation, see https://www.unicode.org/reports/tr44/
 
 # ================================================
 

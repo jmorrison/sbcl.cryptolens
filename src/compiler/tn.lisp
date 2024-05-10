@@ -32,11 +32,11 @@
        ,inner (progn ,@body)
               (if (setq ,tn (tn-next ,tn)) (go ,inner) (go ,outer)))))
 
-(defun set-ir2-physenv-live-tns (value instance)
-  (setf (ir2-physenv-live-tns instance) value))
+(defun set-ir2-environment-live-tns (value instance)
+  (setf (ir2-environment-live-tns instance) value))
 
-(defun set-ir2-physenv-debug-live-tns (value instance)
-  (setf (ir2-physenv-debug-live-tns instance) value))
+(defun set-ir2-environment-debug-live-tns (value instance)
+  (setf (ir2-environment-debug-live-tns instance) value))
 
 (defun set-ir2-component-alias-tns (value instance)
   (setf (ir2-component-alias-tns instance) value))
@@ -70,9 +70,10 @@
                     (t
                      (delete-1 tn prev setter))))))
              (used-p (tn)
-               (or (tn-reads tn) (tn-writes tn)
-                   (member (tn-kind tn) '(:component :environment))
-                   (not (zerop (sbit aliases (tn-number tn))))))
+               (and (neq (tn-kind tn) :unused)
+                    (or (tn-reads tn) (tn-writes tn)
+                        (member (tn-kind tn) '(:component :environment))
+                        (not (zerop (sbit aliases (tn-number tn)))))))
              (delete-1 (tn prev setter)
                (if prev
                    (setf (tn-next prev) (tn-next tn))
@@ -81,14 +82,14 @@
                (case (tn-kind tn)
                  (:environment
                   (clear-live tn
-                              #'ir2-physenv-live-tns
-                              #'set-ir2-physenv-live-tns))
+                              #'ir2-environment-live-tns
+                              #'set-ir2-environment-live-tns))
                  (:debug-environment
                   (clear-live tn
-                              #'ir2-physenv-debug-live-tns
-                              #'set-ir2-physenv-debug-live-tns))))
+                              #'ir2-environment-debug-live-tns
+                              #'set-ir2-environment-debug-live-tns))))
              (clear-live (tn getter setter)
-               (let ((env (physenv-info (tn-physenv tn))))
+               (let ((env (environment-info (tn-environment tn))))
                  (funcall setter (delete tn (funcall getter env)) env))))
       (declare (inline used-p delete-some delete-1 clear-live))
       (delete-some #'ir2-component-alias-tns
@@ -170,24 +171,24 @@
   (make-tn (incf (ir2-component-global-tn-counter (component-info *component-being-compiled*)))
            :unused nil nil))
 
-;;; Make TN be live throughout PHYSENV. Return TN. In the DEBUG case,
-;;; the TN is treated normally in blocks in the environment which
+;;; Make TN be live throughout ENV. Return TN. In the DEBUG case, the
+;;; TN is treated normally in blocks in the environment which
 ;;; reference the TN, allowing targeting to/from the TN. This results
 ;;; in move efficient code, but may result in the TN sometimes not
 ;;; being live when you want it.
-(defun physenv-live-tn (tn physenv)
-  (declare (type tn tn) (type physenv physenv))
+(defun environment-live-tn (tn env)
+  (declare (type tn tn) (type environment env))
   (aver (eq (tn-kind tn) :normal))
   (setf (tn-kind tn) :environment)
-  (setf (tn-physenv tn) physenv)
-  (push tn (ir2-physenv-live-tns (physenv-info physenv)))
+  (setf (tn-environment tn) env)
+  (push tn (ir2-environment-live-tns (environment-info env)))
   tn)
-(defun physenv-debug-live-tn (tn physenv)
-  (declare (type tn tn) (type physenv physenv))
+(defun environment-debug-live-tn (tn env)
+  (declare (type tn tn) (type environment env))
   (aver (eq (tn-kind tn) :normal))
   (setf (tn-kind tn) :debug-environment)
-  (setf (tn-physenv tn) physenv)
-  (push tn (ir2-physenv-debug-live-tns (physenv-info physenv)))
+  (setf (tn-environment tn) env)
+  (push tn (ir2-environment-debug-live-tns (environment-info env)))
   tn)
 
 ;;; Make TN be live throughout the current component. Return TN.
@@ -221,16 +222,19 @@
 ;;; EMIT-MOVES-AND-COERCIONS. That's wasteful.
 (defun make-constant-tn (constant &optional force-boxed)
   (declare (type constant constant))
-  (or (leaf-info constant)
+  (or (and (tn-p (leaf-info constant))
+           (leaf-info constant))
       (multiple-value-bind (immed null-offset)
           (immediate-constant-sc (constant-value constant))
         ;; currently NULL-OFFSET is used only on ARM64
         (if null-offset
-            (setf (leaf-info constant)
-                  (component-live-tn
-                   (make-wired-tn (primitive-type (leaf-type constant))
-                                  immed
-                                  null-offset)))
+            (let ((tn (component-live-tn
+                       (make-wired-tn (primitive-type (leaf-type constant))
+                                      immed
+                                      null-offset
+                                      (specifier-type 'null)))))
+              (setf (tn-leaf tn) constant
+                    (leaf-info constant) tn))
             (let* ((boxed (or (not immed)
                               (boxed-immediate-sc-p immed)))
                    (component (component-info *component-being-compiled*))
@@ -249,10 +253,13 @@
               ;; because liveness depends on pointer tracing without looking at code-fixups.
               (when (and sc
                          (or (not immed)
+                             #+permgen (typep (constant-value constant) 'layout)
                              #+immobile-space
                              (let ((val (constant-value constant)))
                                (or (and (symbolp val) (not (sb-vm:static-symbol-p val)))
-                                   (typep val 'layout)))))
+                                   (typep val 'layout))))
+                         #+(or arm64 x86-64)
+                         (not (eql (constant-value constant) $0f0)))
                 (let ((constants (ir2-component-constants component)))
                   (setf (tn-offset res)
                         (vector-push-extend constant constants))))
@@ -263,6 +270,23 @@
               (setf (tn-leaf res) constant)
               res)))))
 
+;;; Extracted from above
+(defun constant-sc (constant)
+  (if (leaf-info constant)
+      (tn-sc (leaf-info constant))
+      (multiple-value-bind (immed null-offset)
+          (immediate-constant-sc (constant-value constant))
+        (if null-offset
+            immed
+            (let ((boxed (or (not immed)
+                             (boxed-immediate-sc-p immed))))
+              (cond (boxed
+                     (if immed
+                         (svref *backend-sc-numbers* immed)
+                         (sc-or-lose 'constant)))
+                    (t
+                     (sc-or-lose 'constant))))))))
+
 (defun make-load-time-value-tn (handle type)
   (let* ((component (component-info *component-being-compiled*))
          (sc (svref *backend-sc-numbers*
@@ -271,7 +295,9 @@
          (constants (ir2-component-constants component)))
     (setf (tn-offset res) (fill-pointer constants)
           (tn-type res) type)
-    (vector-push-extend (list :load-time-value handle res) constants)
+    ;; The third list element served no purpose as far as I can discern.
+    ;; Perhaps it was for debugging?
+    (vector-push-extend (list :load-time-value handle #|res|#) constants)
     (push-in tn-next res (ir2-component-constant-tns component))
     res))
 
@@ -307,7 +333,9 @@
     (do ((i 1 (1+ i)))
         ((= i (length constants))
          (setf (tn-offset res) i)
-         (vector-push-extend (list kind info res) constants))
+         ;; The third list element served no purpose as far as I can discern.
+         ;; Perhaps it was for debugging?
+         (vector-push-extend (list kind info #|res|#) constants))
       (let ((entry (aref constants i)))
         (when (and (consp entry)
                    (eq (car entry) kind)
@@ -322,20 +350,46 @@
 
 ;;;; TN referencing
 
+(defmacro link-tn-ref (write-p tn ref)
+  `(cond (,write-p
+          (let ((w (tn-writes ,tn)))
+            (when w
+              (setf (tn-ref-prev w) ,ref))
+            (setf (tn-ref-next ref) w
+                  (tn-writes tn) ,ref)))
+         (t
+          (let ((r (tn-reads ,tn)))
+            (when r
+              (setf (tn-ref-prev r) ,ref))
+            (setf (tn-ref-next ,ref) r
+                  (tn-reads tn) ,ref)))))
+
 ;;; Make a TN-REF that references TN and return it. WRITE-P should be
 ;;; true if this is a write reference, otherwise false. All we do
 ;;; other than calling the constructor is add the reference to the
 ;;; TN's references.
 (defun reference-tn (tn write-p)
   (declare (type tn tn) (type boolean write-p))
-  (let ((res (make-tn-ref tn write-p)))
+  (let ((ref (make-tn-ref tn write-p)))
     (unless (eql (tn-kind tn) :unused)
       (when (tn-primitive-type tn)
-        (aver (setf (tn-ref-type res) (tn-type tn))))
-      (if write-p
-          (push-in tn-ref-next res (tn-writes tn))
-          (push-in tn-ref-next res (tn-reads tn))))
-    res))
+        (aver (setf (tn-ref-type ref) (tn-type tn))))
+      (link-tn-ref write-p tn ref))
+    ref))
+
+(defun reference-tn-refs (refs write-p)
+  (when refs
+    (let* ((first (reference-tn (tn-ref-tn refs) write-p))
+           (prev first))
+      (setf (tn-ref-type first) (tn-ref-type refs))
+      (loop for tn-ref = (tn-ref-across refs) then (tn-ref-across tn-ref)
+            while tn-ref
+            do
+            (let ((ref (reference-tn (tn-ref-tn tn-ref) write-p)))
+              (setf (tn-ref-across prev) ref
+                    (tn-ref-type ref) (tn-ref-type tn-ref))
+              (setq prev ref)))
+      first)))
 
 ;;; Make TN-REFS to reference each TN in TNs, linked together by
 ;;; TN-REF-ACROSS. WRITE-P is the WRITE-P value for the refs. MORE is
@@ -354,13 +408,39 @@
         first)
       more))
 
+;;; Copy the tn-ref-type of the TNs.
+(defun reference-tn-ref-list (tn-refs write-p &optional more)
+  (declare (list tn-refs) (type boolean write-p) (type (or tn-ref null) more))
+  (if tn-refs
+      (let* ((first (reference-tn (tn-ref-tn (first tn-refs)) write-p))
+             (prev first))
+        (setf (tn-ref-type first) (tn-ref-type (first tn-refs)))
+        (dolist (tn-ref (rest tn-refs))
+          (let ((res (reference-tn (tn-ref-tn tn-ref) write-p)))
+            (setf (tn-ref-across prev) res
+                  (tn-ref-type res) (tn-ref-type tn-ref))
+            (setq prev res)))
+        (setf (tn-ref-across prev) more)
+        first)
+      more))
+
 ;;; Remove Ref from the references for its associated TN.
 (defun delete-tn-ref (ref)
   (declare (type tn-ref ref))
-  (if (tn-ref-write-p ref)
-      (deletef-in tn-ref-next (tn-writes (tn-ref-tn ref)) ref)
-      (deletef-in tn-ref-next (tn-reads (tn-ref-tn ref)) ref))
-  (values))
+  (let ((tn (tn-ref-tn ref))
+        (prev (tn-ref-prev ref))
+        (next (tn-ref-next ref)))
+    (cond ((tn-ref-write-p ref)
+           (if prev
+               (setf (tn-ref-next prev) next)
+               (setf (tn-writes tn) next)))
+          (t
+           (if prev
+               (setf (tn-ref-next prev) next)
+               (setf (tn-reads tn) next))))
+    (when next
+      (setf (tn-ref-prev next) prev))
+    (setf (tn-ref-prev ref) nil)))
 
 ;;; Do stuff to change the TN referenced by Ref. We remove Ref from its
 ;;; old TN's refs, add ref to TN's refs, and set the TN-REF-TN.
@@ -368,10 +448,8 @@
   (declare (type tn-ref ref) (type tn tn))
   (delete-tn-ref ref)
   (setf (tn-ref-tn ref) tn)
-  (if (tn-ref-write-p ref)
-      (push-in tn-ref-next ref (tn-writes tn))
-      (push-in tn-ref-next ref (tn-reads tn)))
-  (values))
+  (link-tn-ref (tn-ref-write-p ref) tn ref)
+  nil)
 
 ;;;; miscellaneous utilities
 

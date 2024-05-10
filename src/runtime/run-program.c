@@ -13,7 +13,12 @@
  * files for more information.
  */
 
-#include "sbcl.h"
+#ifdef __linux__
+/* glibc won't give us close_range without this */
+#define _GNU_SOURCE
+#endif
+
+#include "genesis/sbcl.h"
 #include <stdlib.h>
 #include <sys/file.h>
 #include <sys/types.h>
@@ -27,6 +32,7 @@
 #include <termios.h>
 #include <errno.h>
 #include <dirent.h>
+#include <sys/syscall.h>
 #include "interr.h" // for lose()
 
 #ifdef LISP_FEATURE_OPENBSD
@@ -96,20 +102,6 @@ set_pty(char *pty_name)
 
 #endif /* !LISP_FEATURE_OPENBSD */
 
-void closefrom_fallback(int lowfd)
-{
-    int fd, maxfd;
-
-#ifdef SVR4
-    maxfd = sysconf(_SC_OPEN_MAX)-1;
-#else
-    maxfd = getdtablesize()-1;
-#endif
-
-    for (fd = maxfd; fd >= lowfd; fd--)
-        close(fd);
-}
-
 int closefrom_fddir(char *dir, int lowfd)
 {
     DIR *d;
@@ -133,22 +125,48 @@ int closefrom_fddir(char *dir, int lowfd)
     return 0;
 }
 
+void closefds_range(unsigned int first, unsigned int last)
+{
+    int fds_closed = 0;
+    // Try using close_range syscall first.
+#if defined(LISP_FEATURE_OS_PROVIDES_CLOSE_RANGE_WRAPPER)
+    // Prefer the libc wrapper, if it exists at build time.
+    fds_closed = !close_range(first, last, 0);
+#elif defined(LISP_FEATURE_LINUX) && defined(__NR_close_range)
+    // Use syscall(2) if we could detect the syscall number at build time.
+    fds_closed = !syscall(__NR_close_range, first, last, 0);
+#endif
+    // Otherwise (if the syscall information isn't availble at build time or if
+    // the run time kernel doesn't support the syscall), fall back to close()
+    // in a for loop.
+    if (!fds_closed)
+    {
+        unsigned int close_fd;
+        if (last == ~0U)
+        {
+#if defined SVR4 || defined LISP_FEATURE_ANDROID
+            last = sysconf(_SC_OPEN_MAX)-1;
+#else
+            last = getdtablesize()-1;
+#endif
+        }
+        for (close_fd = first; close_fd <= last; close_fd++)
+        {
+            close(close_fd);
+        }
+    }
+}
+
 void closefds_from(int lowfd, int* dont_close)
 {
     if (dont_close) {
-        /* dont_close is a sorted simple-array of ints */
+        /* dont_close is a sorted simple-array of tagged ints */
         uword_t length = fixnum_value(((uword_t*)dont_close)[-1]);
         uword_t i;
         for (i = 0; i < length; i++)
         {
             int fd = dont_close[i];
-            int close_fd;
-
-            /* Close the gaps between the fds */
-            for (close_fd = lowfd; close_fd < fd; close_fd++)
-            {
-                close(close_fd);
-            }
+            closefds_range(lowfd, fd - 1);
             lowfd = fd+1;
         }
     }
@@ -172,7 +190,7 @@ void closefds_from(int lowfd, int* dont_close)
 */
 
     if (!fds_closed)
-        closefrom_fallback(lowfd);
+        closefds_range(lowfd, ~0U);
 #endif
 }
 
@@ -214,6 +232,81 @@ int wait_for_exec(int pid, int channel[2]) {
 }
 
 extern char **environ;
+
+
+#ifdef LISP_FEATURE_OS_PROVIDES_POSIX_SPAWN
+
+#include <spawn.h>
+int pspawn(char *program, char *argv[], int sin, int sout, int serr,
+          int search, char *envp[], __attribute__((unused)) char *pty_name,
+          __attribute__((unused)) char *pwd, __attribute__((unused)) int* dont_close)
+{
+    pid_t pid;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    short flags = POSIX_SPAWN_SETSIGMASK;
+
+    posix_spawn_file_actions_init(&actions);
+    posix_spawnattr_init(&attr);
+
+    sigset_t sset;
+    sigemptyset(&sset);
+
+    posix_spawnattr_setsigmask(&attr, &sset);
+
+    if (sin >= 0) {
+        posix_spawn_file_actions_adddup2(&actions, sin, 0);
+        flags |= POSIX_SPAWN_SETPGROUP;
+    } else
+    {
+#ifdef LISP_FEATURE_DARWIN
+        posix_spawn_file_actions_addinherit_np(&actions, 0);
+#endif
+    }
+    if (sout >= 0)
+        posix_spawn_file_actions_adddup2(&actions, sout, 1);
+    else
+    {
+#ifdef LISP_FEATURE_DARWIN
+        posix_spawn_file_actions_addinherit_np(&actions, 1);
+#endif
+    }
+    if (serr >= 0)
+        posix_spawn_file_actions_adddup2(&actions, serr, 2);
+    else
+    {
+#ifdef LISP_FEATURE_DARWIN
+        posix_spawn_file_actions_addinherit_np(&actions, 2);
+#endif
+    }
+
+#ifdef LISP_FEATURE_DARWIN
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#elif defined LISP_FEATURE_LINUX
+    posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#endif
+
+    posix_spawnattr_setflags(&attr, flags);
+
+    int ret;
+
+    if (search)
+        ret = posix_spawnp(&pid, program, &actions, &attr, argv, envp);
+    else
+        ret = posix_spawn(&pid, program, &actions, &attr, argv, envp);
+
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+
+    if (ret) {
+        errno = ret;
+        return -2;
+    }
+
+    return pid;
+}
+#endif
+
 int spawn(char *program, char *argv[], int sin, int sout, int serr,
           int search, char *envp[], char *pty_name,
           int channel[2],
@@ -222,11 +315,6 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
     pid_t pid;
     sigset_t sset;
     int failure_code = 2;
-
-    channel[0] = -1;
-    channel[1] = -1;
-    // Surely we can do better than to lose()
-    if (pipe(channel)) lose("can't run-program");
 
     pid = fork();
     if (pid) {
@@ -315,4 +403,3 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
     }
     _exit(failure_code);
 }
-

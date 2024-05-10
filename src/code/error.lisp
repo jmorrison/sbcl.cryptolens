@@ -21,7 +21,7 @@
            (dynamic-extent arguments))
   (cond ((and (%instancep datum)
               (let ((layout (%instance-layout datum)))
-                (and (logtest +condition-layout-flag+ (layout-flags layout))
+                (and (logtest (layout-flags layout) +condition-layout-flag+)
                      ;; An invalid layout will drop into the (MAKE-CONDITION) branch
                      ;; which rightly fails because ALLOCATE-CONDITION asserts that
                      ;; the first argument is a condition-designator, which it won't be.
@@ -55,10 +55,6 @@
 (sb-xc:defmacro %handler-bind (bindings form &environment env)
   (unless bindings
     (return-from %handler-bind form))
-  ;; As an optimization, this looks at the handler parts of BINDINGS
-  ;; and turns handlers of the forms (lambda ...) and (function
-  ;; (lambda ...)) into local, dynamic-extent functions.
-  ;;
   ;; Type specifiers in BINDINGS which name classoids are parsed
   ;; into the classoid, otherwise are translated local TYPEP wrappers.
   ;;
@@ -69,43 +65,39 @@
   ;; is one dx cons cell for the whole cluster.
   ;; Otherwise it takes 1+2N cons cells where N is the number of bindings.
   ;;
-  (collect ((local-functions) (cluster-entries) (dummy-forms))
+  (collect ((cluster-entries) (dummy-forms))
     (flet ((const-cons (test handler)
              ;; If possible, render HANDLER as a load-time constant so that
              ;; consing the test and handler is also load-time constant.
-             (let ((quote (car handler))
-                   (name (cadr handler)))
-               (cond ((and (eq quote 'function)
-                           (or (assq name (local-functions))
-                               (sb-c::fun-locally-defined-p name env)))
-                      `(cons ,(case (car test)
-                                ((named-lambda function) test)
-                                (t `(load-time-value ,test t)))
-                             (the (function-designator (condition)) ,handler)))
-                     ((info :function :info name) ; known
-                      ;; This takes care of CONTINUE,ABORT,MUFFLE-WARNING.
-                      ;; #' will be evaluated in the null environment.
-                      `(load-time-value
-                        (cons ,test (the (function-designator (condition)) #',name))
-                        t))
-                     (t
-                      ;; For each handler specified as #'F we must verify
-                      ;; that F is fboundp upon entering the binding scope.
-                      ;; Referencing #'F is enough to ensure a warning if the
-                      ;; function isn't defined at compile-time, but the
-                      ;; compiler considers it elidable unless something forces
-                      ;; an apparent use of the form at runtime,
-                      ;; so instead use SAFE-FDEFN-FUN on the fdefn.
-                      (when (eq (car handler) 'function)
-                        (dummy-forms `(sb-c:safe-fdefn-fun
-                                       (load-time-value
-                                        (find-or-create-fdefn ',name) t))))
-                      ;; Resolve to an fdefn at load-time.
-                      `(load-time-value
-                        (cons ,test (find-or-create-fdefn
-                                     (the (function-designator (condition)) ',name)))
-                        t)))))
-
+             (if (and (listp handler)
+                      (memq (car handler) '(quote function))
+                      (not (sb-c::fun-locally-defined-p (cadr handler) env))
+                      (legal-fun-name-p (cadr handler)))
+                 ;; The CLHS writeup of HANDLER-BIND says "Exceptional Situations: None."
+                 ;; which might suggest that it's not an error if #'HANDLER is un-fboundp
+                 ;; on entering the body, but we should check in safe code.
+                 (let ((name (cadr handler)))
+                   (cond ((info :function :info name) ; known
+                          ;; This takes care of CONTINUE,ABORT,MUFFLE-WARNING.
+                          ;; #' will be evaluated in the null environment.
+                          `(load-time-value (cons ,test (the (function (condition)) #',name))
+                                            t))
+                         (t
+                          (when (eq (car handler) 'function)
+                            ;; Referencing #'F is enough to get a compile-time warning about unknown
+                            ;; functions, but the use itself is flushable, so employ SAFE-FDEFN-FUN.
+                            (dummy-forms `#',name)
+                            (when (sb-c:policy env (= safety 3))
+                              (dummy-forms `(sb-c:safe-fdefn-fun
+                                             (load-time-value
+                                              (find-or-create-fdefn ',name) t)))))
+                          `(load-time-value
+                            (cons ,test (the (function-designator (condition)) ',name))
+                            t))))
+                 `(cons ,(case (car test)
+                           ((named-lambda function) test)
+                           (t `(load-time-value ,test t)))
+                        (the (function-designator (condition)) ,handler))))
            (const-list (items)
              ;; If the resultant list is (LIST (L-T-V ...) (L-T-V ...) ...)
              ;; then pull the L-T-V outside.
@@ -132,24 +124,19 @@
                        ;; whether you wrote T or CONDITION, this is
                        ;; always an eligible handler.
                        '#'constantly-t)
-                      ((typep type '(cons (eql satisfies) (cons t null)))
-                       ;; (SATISFIES F) => #'F but never a local
-                       ;; definition of F.  The predicate is used only
-                       ;; if needed - it's not an error if not fboundp
-                       ;; (though dangerously stupid) - so just
-                       ;; reference #'F for the compiler to see the
-                       ;; use of the name.  But (KLUDGE): since the
-                       ;; ref is to force a compile-time effect, the
-                       ;; interpreter should not see that form,
-                       ;; because there is no way for it to perform an
-                       ;; unsafe ref, (and it wouldn't signal a
-                       ;; style-warning anyway), and so it would
-                       ;; actually fail immediately if predicate were
-                       ;; not defined.
+                      ((typep type '(cons (eql satisfies) (cons symbol null)))
+                       ;; (SATISFIES F) => #'F but never a local definition of F.
+                       ;; The predicate is used only if needed - it's not an error if not
+                       ;; fboundp (though dangerously stupid) - so reference #'F for the
+                       ;; compiler to see the use of the name.  But (KLUDGE): since the
+                       ;; ref is to force a compile-time effect, the interpreter should not
+                       ;; see that form, because there is no way for it to perform an
+                       ;; unsafe ref, and it wouldn't signal a style-warning anyway.
                        (let ((name (second type)))
-                         (when (typep env 'lexenv)
-                           (dummy-forms `#',name))
-                         `(find-or-create-fdefn ',name)))
+                         ;; FIXME: if you've locally flet NAME (why would you do that?)
+                         ;; then this does not notice the use of the global function.
+                         (when (typep env 'lexenv) (dummy-forms `#',name))
+                         `',name))
                       ((and (symbolp type)
                             (condition-classoid-p (find-classoid type nil)))
                        ;; It's debatable whether we need to go through
@@ -162,38 +149,30 @@
                        `(named-lambda (%handler-bind ,type) (c)
                           (declare (optimize (sb-c:verify-arg-count 0)))
                           (typep c ',type))))
-                ;; Compute the handler expression.
-                ;; Unless the expression is ({FUNCTION|QUOTE} <sym>), then create a
-                ;; new local function. If the supplied handler is spelled
-                ;; (LAMBDA ...) or #'(LAMBDA ...), then the local function is the
-                ;; lambda but named. If not spelled as such, the function funcalls
-                ;; the user's sexpr so that the compiler enforces callable-ness.
-                (if (typep handler '(cons (member function quote) (cons symbol null)))
-                    handler
-                    (let ((lexpr
-                           (typecase handler
-                             ;; These two are merely expansion prettifiers,
-                             ;; and not strictly necessary.
-                             ((cons (eql function) (cons (cons (eql lambda)) null))
-                              (cadr handler))
-                             ((cons (eql lambda))
-                              handler)
-                             (t
-                              ;; Should be (THE (FUNCTION-DESIGNATOR (CONDITION)))
-                              ;; but the cast kills DX allocation.
-                              `(lambda (c) (funcall ,handler c)))))
-                          (name (let ((*gensym-counter*
-                                       (length (cluster-entries))))
-                                  (sb-xc:gensym "H"))))
-                      (local-functions `(,name ,@(rest lexpr)))
-                      `#',name))))))))
-
-      `(dx-flet ,(local-functions)
+                ;; If the supplied handler is spelled (LAMBDA ...) or
+                ;; #'(LAMBDA ...), then insert a declaration to elide
+                ;; arg checking.
+                ;;
+                ;; KLUDGE: This should really be done in a cleaner way.
+                (let ((lambda-expression
+                        (typecase handler
+                          ((cons (eql function) (cons (cons (eql lambda)) null))
+                           (cadr handler))
+                          ((cons (eql lambda))
+                           handler))))
+                  (if lambda-expression
+                      `(lambda ,(cadr lambda-expression)
+                         (declare (sb-c::source-form ,binding))
+                         ,@(when (typep (cadr lambda-expression) '(cons t null))
+                             '((declare (sb-c::local-optimize (sb-c::verify-arg-count 0)))))
+                         ,@(cddr lambda-expression))
+                      handler))))))))
+      `(let ((*handler-clusters*
+               (cons ,(const-list (cluster-entries))
+                     *handler-clusters*)))
+         (declare (dynamic-extent *handler-clusters*))
          ,@(dummy-forms)
-         (dx-let ((*handler-clusters*
-                   (cons ,(const-list (cluster-entries))
-                         *handler-clusters*)))
-           ,form)))))
+         ,form))))
 
 (sb-xc:defmacro handler-bind (bindings &body forms)
   "(HANDLER-BIND ( {(type handler)}* ) body)
@@ -235,7 +214,7 @@ specification."
                (annotated-cases
                  (mapcar (lambda (case)
                            (with-current-source-form (case)
-                             (with-unique-names (tag fun)
+                             (with-unique-names (block fun)
                                (destructuring-bind (type ll &body body) case
                                  (unless (and (listp ll)
                                               (symbolp (car ll))
@@ -244,51 +223,122 @@ specification."
                                           ll))
                                  (multiple-value-bind (body declarations)
                                      (parse-body body nil)
-                                   (push `(,fun ,ll ,@declarations (progn ,@body)) local-funs))
-                                 (list tag type ll fun)))))
+                                   (push `(,fun ,ll
+                                                (declare (sb-c::source-form ,case))
+                                                ,@declarations
+                                                (progn ,@body))
+                                         local-funs))
+                                 (list block type ll fun)))))
                          cases)))
-          (with-unique-names (block cell form-fun)
-            `(dx-flet ((,form-fun ()
-                         #-x86 (progn ,form) ;; no declarations are accepted
-                         ;; Need to catch FP errors here!
-                         #+x86 (multiple-value-prog1 ,form (float-wait)))
-                       ,@(reverse local-funs))
-               (declare (optimize (sb-c::check-tag-existence 0)))
-               (block ,block
-                 ;; KLUDGE: We use a dx CONS cell instead of just assigning to
-                 ;; the variable directly, so that we can stack allocate
-                 ;; robustly: dx value cells don't work quite right, and it is
-                 ;; possible to construct user code that should loop
-                 ;; indefinitely, but instead eats up some stack each time
-                 ;; around.
-                 (dx-let ((,cell (cons :condition nil)))
-                   (declare (ignorable ,cell))
-                   (tagbody
-                      (%handler-bind
-                       ,(mapcar (lambda (annotated-case)
-                                  (destructuring-bind (tag type ll fun-name) annotated-case
-                                    (declare (ignore fun-name))
-                                    (list type
-                                          `(lambda (temp)
-                                             ,(if ll
-                                                  `(setf (cdr ,cell) temp)
-                                                  '(declare (ignore temp)))
-                                             (go ,tag)))))
-                                annotated-cases)
-                       (return-from ,block (,form-fun)))
-                      ,@(mapcan
-                         (lambda (annotated-case)
-                           (destructuring-bind (tag type ll fun-name) annotated-case
-                             (declare (ignore type))
-                             (list tag
-                                   `(return-from ,block
-                                      ,(if ll
-                                           `(,fun-name (cdr ,cell))
-                                           `(,fun-name))))))
-                         annotated-cases))))))))))
+          (with-unique-names (block form-fun)
+            (let ((body `(%handler-bind
+                          ,(mapcar (lambda (annotated-case)
+                                     (destructuring-bind (block type ll fun-name) annotated-case
+                                       (declare (ignore fun-name))
+                                       (list type
+                                             `(lambda (temp)
+                                                ,@(unless ll
+                                                    `((declare (ignore temp))))
+                                                (return-from ,block
+                                                  ,@(and ll '(temp)))))))
+                                   annotated-cases)
+                          (return-from ,block (,form-fun)))))
+              (labels ((wrap (cases)
+                         (if cases
+                             (destructuring-bind (fun-block type ll fun-name) (car cases)
+                               (declare (ignore type))
+                               `(return-from ,block
+                                  ,(if ll
+                                       `(,fun-name (block ,fun-block
+                                                     ,(wrap (cdr cases))))
+                                       `(progn (block ,fun-block
+                                                 ,(wrap (cdr cases)))
+                                               (,fun-name)))))
+                             body)))
+                `(dx-flet ((,form-fun ()
+                          #-x86 (progn ,form) ;; no declarations are accepted
+                          ;; Need to catch FP errors here!
+                          #+x86 (multiple-value-prog1 ,form (float-wait)))
+                        ,@(reverse local-funs))
+                   (declare (inline ,form-fun
+                                    ,@(mapcar #'car local-funs)))
+                   (block ,block
+                     ,(wrap annotated-cases))))))))))
 
 (sb-xc:defmacro ignore-errors (&rest forms)
   "Execute FORMS handling ERROR conditions, returning the result of the last
   form, or (VALUES NIL the-ERROR-that-was-caught) if an ERROR was handled."
   `(handler-case (progn ,@forms)
      (error (condition) (values nil condition))))
+
+;;; Condition slot access - needs DYNAMIC-SPACE-OBJ-P which needs misc-aliens
+;;; which isn't available in target-error.
+#-sb-xc-host
+(labels
+    ((atomic-acons (condition key val alist)
+       ;; Force new conses to the heap if instance is arena-allocated
+       (cas (condition-assigned-slots condition)
+            alist
+            (if (dynamic-space-obj-p condition)
+                (locally (declare (sb-c::tlab :system)) (acons key val alist))
+                (acons key val alist))))
+     (initval (instance slot classoid operation)
+       (let ((instance-length (%instance-length instance)))
+         (do ((i (+ sb-vm:instance-data-start 1) (+ i 2)))
+             ((>= i instance-length)
+              (find-slot-default instance classoid slot
+                                 (eq operation 'slot-boundp)))
+           (when (memq (%instance-ref instance i) (condition-slot-initargs slot))
+             (return (%instance-ref instance (1+ i)))))))
+     (%get (condition name operation)
+       ;; Shared code for CONDITION-SLOT-VALUE and CONDITION-SLOT-BOUNDP.
+       ;; First look for a slot with :CLASS allocation
+       (let ((classoid (layout-classoid (%instance-layout condition))))
+         (dolist (cslot (condition-classoid-class-slots classoid))
+           (when (eq (condition-slot-name cslot) name)
+             (return-from %get (car (condition-slot-cell cslot)))))
+         (let* ((alist (condition-assigned-slots condition))
+                (cell (assq name alist)))
+           (when cell (return-from %get (cdr cell)))
+           ;; find the slot definition or else signal an error
+           (let* ((slot (or (find-condition-class-slot classoid name)
+                            (return-from %get
+                              (values (slot-missing (classoid-pcl-class classoid)
+                                                    condition name 'slot-value)))))
+                  (val (initval condition slot classoid operation)))
+             (loop
+               (let ((old (atomic-acons condition name val alist)))
+                 (when (eq old alist) (return val))
+                 (setq alist old cell (assq name alist))
+                 (when cell (return (cdr cell))))))))))
+
+  ;; This is a stupid argument order. Shouldn't NEW-VALUE be first ?
+  (defun set-condition-slot-value (condition new-value name)
+    (dolist (cslot (condition-classoid-class-slots
+                    (layout-classoid (%instance-layout condition))))
+      (when (eq (condition-slot-name cslot) name)
+        (return-from set-condition-slot-value
+          (setf (car (condition-slot-cell cslot)) new-value))))
+    ;; Apparently this does not care that there might not exist a slot named NAME
+    ;; in the class, at least in this function. It seems to be handled
+    ;; at a higher level of the slot access protocol.
+    (let ((alist (condition-assigned-slots condition)))
+      (loop
+       (let ((cell (assq name alist)))
+         (when cell
+           (return (setf (cdr cell) new-value))))
+        (let ((old (atomic-acons condition name new-value alist)))
+          (if (eq old alist) (return new-value) (setq alist old))))))
+
+  (defun condition-slot-value (condition name)
+    (let ((value (%get condition name 'slot-value)))
+      (if (unbound-marker-p value)
+          (let ((class (classoid-pcl-class (layout-classoid (%instance-layout condition)))))
+            (values (slot-unbound class condition name)))
+          value)))
+
+  (defun condition-slot-boundp (condition name)
+    (not (unbound-marker-p (%get condition name 'slot-boundp))))
+
+  (defun condition-slot-makunbound (condition name)
+    (set-condition-slot-value condition sb-pcl:+slot-unbound+ name)))

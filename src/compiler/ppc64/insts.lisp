@@ -457,13 +457,10 @@
 (def-ppc-iformat (x-4 '(:name :tab rt))
   rt (xo xo21-30))
 
-(def-ppc-iformat (x-5 '(:name :tab ra "," rs "," rb))
+(def-ppc-iformat (x-5 '(:name :tab rs "," ra "," rb))
   rs ra rb (xo xo21-30) rc)
 
-(def-ppc-iformat (x-7 '(:name :tab ra "," rs "," rb))
-  rs ra rb (xo xo21-30))
-
-(def-ppc-iformat (x-8 '(:name :tab ra "," rs "," nb))
+(def-ppc-iformat (x-8 '(:name :tab rs "," ra "," nb))
   rs ra nb (xo xo21-30))
 
 (def-ppc-iformat (x-9 '(:name :tab ra "," rs "," sh))
@@ -493,7 +490,7 @@
 (def-ppc-iformat (x-22 '(:name :tab frt))
   frt (xo xo21-30) rc)
 
-(def-ppc-iformat (x-23 '(:name :tab ra "," frs "," rb))
+(def-ppc-iformat (x-23 '(:name :tab frs "," ra "," rb))
   frs ra rb (xo xo21-30))
 
 (def-ppc-iformat (x-24 '(:name :tab bt))
@@ -1473,9 +1470,12 @@
 
   (macrolet ((def (mnemonic op Rc)
                `(define-instruction ,mnemonic (segment ra rs sh m)
-                  (:declare (type (integer 0 63) sh m))
+                  (:declare (type (integer 0 63) sh) (type (or (integer 0 63) fixup) m))
                   (:printer md-form ((op 30) (subop ,op) (rc ,rc)))
                   (:emitter
+                   (when (and (fixup-p m) (eq (fixup-flavor m) :card-table-index-mask))
+                     (note-fixup segment :rldic-m m)
+                     (setq m 0))
                    (emit-md-form-inst segment 30
                                       (reg-tn-encoding rs) (reg-tn-encoding ra)
                                       (ldb (byte 5 0) sh)
@@ -2232,6 +2232,7 @@
   (:delay 0)
   (:emitter
    (etypecase word
+     #-64-bit
      (fixup
       (note-fixup segment :absolute word)
       (emit-word segment 0))
@@ -2243,6 +2244,7 @@
   (:delay 0)
   (:emitter
    (etypecase dword
+     #+64-bit
      (fixup
       (note-fixup segment :absolute dword)
       (emit-dword segment 0))
@@ -2401,12 +2403,13 @@
     (ecase kind
       (:absolute
        ;; There is an implicit addend currently stored in the fixup location.
-       (incf (sap-ref-32 sap offset) value))
-      (:absolute64
-       (incf (sap-ref-64 sap offset) value))
+       (incf (sap-ref-word sap offset) value))
       (:layout-id
        (aver (zerop (sap-ref-32 sap offset)))
        (setf (signed-sap-ref-32 sap offset) (the layout-id value)))
+      (:rldic-m ; This is the M (mask) immediate operand to RLDIC{L,R} which
+       ;; appears in (byte 6 5) of the instruction. See EMIT-MD-FORM-INST.
+       (setf (ldb (byte 6 5) (sap-ref-32 sap offset)) (encode-mask6 (- 64 value))))
       (:b
        (error "Can't deal with CALL fixups, yet."))
       (:ba
@@ -2428,13 +2431,15 @@
              (ldb (byte 16 0) value)))))
   nil)
 
-(define-instruction store-coverage-mark (segment path-index temp)
+(define-instruction store-coverage-mark (segment mark-index temp)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
    (let ((offset (+ (component-header-length)
-                    n-word-bytes ; skip over jump table word
-                    path-index
+                    ;; skip over jump table word and entries
+                    (* (1+ (component-n-jump-table-entries))
+                       n-word-bytes)
+                    mark-index
                     (- code-tn-lowtag))))
      (inst* segment 'stb sb-vm::null-tn sb-vm::code-tn
             (etypecase offset

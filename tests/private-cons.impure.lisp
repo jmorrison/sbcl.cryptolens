@@ -31,10 +31,14 @@
   (alien-funcall (extern-alien "gc_private_free" (function void unsigned))
                  list))
 
-#+gencgc
+(progn
+(defun page-words-used (index)
+  (ash (slot (deref sb-vm::page-table index) 'sb-vm::words-used*) -1))
+(defun page-need-to-zero (index)
+  (oddp (slot (deref sb-vm::page-table index) 'sb-vm::words-used*)))
 (defun test-private-consing ()
   (let ((conses-per-page ; subtract one for the page header cons
-         (1- (/ sb-vm:gencgc-card-bytes (* 2 sb-vm:n-word-bytes))))
+         (1- (/ sb-vm:gencgc-page-bytes (* 2 sb-vm:n-word-bytes))))
         (counter 0)
         (pages)
         (recycle-me))
@@ -42,17 +46,15 @@
       (let* ((cons (private-list (incf counter)))
              (index (sb-vm::find-page-index cons))
              (base-address
-              (+ sb-vm:dynamic-space-start (* index sb-vm:gencgc-card-bytes)))
+              (+ sb-vm:dynamic-space-start (* index sb-vm:gencgc-page-bytes)))
              (final))
         (push index pages)
         (assert (= cons (+ base-address (* 2 sb-vm:n-word-bytes))))
-        ;; bytes-used should correspond to 2 conses,
-        ;; and the dirty flag should be 1.
-        (assert (= (slot (deref sb-vm::page-table index) 'sb-vm::bytes-used)
-                   (logior (* 4 sb-vm:n-word-bytes) 1)))
+        ;; words-used should be 4, for 2 conses,
+        (assert (= (page-words-used index) 4))
         (dotimes (i (1- conses-per-page))
           (setq final (private-list (incf counter))))
-        (assert (= final (+ base-address sb-vm:gencgc-card-bytes
+        (assert (= final (+ base-address sb-vm:gencgc-page-bytes
                             (* -2 sb-vm:n-word-bytes))))
         (push final recycle-me)))
     (dolist (list recycle-me)
@@ -65,36 +67,10 @@
         (assert (= (sb-vm::find-page-index (sb-sys:sap-int sap))
                    (pop pages)))))
     (alien-funcall (extern-alien "gc_dispose_private_pages" (function void)))
-    ;; Each of the pages should have zero bytes used and need-to-zero = 1
+    ;; Each of the pages should have zero words used and need-to-zero = 1
     (dolist (index pages)
-      (assert (= (slot (deref sb-vm::page-table index) 'sb-vm::bytes-used) 1)))))
-
-#-gencgc
-(defun test-private-consing ()
-  (let ((conses-per-chunk ; subtract one for the chunk header cons
-         (1- (/ 4096 (* 2 sb-vm:n-word-bytes)))) ; 4096 = CHUNKSIZE
-        (counter 0)
-        (chain))
-    (dotimes (i 5) ; 5 = number of times to invoke malloc()
-      (push nil chain)
-      ;; Use up the chunk, which happens in descending address order.
-      ;; So the last cons allocated is nearest the head of the chunk.
-      (dotimes (i conses-per-chunk)
-        (let ((list (private-list (incf counter))))
-          (setf (car chain) list)))
-      ;; The malloc() result was 1 cons below the lowest cons
-      ;; return by the suballocator.
-      (decf (car chain) (* 2 sb-vm:n-word-bytes)))
-    ;; Test that there are 5 chunks on which to invoke free()
-    (let ((len 0))
-      (loop (unless chain (return))
-            (assert (= (sb-sys:sap-ref-word (sb-sys:int-sap (car chain))
-                                            sb-vm:n-word-bytes)
-                       (or (cadr chain) 0)))
-            (incf len)
-            (pop chain))
-      (assert (= len 5))))
-  (alien-funcall (extern-alien "gc_dispose_private_pages" (function void))))
+      (assert (page-need-to-zero index))
+      (assert (= (page-words-used index) 0))))))
 
 ;;; These tests disable GC because the private cons allocator
 ;;; assumes exclusive use of the page table, and moreover if GC

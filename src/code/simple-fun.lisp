@@ -14,8 +14,7 @@
 ;;; Underlying SIMPLE-FUN
 (defun %fun-fun (function)
   (declare (function function))
-  ;; It's too bad that TYPECASE isn't able to generate equivalent code.
-  (case (fun-subtype function)
+  (case (%fun-pointer-widetag function)
     (#.sb-vm:closure-widetag
      (%closure-fun function))
     (#.sb-vm:funcallable-instance-widetag
@@ -39,51 +38,52 @@
   (logand (ash (function-header-word f) (- sb-vm:n-widetag-bits))
           sb-vm:short-header-max-words))
 
-(macrolet ((%closure-index-set (closure index val)
-             ;; Use the identical convention as %CLOSURE-INDEX-REF for the index.
-             ;; There are no closure slot setters, and in fact SLOT-SET
-             ;; does not exist in a variant that takes a non-constant index.
-             `(setf (sap-ref-lispobj (int-sap (get-lisp-obj-address ,closure))
-                                     (+ (ash sb-vm:closure-info-offset sb-vm:word-shift)
-                                        (ash ,index sb-vm:word-shift)
-                                        (- sb-vm:fun-pointer-lowtag)))
-                    ,val))
-           (closure-header-word (closure)
-             `(sap-ref-word (int-sap (get-lisp-obj-address ,closure))
-                            (- sb-vm:fun-pointer-lowtag)))
-           (new-closure (len)
-             #-(or x86 x86-64)
-             `(sb-vm::%alloc-closure ,len (%closure-fun closure))
-             #+(or x86 x86-64)
+(defmacro closure-len->nvalues (length)
+  `(- ,length (1- sb-vm:closure-info-offset)))
+
+;; Return T if and only if CLOSURE has extra values that are physically
+;; in a padding slot of the object and not in the external hash-table.
+(defun closure-has-extra-values-slot-p (closure)
+  (declare (closure closure))
+  (and (logtest (function-header-word closure) closure-extra-data-indicator)
+       (evenp (get-closure-length closure))))
+
+(macrolet ((new-closure (nvalues)
+             ;; argument is the number of INFO words
+             #-(or x86 x86-64 arm64)
+             `(sb-c::maybe-with-system-tlab (closure)
+               (sb-vm::%alloc-closure ,nvalues (%closure-fun closure)))
+             #+(or x86 x86-64 arm64)
              `(with-pinned-objects ((%closure-fun closure))
                 ;; %CLOSURE-CALLEE manifests as a fixnum which remains
                 ;; valid across GC due to %CLOSURE-FUN being pinned
                 ;; until after the new closure is made.
-                (sb-vm::%alloc-closure ,len (sb-vm::%closure-callee closure))))
-           (copy-slots (extra-bit)
-             `(progn
-                (loop with sap = (int-sap (get-lisp-obj-address copy))
-                      for i from 0 below (1- payload-len)
-                      for ofs from (- (ash 2 sb-vm:word-shift) sb-vm:fun-pointer-lowtag)
-                      by sb-vm:n-word-bytes
-                      do (setf (sap-ref-lispobj sap ofs) (%closure-index-ref closure i)))
-                (setf (closure-header-word copy) ; Update the header
-                      ;; Closure copy lost its high header bits, so OR them in again.
-                      (logior #+(and immobile-space 64-bit sb-thread)
-                              (sap-int (sb-vm::current-thread-offset-sap
-                                        sb-vm::thread-function-layout-slot))
-                              #+(and immobile-space 64-bit (not sb-thread))
-                              (get-lisp-obj-address sb-vm:function-layout)
-                              (function-header-word copy)
-                              ,extra-bit)))))
+                (sb-c::maybe-with-system-tlab (closure)
+                 (sb-vm::%alloc-closure ,nvalues (sb-vm::%closure-callee closure)))))
+           (copy-slots (has-extra-data)
+             `(do ((j 0 (1+ j)))
+                  ((>= j nvalues)
+                   (with-pinned-objects (copy)
+                     (let ((sap (sap+ (int-sap (get-lisp-obj-address copy))
+                                      (- sb-vm:fun-pointer-lowtag))))
+                       (declare (ignorable sap))
+                       ,@(when has-extra-data
+                           `((setf (sap-ref-word sap 0)
+                                   (logior (function-header-word copy)
+                                           closure-extra-data-indicator))))
+                       #+compact-instance-header ; copy the layout
+                       (setf (sap-ref-32 sap 4) ; ASSUMPTION: little-endian
+                             (logior (get-lisp-obj-address ,(find-layout 'function)))))))
+                (%closure-index-set copy j (%closure-index-ref closure j)))))
 
   ;; This is factored out because of a cutting-edge implementation
   ;; of tracing wrappers that I'm trying to finish.
   (defun copy-closure (closure)
     (declare (closure closure))
-    (let* ((payload-len (get-closure-length (truly-the function closure)))
-           (copy (new-closure (1- payload-len))))
-      (with-pinned-objects (copy) (copy-slots 0))
+    (let* ((nvalues (closure-len->nvalues
+                     (get-closure-length (truly-the function closure))))
+           (copy (new-closure nvalues)))
+      (copy-slots nil)
       copy))
 
   ;;; Assign CLOSURE a new name and/or docstring in VALUES, and return the
@@ -96,17 +96,15 @@
   ;;;     then a copy of the closure with extra slots reduces to case (1).
   (defun set-closure-extra-values (closure permit-copy data)
     (declare (closure closure))
-    (let ((payload-len (get-closure-length (truly-the function closure)))
-          (extendedp (logtest (function-header-word closure)
-                              closure-extra-data-indicator)))
-      (when (and (not extendedp) permit-copy (oddp payload-len))
-        ;; PAYLOAD-LEN includes the trampoline, so the number of slots we would
-        ;; pass to %ALLOC-CLOSURE is 1 less than that, were it not for
-        ;; the fact that we actually want to create 1 additional slot.
-        ;; So in effect, asking for PAYLOAD-LEN does exactly the right thing.
-        (let ((copy (new-closure payload-len)))
+    (let* ((len (get-closure-length (truly-the function closure)))
+           (nvalues (closure-len->nvalues len))
+           (has-padding-slot (evenp len))
+           (extendedp (logtest (function-header-word closure)
+                               closure-extra-data-indicator)))
+      (when (and (not extendedp) (not has-padding-slot) permit-copy)
+        (let ((copy (new-closure (1+ nvalues))))
           (with-pinned-objects (copy)
-            (copy-slots closure-extra-data-indicator)
+            (copy-slots t)
             ;; We copy only if there was no padding, which means that adding 1 slot
             ;; physically adds 2 slots. You might think that the added data go in the
             ;; first new slot, followed by padding. Nope! Take an example of a
@@ -121,17 +119,20 @@
             ;; CLOSURE-EXTRA-VALUES always reads 1 word past the stated payload size
             ;; regardless of whether the closure really captured the implied
             ;; number of closure values.
-            (%closure-index-set copy payload-len data)
+            (%closure-index-set copy (1+ nvalues) data)
             (return-from set-closure-extra-values copy))))
       (unless (with-pinned-objects (closure)
                 (unless extendedp ; Set the header bit
-                  (setf (closure-header-word closure)
+                  (setf (sap-ref-word (int-sap (get-lisp-obj-address closure))
+                                      (- sb-vm:fun-pointer-lowtag))
                         (logior (function-header-word closure)
                                 closure-extra-data-indicator)))
-                (when (evenp payload-len)
-                  (%closure-index-set closure (1- payload-len) data)
+                (when has-padding-slot
+                  (%closure-index-set closure nvalues data)
                   t))
-        (setf (gethash closure **closure-extra-values**) data)))
+        (if (unbound-marker-p data)
+            (remhash closure **closure-extra-values**)
+            (setf (gethash closure **closure-extra-values**) data))))
     closure))
 
 (defun pack-closure-extra-values (name docstring)
@@ -158,40 +159,21 @@
     ;; an even-length payload takes the last slot for the name,
     ;; and an odd-length payload uses the global hashtable.
   (declare (closure closure))
-  (let ((header-word (function-header-word closure)))
-      (if (not (logtest header-word closure-extra-data-indicator))
-          (values unbound unbound)
-          (let* ((len (logand (ash header-word (- sb-vm:n-widetag-bits))
-                              sb-vm:short-header-max-words))
-                 (data
-                  (if (oddp len)
-                      ;; Boxed length odd implies total length even which implies
-                      ;; no extra slot in which to store ancillary data.
-                      (gethash closure **closure-extra-values** 0)
-                      ;; GET-CLOSURE-LENGTH counts the 'fun' slot in the length,
-                      ;; but %CLOSURE-INDEX-REF starts indexing from the value slots.
-                      (%closure-index-ref closure (1- len)))))
-            ;; There can be a concurrency glitch, because the 'extended' flag is
-            ;; toggled to indicate that extra data are present before the data
-            ;; are written; so there's a window where NAME looks like 0. That could
-            ;; be fixed in the setter, or caught here, but it shouldn't matter.
+  (if (logtest (function-header-word closure) closure-extra-data-indicator)
+      (let* ((len (get-closure-length closure))
+             ;; See examples in doc/internals-notes/closure
+             (data (if (evenp len) ; has padding slot
+                       (%closure-index-ref closure (closure-len->nvalues len))
+                       ; No padding slot
+                       (gethash closure **closure-extra-values** 0))))
             (typecase data
+             ((eql 0) (values unbound unbound))
              ((cons t (or string null (satisfies unbound-marker-p)))
               (values (car data) (cdr data)))
              ;; NIL represents an explicit docstring of NIL, not the name.
              ((or string null) (values unbound data))
-             (t (values data unbound)))))))
-
-;; Return T if and only if CLOSURE has extra values that are physically
-;; in the padding slot of the object and not in the external hash-table.
-(defun closure-has-extra-values-slot-p (closure)
-  (declare (closure closure))
-  (let ((header-word (function-header-word closure)))
-    (and (logtest header-word closure-extra-data-indicator)
-         ;; If the boxed payload length is even, adding the header makes it odd,
-         ;; so there's a padding slot for alignment to an even total word count.
-         ;; i.e. if the least-significant bit of the size field is 0, there's padding.
-         (not (logbitp sb-vm:n-widetag-bits header-word)))))
+             (t (values data unbound))))
+      (values unbound unbound)))
 
 (defconstant +closure-name-index+ 0)
 (defconstant +closure-doc-index+ 1)
@@ -206,7 +188,7 @@
 ;;; (i.e., the third value returned from CL:FUNCTION-LAMBDA-EXPRESSION),
 ;;; or NIL if there's none
 (defun %fun-name (function)
-  (case (fun-subtype function)
+  (case (%fun-pointer-widetag function)
     (#.sb-vm:closure-widetag
      (let ((val (nth-value +closure-name-index+ (closure-extra-values function))))
        (unless (unbound-marker-p val)
@@ -226,7 +208,7 @@
   (%simple-fun-name (%fun-fun function)))
 
 (defun (setf %fun-name) (new-value function)
-  (case (fun-subtype function)
+  (case (%fun-pointer-widetag function)
     (#.sb-vm:closure-widetag
      (set-closure-name (truly-the closure function) nil new-value))
     (#.sb-vm:simple-fun-widetag
@@ -310,7 +292,7 @@
                           ((not simple-vector) info))))
     ;; For backward-compatibility we expand SFUNCTION -> FUNCTION.
     (if (and (listp internal-type) (eq (car internal-type) 'sfunction))
-        (sb-ext:typexpand-1 internal-type)
+        (values (sb-ext:typexpand-1 internal-type))
         internal-type)))
 
 (defun %simple-fun-xrefs (fun)
@@ -319,13 +301,35 @@
       ((cons t simple-vector) (cdr info))
       (simple-vector info))))
 
-(defun %fun-type (function)
+(defun %fun-ftype (function)
   (typecase function
     #+sb-fasteval
     ;; Obtain a list of the right shape, usually with T for each
     ;; arg type, but respecting local declarations if any.
-    (interpreted-function (sb-interpreter:%fun-type function))
+    (interpreted-function (sb-interpreter:%fun-ftype function))
     (t (%simple-fun-type (%fun-fun function)))))
+
+(defun sb-c::ftype-from-definition (name)
+  (let ((function (fboundp name)))
+    (cond
+      ((not function)
+       (specifier-type 'function))
+      ((and (symbolp name) (macro-function name))
+       ;; this seems to be called often on macros
+       ;; what's the right answer ???
+       ;; (warn "ftype-from-fdefn called on macro ~s" name)
+       (specifier-type '(function (t t) t)))
+      (t
+        ;; Never signal the PARSE-UNKNOWN-TYPE condition.
+        ;; This affects 2 regression tests, both very contrived:
+        ;;  - in defstruct.impure ASSERT-ERROR (BUG127--FOO (MAKE-BUG127-E :FOO 3))
+        ;;  - in compiler.impure at :IDENTIFY-SUSPECT-VOPS
+        (let* ((ftype (%fun-ftype function))
+               (context
+                (sb-kernel::make-type-context
+                 ftype nil sb-kernel::+type-parse-signal-inhibit+)))
+          (declare (dynamic-extent context))
+          (values (sb-kernel::basic-parse-typespec ftype context)))))))
 
 ;;; Return the lambda expression for SIMPLE-FUN if compiled to memory
 ;;; and rentention of forms was enabled via the EVAL-STORE-SOURCE-FORM policy
@@ -370,20 +374,17 @@
 
 ;;;; CODE-COMPONENT
 
-(defun %code-debug-info (code-obj)
-  ;; Extract the unadulterated debug-info emitted by the compiler. The slot
-  ;; value might be a cons of that and info stuffed in by the debugger.
-  (let ((info (sb-vm::%%code-debug-info code-obj)))
-    (if (and (listp info) (%instancep (car info)))
-        (car info)
-        ;; return it unchanged in all other cases
-        info)))
+;;; software mark bits on pages of code require that all assignments to
+;;; header slots go through the CODE-HEADER-SET vop,
+;;; which is slightly different from the general soft card mark implementation
+;;; for historical reasons.
+(defun (setf %code-debug-info) (newval code)
+  (setf (code-header-ref code sb-vm:code-debug-info-slot) newval)
+  newval)
 
-(declaim (inline code-obj-is-filler-p))
-(defun code-obj-is-filler-p (code-obj)
-  ;; See also HOLE-P in the allocator (same thing but using SAPs)
-  ;; and filler_obj_p() in the C code
-  (eql (sb-vm::%code-boxed-size code-obj) 0))
+(defun (setf sb-vm::%code-fixups) (newval code)
+  (setf (code-header-ref code sb-vm::code-fixups-slot) newval)
+  newval)
 
 #+(or sparc ppc64)
 (defun code-trailer-ref (code offset)
@@ -392,20 +393,18 @@
                 (+ (code-object-size code) offset (- sb-vm:other-pointer-lowtag)))))
 
 ;;; The last 'uint16' in the object holds the trailer length (see 'src/runtime/code.h')
-;;; but do not attempt to read it if the object is a filler.
 (declaim (inline code-trailer-len))
 (defun code-trailer-len (code-obj)
-  (if (code-obj-is-filler-p code-obj)
-      0
-      (let ((word (code-trailer-ref code-obj -4)))
-        ;; TRAILER-REF returns 4-byte quantities. Extract a two-byte quantity.
-        #+little-endian (ldb (byte 16 16) word)
-        #+big-endian    (ldb (byte 16  0) word))))
+  (let ((word (code-trailer-ref code-obj -4)))
+    ;; TRAILER-REF returns 4-byte quantities. Extract a two-byte quantity.
+    #+little-endian (ldb (byte 16 16) word)
+    #+big-endian    (ldb (byte 16  0) word)))
 
 ;;; The fun-table-count is a uint16_t immediately preceding the trailer length
 ;;; containing two subfields:
-;;;  12 bits for the number of simple-funs in the code component
-;;;   4 bits for the number of pad bytes added to align the fun-offset-table
+;;;  11 bits for the number of simple-funs in the code component
+;;;   5 bits for the number of pad bytes added to align the fun-offset-table
+;;; See also code_n_funs() in code.h
 (declaim (inline code-fun-table-count))
 (defun code-fun-table-count (code-obj)
   (if (eql (code-trailer-len code-obj) 0)
@@ -419,26 +418,31 @@
 ;;; Keep in sync with C function code_n_funs()
 (defun code-n-entries (code-obj)
   (declare (type code-component code-obj))
-  (ash (code-fun-table-count code-obj) -4))
+  (ash (code-fun-table-count code-obj) -5))
 
-;;; Index to start of named-call fdefns
-;;; FIXME: Naming symmetry between this and code-n-named-calls might be nice.
-(defun code-fdefns-start-index (code-obj)
-  (+ sb-vm:code-constants-offset
-     (* (code-n-entries code-obj) sb-vm:code-slots-per-simple-fun)))
-
-;;; Number of "called" fdefns, which does not count fdefns in the boxed
-;;; constants that are used in #'FUN syntax without a funcall necessarily
-;;; occuring, though it may.
-(defun code-n-named-calls (code-obj)
-  (ash (sb-vm::%code-boxed-size code-obj)
-       (+ -32 sb-vm:n-fixnum-tag-bits)))
+;;; Start and count of fdefns used in #'F synax or normal named call
+;;; (i.e. at the head of an expression)
+(defun code-header-fdefn-range (code-obj)
+  #-64-bit ; inefficient
+  (let ((start (+ sb-vm:code-constants-offset
+                  (* (code-n-entries code-obj) sb-vm:code-slots-per-simple-fun)))
+        (count 0))
+    (do ((i start (1+ i))
+         (limit (code-header-words code-obj)))
+        ((= i limit))
+      (if (fdefn-p (code-header-ref code-obj i)) (incf count) (return)))
+    (values start count))
+  #+64-bit
+  (values (+ sb-vm:code-constants-offset
+             (* (code-n-entries code-obj) sb-vm:code-slots-per-simple-fun))
+          (ash (sb-vm::%code-boxed-size code-obj)
+               (+ -32 sb-vm:n-fixnum-tag-bits))))
 
 ;;; Return the offset in bytes from (CODE-INSTRUCTIONS CODE-OBJ)
 ;;; to its FUN-INDEXth function.
 (declaim (inline %code-fun-offset))
 (defun %code-fun-offset (code-obj fun-index)
-  (declare ((unsigned-byte 12) fun-index))
+  (declare ((unsigned-byte 11) fun-index))
   (code-trailer-ref code-obj (* -4 (+ fun-index 2))))
 
 ;;; Subtract from %CODE-CODE-SIZE the number of trailing data bytes which aren't
@@ -456,11 +460,12 @@
 (defun %code-text-size (code-obj)
   (- (%code-code-size code-obj)
      (code-trailer-len code-obj)
-     ;; Subtract between 0 and 15 bytes of padding
-     (logand (code-fun-table-count code-obj) #xf)))
+     ;; Subtract between 0 and 31 bytes of padding
+     (logand (code-fun-table-count code-obj) #x1f)))
 
 (defun %code-entry-point (code-obj fun-index)
   (declare (type (unsigned-byte 16) fun-index))
+  ;; FIXME: it should probably be an error to pass FUN-INDEX too large
   (when (< fun-index (code-n-entries code-obj))
     (truly-the function
       (values (%primitive sb-c:compute-fun code-obj
@@ -564,25 +569,27 @@
          (set-closure-name
           (lambda (&rest args)
            (declare (ignore args))
+           ;; don't capture the SYMBOL argument of INSTALL-GUARD-FUNCTION.
+           ;; It's redundant with FUN-NAME, which provides more information.
+           ;; No need to use SPECIAL-OPERATOR-P to see what it is.
+           (let ((kind (first fun-name)))
            ;; ANSI specification of FUNCALL says that this should be
            ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.
            ;; SPECIAL-FORM-FUNCTION is a subtype of UNDEFINED-FUNCTION.
-           (error (if (special-operator-p symbol)
-                      'special-form-function
-                      'undefined-function)
-                  :name symbol))
+             (error (if (eq kind :special) 'special-form-function 'undefined-function)
+                    :name  (second fun-name))))
           t
           fun-name))
         (fdefn (find-or-create-fdefn symbol)))
 
     ;; In most cases, install the guard closure in the usual way.
-    #-immobile-code (setf (fdefn-fun fdefn) closure)
+    #-(and x86-64 immobile-code) (setf (fdefn-fun fdefn) closure)
 
     ;; Do something slightly different for immobile code: fmakunbound, assigning
     ;; FUN = NIL and RAW-ADDR = UNDEFINED-TRAMP; then overwrite the NIL with the
     ;; above closure. This is better than assigning a closure, because closures
     ;; require a new closure-calling trampoline to be consed.
-    #+immobile-code
+    #+(and x86-64 immobile-code)
     (progn (fdefn-makunbound fdefn)
            (%primitive sb-vm::set-undefined-fdefn-fun fdefn closure))
 
@@ -618,33 +625,3 @@
   (do-closure-values (value closure)
     (when (funcall test value)
       (return value))))
-
-(in-package "SB-C")
-
-;;; Decode the packed TLF-NUM+OFFSET slot, which might have ancillary
-;;; data for the debugger pushed in.  So if it's a cons, take the CDR.
-;;; This is target-only code, so doesn't belong in 'debug-info.lisp'
-(flet ((unpack-tlf-num+offset (cdi &aux (tlf-num+offset
-                                         (compiled-debug-info-tlf-num+offset cdi))
-                                        (integer (if (consp tlf-num+offset)
-                                                     (car tlf-num+offset)
-                                                     tlf-num+offset))
-                                        (bytepos 0))
-         (flet ((unpack-1 ()
-                  (let ((shift 0) (acc 0))
-                    (declare (notinline sb-kernel:%ldb)) ; lp#1573398
-                    (loop
-                     (let ((byte (ldb (byte 8 bytepos) integer)))
-                       (incf bytepos 8)
-                       (setf acc (logior acc (ash (logand byte #x7f) shift)))
-                       (if (logtest byte #x80)
-                           (incf shift 7)
-                           (return acc)))))))
-           (let ((v1 (unpack-1))
-                 (v2 (unpack-1)))
-             (values (if (eql v1 0) nil (1- v1))
-                     (if (eql v2 0) nil (1- v2)))))))
-  (defun compiled-debug-info-tlf-number (cdi)
-    (nth-value 0 (unpack-tlf-num+offset cdi)))
-  (defun compiled-debug-info-char-offset (cdi)
-    (nth-value 1 (unpack-tlf-num+offset cdi))))

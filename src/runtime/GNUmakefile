@@ -45,7 +45,7 @@ include genesis/Makefile.features
 # Config-foo file for setup foo, then arrange for Config to be a
 # symlink to Config-foo.
 # Commonly used variables in Config are: ARCH_SRC, ASSEM_SRC, GC_SRC,
-# OS_SRC, OS_LIBS, OS_CLEAN_FILES
+# OS_SRC, OS_LIBS
 DISABLE_PIE=yes
 include Config
 
@@ -70,27 +70,42 @@ __LDFLAGS__ += -nopie
 endif
 endif
 
-COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
-	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
-	interr.c interrupt.c largefile.c main.c                         \
-	monitor.c murmur_hash.c os-common.c parse.c print.c             \
-	purify.c regnames.c runtime.c			                \
-	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
+COMMON_SRC = alloc.c arena.c backtrace.c breakpoint.c coalesce.c	\
+	coreparse.c dynbind.c funcall.c gc-common.c globals.c		\
+	hopscotch.c interr.c interrupt.c largefile.c main.c		\
+	math.c monitor.c murmur_hash.c os-common.c parse.c              \
+	perfecthash.c print.c                                           \
+	regnames.c runtime.c safepoint.c save.c                         \
+	sc-offset.c search.c stringspace.c thread.c time.c              \
 	validate.c var-io.c vars.c wrap.c
 
 ifndef LISP_FEATURE_WIN32
-COMMON_SRC += run-program.c
+COMMON_SRC += run-program.c sprof.c
 endif
 
 C_SRC = $(COMMON_SRC) ${ARCH_SRC} ${OS_SRC} ${GC_SRC}
 
 SRCS = $(C_SRC) ${ASSEM_SRC}
 
-OBJS = $(C_SRC:.c=.o) $(ASSEM_SRC:.S=.o)
+OBJS = $(C_SRC:.c=.o) $(ASSEM_SRC:.S=.o) ../../tlsf-bsd/tlsf/tlsf.o
 
 LIBS = ${OS_LIBS} $(LDLIBS) -lm
 
-targets: $(TARGET) $(OBJTARGET) sbcl.mk
+ifdef LISP_FEATURE_SB_SAFEPOINT
+LDB_TARGET =
+else
+LDB_TARGET = ldb
+endif
+
+targets: $(TARGET) $(OBJTARGET) $(LDB_TARGET) sbcl.mk
+
+LDB_OBJS = $(filter-out main.o interr.o runtime.o monitor.o thread.o safepoint.o,$(OBJS))
+ldb: $(LIBSBCL)
+	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-monitor.o monitor.c
+	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-interr.o interr.c
+	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-thread.o thread.c
+	$(CC) $(LINKFLAGS) -o ldb standalone-monitor.o standalone-interr.o standalone-thread.o \
+		$(LDB_OBJS) $(LIBS)
 
 $(TARGET): $(LIBSBCL)
 	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
@@ -103,9 +118,9 @@ heap-reloc-test: ../../tests/heap-reloc/fake-mman.c $(OBJS)
 
 # Enable compiling gencgc with even more assertions and/or
 # data collection, with COMPILING_TESTS. Not really used yet.
-gc-unit-tests.o: CFLAGS=-DCOMPILING_TESTS
+gc-unit-tests.o: CFLAGS=-g -DCOMPILING_TESTS
 unit-tests: gc-unit-tests.o libsbcl.a
-	cc -g -no-pie -o $@ $^ -ldl -lpthread -lm
+	$(CC) -g -no-pie -o $@ $^ -ldl -lpthread -lm
 
 # ld -r -o sbcl.o works on Linux, but not on other platforms.
 # On macOS, it fails to keep debug sections.
@@ -118,26 +133,28 @@ libsbcl.a: $(OBJS)
 
 PIC_OBJS = $(subst .o,.pic.o,$(OBJS))
 libsbcl.so: $(PIC_OBJS)
-	cc -shared -o $@ $^ $(LIBS)
+	$(CC) -shared -o $@ $^ $(LIBS) $(SOFLAGS)
 # for this to work, you must have with-gcc-tls in your build features already.
 # can't define it here because then it conflicts if you have it in both places.
 %.pic.o: %.c
-	$(CC) -fPIC -c $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
+	$(CC) -fPIC -c $(CPPFLAGS) $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
 %.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
-	$(CC) -c $(CFLAGS) $< -o $@
-testmain: testmain.c libsbcl.so -ldl
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) $< -o $@
 
-SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/editcore.lisp
+SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/elftool.lisp
 shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
-	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split \
-		../../output/sbcl.core shrinkwrap-sbcl.s
+	../../run-sbcl.sh --script ../../tools-for-build/elftool.lisp split \
+	--dynamic-space-size 256 ../../output/sbcl.core shrinkwrap-sbcl.s
 pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
-	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split --pie \
+	../../run-sbcl.sh --script ../../tools-for-build/elftool.lisp split --pie \
 		../../output/sbcl.core pie-shrinkwrap-sbcl.s
-comma := , # "Commas ... cannot appear in the text of an argument as written"
+# "Commas ... cannot appear in the text of an argument as written"
+# There can not be any space after the comma on the next line,
+# or else it becomes part of the expansion of $(comma)
+comma := ,
 shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
 	$(CC) -no-pie $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
- $(CFLAGS) -o $@ $^ $(LIBS)
+ $(CFLAGS) -o $@ $^ $(filter-out -ldl, $(LIBS))
 pie-shrinkwrap-sbcl: pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o $(PIC_OBJS)
 	$(CC) -pie -o $@ $^ $(LIBS)
 semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
@@ -158,25 +175,23 @@ sbcl.mk: Config
 	  fi ; \
 	  : ) > $@
 
-sbcl.h: $(wildcard genesis/*.h)
-	echo '#include "genesis/config.h"' >sbcl.h
-	echo '#include "genesis/constants.h"' >>sbcl.h
-
 # || true because we don't want the build to break if etags isn't there.
 # ...but it's still nice to have it done by default.
 HEADERS=$(wildcard *.h genesis/*.h)
-TAGS tags: $(SRCS) $(HEADERS)
-	@etags $(SRCS) $(HEADERS) || true
+INC=$(wildcard *.inc)
+TAGS tags: $(SRCS) $(HEADERS) $(INC)
+	@etags --language=c $(SRCS) $(HEADERS) $(INC) || true
 
 clean:
-	-rm -f *.[do] $(TARGET) sbcl.h core *.tmp $(OS_CLEAN_FILES) libsbcl.a shrinkwrap-sbcl* sbcl.mk
+	-rm -f *.[do] ../../tlsf-bsd/tlsf/tlsf.o $(TARGET) *.tmp libsbcl.a \
+ ldb unit-tests libsbcl.a shrinkwrap-sbcl* sbcl.mk core
 
-%.d: %.c sbcl.h
+%.d: %.c
 	@$(CC) $(DEPEND_FLAGS) $(CPPFLAGS) $< > $@.tmp; \
 	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.tmp > $@; \
 	rm -f $@.tmp
 
-%.d: %.S sbcl.h
+%.d: %.S
 	@$(CC) $(DEPEND_FLAGS) $(CPPFLAGS) $< > $@.tmp; \
 	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.tmp > $@; \
 	rm -f $@.tmp

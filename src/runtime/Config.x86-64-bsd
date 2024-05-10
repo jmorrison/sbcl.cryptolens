@@ -16,7 +16,7 @@ ARCH_SRC = x86-64-arch.c
 OS_SRC = bsd-os.c x86-64-bsd-os.c
 OS_LIBS = # -ldl
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-  OS_LIBS += -lz
+  OS_LIBS += -lzstd
 endif
 ifdef HAVE_LIBUNWIND
   OS_LIBS += -lunwind
@@ -26,11 +26,9 @@ CFLAGS += -fno-omit-frame-pointer
 LINKFLAGS += -Wl,--export-dynamic
 
 ifdef LISP_FEATURE_IMMOBILE_SPACE
-  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c elf.c
+  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c
+else ifdef LISP_FEATURE_MARK_REGION_GC
+  GC_SRC = fullcgc.c pmrgc.c traceroot.c mark-region.c incremental-compact.c gc-thread-pool.c
 else
   GC_SRC = fullcgc.c gencgc.c traceroot.c
 endif
-
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:

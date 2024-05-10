@@ -37,16 +37,13 @@
 
 (in-package "SB-PCL")
 
-;;; The PCL package is internal and is used by code in potential
-;;; bottlenecks. And since it's internal, no one should be
-;;; doing things like deleting and recreating it in a running target Lisp.
-(define-symbol-macro *pcl-package* #.(find-package "SB-PCL"))
 
 (declaim (inline defstruct-classoid-p))
 (defun defstruct-classoid-p (classoid)
   ;; It is non-obvious to me why STRUCTURE-CLASSOID-P doesn't
   ;; work instead of this. -- NS 2008-03-14
-  (typep (layout-info (classoid-layout classoid)) 'defstruct-description))
+  (typep (sb-kernel::layout-%info (classoid-layout classoid))
+         'defstruct-description))
 
 ;;; This excludes structure types created with the :TYPE option to
 ;;; DEFSTRUCT. It also doesn't try to deal with types created by
@@ -63,50 +60,25 @@
               (defstruct-classoid-p classoid)))))
 
 ;;; Symbol contruction utilities
-(defun format-symbol (package format-string &rest format-arguments)
-  (without-package-locks
-   (intern (possibly-base-stringize
-            (apply #'format nil format-string format-arguments))
-           package)))
+(defun pkg-format-symbol (package format-string &rest format-arguments)
+  ;; It's unclear to me why ignoring package locks here is a good thing.
+  (symbolicate! package (apply #'format nil format-string format-arguments)))
+;; Like the preceding, but always use PCL package, and override the package lock
+;; in a more elegant way than using WITHOUT-PACKAGE-LOCKS.
+(defun pcl-symbolicate (&rest things)
+  (apply #'symbolicate! #.(find-package "SB-PCL") things))
 
 (defun condition-type-p (type)
   (and (symbolp type)
        (condition-classoid-p (find-classoid type nil))))
 
-(defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
-  `(dotimes (,var (the fixnum ,count) ,result)
-     (declare (fixnum ,var))
-     ,@body))
-
-(declaim (inline random-fixnum))
-(defun random-fixnum ()
-  (random (1+ most-positive-fixnum)))
-
-;;; Lambda which executes its body (or not) randomly. Used to drop
-;;; random cache entries.
-;;; This formerly punted with slightly greater than 50% probability,
-;;; and there was a periodicity to the nonrandomess.
-;;; If that was intentional, it should have been commented to that effect.
-(defmacro randomly-punting-lambda (lambda-list &body body)
-  (with-unique-names (drops drop-pos)
-    `(let ((,drops (random-fixnum)) ; means a POSITIVE fixnum
-           (,drop-pos sb-vm:n-positive-fixnum-bits))
-       (declare (fixnum ,drops)
-                (type (mod #.sb-vm:n-fixnum-bits) ,drop-pos))
-       (lambda ,lambda-list
-         (when (logbitp (the unsigned-byte (decf ,drop-pos)) ,drops)
-           (locally ,@body))
-         (when (zerop ,drop-pos)
-           (setf ,drops (random-fixnum)
-                 ,drop-pos sb-vm:n-positive-fixnum-bits))))))
 
 (defun set-funcallable-instance-function (fin new-value)
   (declare (type function new-value))
   ;; It's not worth bothering to teach the compiler to efficiently transform
-  ;; a type declaration involving FUNCALLABLE-STANDARD-OBJECT, not the least
+  ;; a type test involving FUNCALLABLE-STANDARD-OBJECT, not the least
   ;; of the problems being that the type isn't known during make-host-2.
-  (unless (and #+compact-instance-header (functionp fin)
-               #-compact-instance-header (funcallable-instance-p fin)
+  (unless (and (function-with-layout-p fin)
                (logtest (layout-flags (%fun-layout fin))
                         +pcl-object-layout-flag+))
     (error 'type-error :datum fin :expected-type 'funcallable-standard-object))
@@ -186,28 +158,15 @@
     (setf (fdefinition new-name) fun))
   fun)
 
-;;; FIXME: probably no longer needed after init
-(defmacro precompile-random-code-segments (&optional system)
-  `(progn
-     (eval-when (:compile-toplevel)
-       (update-dispatch-dfuns))
-     (precompile-function-generators ,system)
-     (precompile-dfun-constructors ,system)
-     (precompile-ctors)))
-
 ;;; This definition is for interpreted code.
 ;;; FIXME: (1) is EXPLICIT-CHECK really doing anything here?
 ;;;        (2) why isn't this named STANDARD-OBJECT-P?
 (defun pcl-instance-p (x) (declare (explicit-check)) (%pcl-instance-p x))
 
-(defmacro %std-instance-slots (x)
-  `(%instance-ref ,x ,sb-vm:instance-data-start))
 (defmacro std-instance-slots (x)
-  `(truly-the simple-vector (%std-instance-slots ,x)))
-(defmacro %fsc-instance-slots (fin)
-  `(%funcallable-instance-info ,fin 0))
+  `(truly-the simple-vector (%instance-ref ,x ,sb-vm:instance-data-start)))
 (defmacro fsc-instance-slots (x)
-  `(truly-the simple-vector (%fsc-instance-slots ,x)))
+  `(truly-the simple-vector (%funcallable-instance-info ,x 0)))
 
 ;;; FIXME: These functions are called every place we do a
 ;;; CALL-NEXT-METHOD, and probably other places too. It's likely worth
@@ -230,92 +189,10 @@
   ;; (once in the test of PCL-INSTANCE-P and once in GET-SLOTS).
   (cond ((std-instance-p instance) (std-instance-slots instance))
         ((fsc-instance-p instance) (fsc-instance-slots instance))))
-
-;;;; structure-instance stuff
-;;;;
-;;;; FIXME: Now that the code is SBCL-only, this extra layer of
-;;;; abstraction around our native structure representation doesn't
-;;;; seem to add anything useful, and could probably go away.
 
-;;; The definition of STRUCTURE-TYPE-P was moved to early-low.lisp.
-
-(defun structure-type-slot-description-list (type)
-  (let* ((dd (find-defstruct-description type))
-         (include (dd-include dd))
-         (all-slots (dd-slots dd)))
-    (multiple-value-bind (super slot-overrides)
-        (if (consp include)
-            (values (car include) (mapcar #'car (cdr include)))
-            (values include nil))
-      (let ((included-slots
-             (when super
-               (dd-slots (find-defstruct-description super)))))
-        (loop for slot = (pop all-slots)
-              for included-slot = (pop included-slots)
-              while slot
-              when (or (not included-slot)
-                       (member (dsd-name included-slot) slot-overrides :test #'eq))
-              collect slot)))))
-
-(defun uninitialized-accessor-function (type slotd)
-  (lambda (&rest args)
-    (declare (ignore args))
-    (error "~:(~A~) function~@[ for ~S ~] not yet initialized."
-           type slotd)))
-
-(defun structure-slotd-name (slotd)
-  (dsd-name slotd))
-
-(defun structure-slotd-accessor-symbol (slotd)
-  (dsd-accessor-name slotd))
-
-(defun structure-slotd-reader-function (slotd)
-  (let ((name (dsd-accessor-name slotd)))
-    (if (fboundp name)
-        (fdefinition name)
-        (uninitialized-accessor-function :reader slotd))))
-
-;;; Return a function to write the slot identified by SLOTD.
-;;; This is easy for read/write slots - we just return the accessor
-;;; that was already set up - but it requires work for read-only slots.
-;;; Basically we get the slotter-setter-lambda-form and compile it.
-;;; Using (COERCE lambda-form 'FUNCTION) as used to be done might produce
-;;; an interpreted function. I'm not sure whether that's right or wrong,
-;;; because if the DEFSTRUCT itself were evaluated, then the ordinary
-;;; accessors would indeed be interpreted. However if the DEFSTRUCT were
-;;; compiled, and the fasl loaded in a Lisp with *EVALUATOR-MODE* = :INTERPRET,
-;;; arguably this is against the expectation that all things got compiled.
-;;; But can people really expect that manipulating read-only slots
-;;; via (SETF SLOT-VALUE) should be fast?
-;;;
-;;; Damned-if-you-do / damned-if-you don't - the best thing would be to
-;;; compile all accessors at "really" compile-time but not store the writer
-;;; for a reaadonly slot under the #<fdefn> for #'(SETF slot-name).
-;;;
-(defun structure-slotd-writer-function (type slotd)
-  ;; TYPE is not used, because the DD is taken from runtime data.
-  (declare (ignore type))
-  (if (dsd-read-only slotd)
-      ;; We'd like to compile the writer just-in-time and store it
-      ;; back into the STRUCTURE-DIRECT-SLOT-DEFINITION and also
-      ;; the LAYOUT for the class, but we don't have a handle on
-      ;; any of the containing objects. So this has to be a closure.
-      (let ((setter 0))
-        (lambda (newval instance)
-          (if (eql setter 0)
-              (let* ((dd (layout-info (%instance-layout instance)))
-                     (f (compile nil (slot-setter-lambda-form dd slotd))))
-                (if (functionp f)
-                    (funcall (setq setter f) newval instance)
-                    (uninitialized-accessor-function :writer slotd)))
-              (funcall (truly-the function setter) newval instance))))
-      (let ((name `(setf ,(dsd-accessor-name slotd))))
-        (if (fboundp name)
-            (fdefinition name)
-            (uninitialized-accessor-function :writer slotd)))))
-
-(defun structure-slotd-type (slotd)
-  (dsd-type slotd))
-
-(defun structure-slotd-init-form (slotd)
-  (dsd-default slotd))
+;;; This is here, moved from src/pcl/boot so that it gets a 1-byte layout ID
+(defstruct (fast-method-call (:copier nil))
+  (function #'identity :type function)
+  pv
+  next-method-call
+  arg-info)

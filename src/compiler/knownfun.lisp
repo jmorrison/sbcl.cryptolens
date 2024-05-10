@@ -29,10 +29,8 @@
   ;; FUN-TYPE.)
   (type (missing-arg) :type ctype)
   ;; the transformation function. Takes the COMBINATION node and
-  ;; returns a lambda expression, or throws out.
+  ;; returns a lambda expression, or THROWs out.
   (function (missing-arg) :type function)
-  ;; string used in efficiency notes
-  (note (missing-arg) :type string)
   ;; T if we should emit a failure note even if SPEED=INHIBIT-WARNINGS.
   (important nil :type (member nil :slightly t))
   ;; A function with NODE as an argument that checks wheteher the
@@ -41,32 +39,59 @@
   ;; notes about failed transformation due to types even though it
   ;; wouldn't have been applied with the right types anyway,
   ;; or if another transform could be applied with the right policy.
-  (policy nil :type (or null function))
-  (extra-type nil))
+  (policy nil :type (or null function)))
 
-(defprinter (transform) type note important)
+;;; A transform inserted at the front of fun-info-transforms and stops
+;;; other from firing if it has a VOP that can do the job.
+(defstruct (vop-transform (:copier nil)
+                          (:predicate nil)
+                          (:include transform)))
+
+(defun transform-note (transform)
+  (or #+sb-xc-host (documentation (transform-function transform) 'function)
+      #-sb-xc-host (and (fboundp 'sb-pcl::fun-doc)
+                        (funcall 'sb-pcl::fun-doc (transform-function transform)))
+      "optimize"))
+
+(defmethod print-object ((x transform) stream)
+  (print-unreadable-object (x stream :type t :identity t)
+    (princ (type-specifier (transform-type x)) stream)))
 
 ;;; Grab the FUN-INFO and enter the function, replacing any old
 ;;; one with the same type and note.
-(defun %deftransform (name type fun &optional note important policy)
+;;; Argument order is: policy constraint, ftype constraint, consequent.
+;;; (think "qualifiers + specializers -> method")
+(defun %deftransform (name policy type fun &optional (important :slightly))
   (let* ((ctype (specifier-type type))
-         (note (or note "optimize"))
          (info (fun-info-or-lose name))
-         (old (find ctype (fun-info-transforms info)
-                    :test #'type=
-                    :key #'transform-type)))
+         (transforms (fun-info-transforms info))
+         (old (find-if (lambda (transform)
+                         (and (if (eq important :vop)
+                                  (typep transform 'vop-transform)
+                                  (not (typep transform 'vop-transform)))
+                              (type= (transform-type transform)
+                                     ctype)))
+                       transforms)))
     (cond (old
-           (style-warn 'redefinition-with-deftransform
-                       :transform old)
+           (style-warn 'redefinition-with-deftransform :transform old)
            (setf (transform-function old) fun
-                 (transform-note old) note
-                 (transform-important old) important
-                 (transform-policy old) policy))
+                 (transform-policy old) policy)
+           (unless (eq important :vop)
+             (setf (transform-important old) important)))
           (t
-           (push (make-transform :type ctype :function fun :note note
-                                 :important important
-                                 :policy policy)
-                 (fun-info-transforms info))))
+           ;; Put vop-transform at the front.
+           (if (eq important :vop)
+               (push (make-vop-transform :type ctype :function fun
+                                         :policy policy)
+                     (fun-info-transforms info))
+               (let ((normal (member-if (lambda (transform)
+                                          (not (typep transform 'vop-transform)))
+                                        transforms))
+                     (transform (make-transform :type ctype :function fun
+                                                :important important
+                                                :policy policy)))
+                 (setf (fun-info-transforms info)
+                       (append (ldiff transforms normal) (list* transform normal)))))))
     name))
 
 ;;; Make a FUN-INFO structure with the specified type, attributes
@@ -75,42 +100,63 @@
                   &key derive-type optimizer result-arg
                        overwrite-fndb-silently
                        call-type-deriver
-                       annotation)
+                       annotation
+                       folder)
   (let* ((ctype (specifier-type type))
          (type-to-store (if (contains-unknown-type-p ctype)
                             ;; unparse it, so SFUNCTION -> FUNCTION
                             (type-specifier ctype)
                             ctype)))
     (dolist (name names)
-      (unless overwrite-fndb-silently
-        (let ((old-fun-info (info :function :info name)))
-          (when old-fun-info
-            ;; This is handled as an error because it's generally a bad
-            ;; thing to blow away all the old optimization stuff. It's
-            ;; also a potential source of sneaky bugs:
-            ;;    DEFKNOWN FOO
-            ;;    DEFTRANSFORM FOO
-            ;;    DEFKNOWN FOO ; possibly hidden inside some macroexpansion
-            ;;    ; Now the DEFTRANSFORM doesn't exist in the target Lisp.
-            ;; However, it's continuable because it might be useful to do
-            ;; it when testing new optimization stuff interactively.
-            (cerror "Go ahead, overwrite it."
-                    "~@<overwriting old FUN-INFO ~2I~_~S ~I~_for ~S~:>"
-                    old-fun-info name))))
-      (setf (info :function :type name) type-to-store)
-      (setf (info :function :where-from name) :declared)
-      (setf (info :function :kind name) :function)
-      (setf (info :function :info name)
-            (make-fun-info :attributes attributes
-                           :derive-type derive-type
-                           :optimizer optimizer
-                           :result-arg result-arg
-                           :call-type-deriver call-type-deriver
-                           :annotation annotation))
-      (if location
-          (setf (getf (info :source-location :declaration name) 'defknown)
-                location)
-          (remf (info :source-location :declaration name) 'defknown))))
+      (let ((old-fun-info (info :function :info name))
+            inherit)
+        (block ignore
+          (unless overwrite-fndb-silently
+            (when old-fun-info
+              ;; This is handled as an error because it's generally a bad
+              ;; thing to blow away all the old optimization stuff. It's
+              ;; also a potential source of sneaky bugs:
+              ;;    DEFKNOWN FOO
+              ;;    DEFTRANSFORM FOO
+              ;;    DEFKNOWN FOO ; possibly hidden inside some macroexpansion
+              ;;    ; Now the DEFTRANSFORM doesn't exist in the target Lisp.
+              ;; However, it's continuable because it might be useful to do
+              ;; it when testing new optimization stuff interactively.
+              (restart-case
+                  (cerror "Go ahead, overwrite it."
+                          "~@<overwriting old FUN-INFO ~2I~_~S ~I~_for ~S~:>"
+                          old-fun-info name)
+                (continue ()
+                  :report "Inherit templates and optimizers"
+                  (setf inherit t))
+                (ignore ()
+                  (return-from ignore)))))
+          (setf (info :function :type name) type-to-store)
+          (setf (info :function :where-from name) :declared)
+          (setf (info :function :kind name) :function)
+          (cond (inherit
+                 (when optimizer
+                   (setf (fun-info-optimizer old-fun-info) optimizer))
+                 (when derive-type
+                   (setf (fun-info-derive-type old-fun-info) derive-type))
+                 (setf (fun-info-attributes old-fun-info) attributes
+                       (fun-info-result-arg old-fun-info) result-arg
+                       (fun-info-annotation old-fun-info) annotation
+                       (fun-info-call-type-deriver old-fun-info) call-type-deriver
+                       (fun-info-folder old-fun-info) folder))
+                (t
+                 (setf (info :function :info name)
+                       (make-fun-info :attributes attributes
+                                      :derive-type derive-type
+                                      :optimizer optimizer
+                                      :result-arg result-arg
+                                      :call-type-deriver call-type-deriver
+                                      :annotation annotation
+                                      :folder folder))))
+          (if location
+              (setf (getf (info :source-location :declaration name) 'defknown)
+                    location)
+              (remf (info :source-location :declaration name) 'defknown))))))
   names)
 
 
@@ -146,6 +192,17 @@
     (setq attributes (union '(unwind) attributes)))
   (when (member 'flushable attributes)
     (pushnew 'unsafely-flushable attributes))
+  ;; Needs to be supported by the call VOPs
+  #-(or arm64 x86-64)
+  (setf attributes (remove 'no-verify-arg-count attributes))
+  #-(or arm64 x86-64)
+  (setf attributes (remove 'unboxed-return attributes))
+  #-(or arm64 x86-64) ;; Needs to be supported by the call VOPs, sb-vm::fixed-call-arg-location
+  (setf attributes (remove 'fixed-args attributes))
+  (when (or (memq 'fixed-args attributes)
+            (memq 'unboxed-return attributes))
+    (pushnew 'no-verify-arg-count attributes))
+
   (multiple-value-bind (type annotation)
       (split-type-info arg-types result-type)
     `(%defknown ',(if (and (consp name)
@@ -156,7 +213,14 @@
                 (ir1-attributes ,@attributes)
                 (source-location)
                 :annotation ,annotation
-                ,@keys)))
+                ,@keys
+                :folder ,(and (memq 'foldable attributes)
+                              (not (getf keys :folder))
+                              (or
+                               (memq 'fixed-args attributes)
+                               (memq 'unboxed-return attributes))
+                              (let ((args (make-gensym-list (length arg-types))))
+                                `(lambda ,args (funcall ',name ,@args)))))))
 
 (defstruct (fun-type-annotation
             (:copier nil))
@@ -247,10 +311,15 @@
 
 ;;;; generic type inference methods
 
-(defun symeval-derive-type (node &aux (args (basic-combination-args node))
+(defun maybe-find-free-var (name)
+  (let ((found (gethash name (free-vars *ir1-namespace*))))
+    (unless (eq found :deprecated)
+      found)))
+
+(defun symbol-value-derive-type (node &aux (args (basic-combination-args node))
                                       (lvar (pop args)))
   (unless (and lvar (endp args))
-    (return-from symeval-derive-type))
+    (return-from symbol-value-derive-type))
   (if (constant-lvar-p lvar)
       (let* ((sym (lvar-value lvar))
              (var (maybe-find-free-var sym))
@@ -278,15 +347,6 @@
     (let ((lvar (nth n (combination-args call))))
       (when lvar (lvar-type lvar)))))
 
-;;; Derive the result type according to the float contagion rules, but
-;;; always return a float. This is used for irrational functions that
-;;; preserve realness of their arguments.
-(defun result-type-float-contagion (call)
-  (declare (type combination call))
-  (reduce #'numeric-contagion (combination-args call)
-          :key #'lvar-type
-          :initial-value (specifier-type 'single-float)))
-
 (defun simplify-list-type (type &key preserve-dimensions)
   ;; Preserve all the list types without dragging
   ;; (cons (eql 10)) stuff in.
@@ -306,16 +366,23 @@
 ;;; N'th argument. If arg is a list, result is a list. If arg is a
 ;;; vector, result is a vector with the same element type.
 (defun sequence-result-nth-arg (n &key preserve-dimensions
-                                       preserve-vector-type)
+                                       preserve-vector-type
+                                       string-designator)
   (lambda (call)
     (declare (type combination call))
-    (let ((lvar (nth (1- n) (combination-args call))))
+    (let ((lvar (nth n (combination-args call))))
       (when lvar
         (let ((type (lvar-type lvar)))
-          (cond ((simplify-list-type type
-                                     :preserve-dimensions preserve-dimensions))
+          (cond ((and (not string-designator)
+                      (simplify-list-type type
+                                          :preserve-dimensions preserve-dimensions)))
                 ((not (csubtypep type (specifier-type 'vector)))
-                 nil)
+                 (cond ((not string-designator) nil)
+                       ((csubtypep type (specifier-type 'character))
+                        (specifier-type `(simple-string 1)))
+                       ((and (constant-lvar-p lvar)
+                             (symbolp (lvar-value lvar)))
+                        (ctype-of (symbol-name (lvar-value lvar))))))
                 (preserve-vector-type
                  type)
                 (t
@@ -331,7 +398,7 @@
 (defun result-type-specifier-nth-arg (n)
   (lambda (call)
     (declare (type combination call))
-    (let ((lvar (nth (1- n) (combination-args call))))
+    (let ((lvar (nth n (combination-args call))))
       (when (and lvar (constant-lvar-p lvar))
         (careful-specifier-type (lvar-value lvar))))))
 
@@ -349,7 +416,7 @@
 (defun creation-result-type-specifier-nth-arg (n)
   (lambda (call)
     (declare (type combination call))
-    (let ((lvar (nth (1- n) (combination-args call))))
+    (let ((lvar (nth n (combination-args call))))
       (when (and lvar (constant-lvar-p lvar))
         (let* ((specifier (lvar-value lvar))
                (lspecifier (if (atom specifier) (list specifier) specifier)))
@@ -441,16 +508,6 @@
             (max-dim (lvar-type lvar))
             (values max min))))))
 
-(defun position-derive-type (call)
-  (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
-    (when (integerp dim)
-      (specifier-type `(or (integer 0 (,dim)) null)))))
-
-(defun count-derive-type (call)
-  (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
-    (when (integerp dim)
-      (specifier-type `(integer 0 ,dim)))))
-
 ;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
 ;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
 ;;; assertion that may not get eliminated and requires extra work.
@@ -478,7 +535,16 @@
                            (pop required)
                            (type-intersection
                             (pop required)
-                            (specifier-type `(array * ,(length args)))))
+                            (let ((rank (length args)))
+                              (when (>= rank array-rank-limit)
+                                (setf (combination-kind call) :error)
+                                (compiler-warn "More subscripts for ~a (~a) than ~a (~a)"
+                                               (combination-fun-debug-name call)
+                                               rank
+                                               'array-rank-limit
+                                               array-rank-limit)
+                                (return-from array-call-type-deriver))
+                              (specifier-type `(array * ,rank)))))
                        set)
           (loop for type in required
                 do

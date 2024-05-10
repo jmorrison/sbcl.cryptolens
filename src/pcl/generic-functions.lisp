@@ -211,7 +211,7 @@
 
 (defgeneric generic-function-lambda-list (generic-function))
 
-(defgeneric generic-function-pretty-arglist (generic-function))
+(defgeneric generic-function-pretty-arglist (generic-function &optional current-defmethod))
 
 (defgeneric gf-fast-method-function-p (gf))
 
@@ -270,8 +270,6 @@
 
 (defgeneric effective-slot-definition-class (class &rest initargs))
 
-(defgeneric make-boundp-method-function (class slot-name))
-
 (defgeneric make-reader-method-function (class slot-name))
 
 (defgeneric make-writer-method-function (class slot-name))
@@ -299,8 +297,6 @@ evaluated (in contrast to DEFMETHOD's behavior).
 
 NOTE: This generic function is part of an SBCL-specific experimental
 protocol. Interface subject to change."))
-
-(defgeneric remove-boundp-method (class generic-function))
 
 (defgeneric remove-dependent (metaobject dependent))
 
@@ -342,9 +338,11 @@ protocol. Interface subject to change."))
 ;;; remember what the second value was supposed to be.  So, PCL's
 ;;; COMPUTE-EFFECTIVE-METHOD returns one value as do Allegro and
 ;;; Lispworks.
-(defgeneric compute-effective-method (generic-function
-                                      combin
-                                      applicable-methods))
+(defgeneric compute-effective-method
+    (generic-function combin applicable-methods))
+
+(defgeneric compute-primary-methods
+    (generic-function combin applicable-methods))
 
 (defgeneric compute-effective-slot-definition (class name dslotds))
 
@@ -445,10 +443,6 @@ protocol. Interface subject to change."))
 (defgeneric (setf slot-value-using-class) (new-value class object slotd))
 
 ;;;; 5 arguments
-
-;;; FIXME: This is currently unused -- where should we call it? Or should we just
-;;; delete it.
-(defgeneric add-boundp-method (class generic-function slot-name slot-documentation source-location))
 
 (defgeneric add-reader-method (class generic-function slot-name slot-documentation source-location))
 

@@ -20,13 +20,7 @@
         class)))
 
 ;;;; the ANSI interface to function names (and to other stuff too)
-;;; Note: this function gets called by the compiler (as of 1.0.17.x,
-;;; in MAYBE-INLINE-SYNTACTIC-CLOSURE), and so although ANSI says
-;;; we're allowed to return NIL here freely, it seems plausible that
-;;; small changes to the circumstances under which this function
-;;; returns non-NIL might have subtle consequences on the compiler.
-;;; So it might be desirable to have the compiler not rely on this
-;;; function, eventually.
+
 (defun function-lambda-expression (fun)
   "Return (VALUES DEFINING-LAMBDA-EXPRESSION CLOSURE-P NAME), where
   DEFINING-LAMBDA-EXPRESSION is NIL if unknown, or a suitable argument
@@ -539,13 +533,15 @@
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 100))
-    (format stream "~@:_Lambda-list: ~:S" lambda-list)))
+    (format stream "~@:_Lambda-list: ~/sb-impl:print-lambda-list/" lambda-list)))
 
 (defun describe-argument-precedence-order (argument-list stream)
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 100))
-    (format stream "~@:_Argument precedence order: ~:A" argument-list)))
+    (format stream "~@:_Argument precedence order: ~
+                    ~/sb-impl:print-lambda-list/"
+            argument-list)))
 
 (defun describe-function-source (function stream)
   (declare (function function))
@@ -599,7 +595,7 @@
                   (t
                    (let* ((fun (or function (fdefinition name)))
                           (derived-type (and function
-                                             (%fun-type function)))
+                                             (%fun-ftype function)))
                           (legal-name-p (legal-fun-name-p name))
                           (ctype (and legal-name-p
                                       (global-ftype name)))
@@ -614,7 +610,7 @@
                                  (member from '(:defined-method :defined)))
                             (setf derived-type type)))
                      (unless derived-type
-                       (setf derived-type (%fun-type fun)))
+                       (setf derived-type (%fun-ftype fun)))
                      (if (typep fun 'standard-generic-function)
                          (values fun
                                  "a generic function"
@@ -683,7 +679,8 @@
                        (format stream "Methods:")
                        (dolist (method methods)
                          (pprint-indent :block 2 stream)
-                         (format stream "~@:_(~A ~{~S ~}~:S)"
+                         (format stream "~@:_(~A ~{~S ~}~
+                                         ~/sb-impl:print-lambda-list/)"
                                  name
                                  (method-qualifiers method)
                                  (sb-pcl::unparse-specializers
@@ -696,12 +693,14 @@
       (describe-block (stream "~A has a compiler-macro:" name)
         (describe-documentation it t stream)
         (describe-function-source it stream)))
+    ;; It seems entirely bogus to claim that, for example (SETF CAR)
+    ;; has a setf expander when what we mean is that CAR has.
     (when (and (consp name) (eq 'setf (car name)) (not (cddr name)))
       (let* ((name2 (second name))
              (expander (info :setf :expander name2)))
-        (cond ((typep expander '(and symbol (not null)))
+        (cond ((typep expander '(cons symbol))
                (describe-block (stream "~A has setf-expansion: ~S"
-                                       name expander)
+                                       name (car expander))
                  (describe-documentation name2 'setf stream)))
               (expander
                (when (listp expander)

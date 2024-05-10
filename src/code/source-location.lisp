@@ -13,7 +13,6 @@
 
 ;;; A DEFINITION-SOURCE-LOCATION contains two packed fixnums in the INDICES slot,
 ;;; and unless there is a non-nil plist, does not store the plist.
-;;; Packed representation is: header + layout, namestring, indices, (padding)
 (def!struct (definition-source-location
              (:constructor %make-basic-definition-source-location
                            (namestring indices))
@@ -96,13 +95,26 @@
     (%make-definition-source-location namestring tlf-number form-number)))
 
 (defun make-file-info-namestring (name file-info)
-  (let* ((untruename (file-info-untruename file-info))
-         (dir (and untruename (pathname-directory untruename))))
+  (let* ((pathname (file-info-pathname file-info))
+         (dir (and pathname (pathname-directory pathname))))
     (if (and dir (eq (first dir) :absolute))
-        (namestring untruename)
+        (namestring pathname)
         (if name
             (namestring name)
             nil))))
+
+#+sb-source-locations
+(progn
+  (define-source-transform source-location ()
+    (make-definition-source-location))
+  ;; We need a regular definition of SOURCE-LOCATION for calls processed
+  ;; during LOAD on a source file while *EVALUATOR-MODE* is :INTERPRET.
+  #-sb-xc-host
+  (defun source-location ()
+    (make-definition-source-location)))
+
+#+(and (not sb-source-locations) (not sb-xc-host)) ; defined in cross-misc in make-host-1
+(defun source-location () nil)
 
 (in-package "SB-IMPL")
 

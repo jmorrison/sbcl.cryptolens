@@ -69,7 +69,9 @@
     (error "Heap underflow"))
   (prog1
       (aref heap i)
-    (setf (aref heap i) (aref heap (1- (length heap))))
+    (let ((last (1- (length heap))))
+      (setf (aref heap i) (aref heap last)
+            (aref heap last) 0))
     (decf (fill-pointer heap))
     (heapify heap i :key key :test test)))
 
@@ -212,7 +214,7 @@ from now. For timers with a repeat interval it returns true."
 (defun make-cancellable-interruptor (timer)
   ;; return a list of two functions: one that does the same as
   ;; FUNCTION until the other is called, from when it does nothing.
-  (let ((mutex (sb-thread:make-mutex))
+  (let ((mutex (sb-thread:make-mutex :name "interruptor"))
         (cancelledp nil)
         (function (if (%timer-repeat-interval timer)
                       (lambda ()
@@ -344,20 +346,9 @@ triggers."
 ;;; win32 waitable timers using a timerfd-like portability layer in
 ;;; the runtime.
 
-#+sb-wtimer
-(define-alien-type wtimer
-    #+win32 system-area-pointer ;HANDLE, but that's not defined yet
-    #+sunos system-area-pointer ;struct os_wtimer *
-    #+(or android linux bsd) int)
-
-#+sb-wtimer
+#+win32
 (progn
-  (define-alien-routine "os_create_wtimer" wtimer)
-  (define-alien-routine "os_wait_for_wtimer" int (wt wtimer))
-  (define-alien-routine "os_close_wtimer" void (wt wtimer))
-  (define-alien-routine "os_cancel_wtimer" void (wt wtimer))
-  (define-alien-routine "os_set_wtimer" void (wt wtimer) (sec int) (nsec int))
-
+  ;; Shouldn't all this junk be in the win32.lisp file???
   ;; scheduler lock already protects us
 
   (defvar *waitable-timer-handle* nil)
@@ -368,17 +359,17 @@ triggers."
     (aver (under-scheduler-lock-p))
     (or *waitable-timer-handle*
         (prog1
-            (setf *waitable-timer-handle* (os-create-wtimer))
+            (setf *waitable-timer-handle* (sb-win32::os-create-wtimer))
           (setf *timer-thread*
-                (sb-thread::make-ephemeral-thread
+                (sb-thread::make-system-thread
                  "System timer watchdog thread"
                  (lambda ()
                    (loop while
                          (or (zerop
-                              (os-wait-for-wtimer *waitable-timer-handle*))
+                              (sb-win32::os-wait-for-wtimer *waitable-timer-handle*))
                              *waitable-timer-handle*)
                          doing (run-expired-timers)))
-                 nil)))))
+                 nil nil)))))
 
   (defun itimer-emulation-deinit ()
     (with-scheduler-lock ()
@@ -386,14 +377,14 @@ triggers."
         (sb-thread:terminate-thread *timer-thread*)
         (sb-thread:join-thread *timer-thread* :default nil))
       (when *waitable-timer-handle*
-        (os-close-wtimer *waitable-timer-handle*)
+        (sb-win32::os-close-wtimer *waitable-timer-handle*)
         (setf *waitable-timer-handle* nil))))
 
   (defun %clear-system-timer ()
-    (os-cancel-wtimer (get-waitable-timer)))
+    (sb-win32::os-cancel-wtimer (get-waitable-timer)))
 
   (defun %set-system-timer (sec nsec)
-    (os-set-wtimer (get-waitable-timer) sec nsec)))
+    (sb-win32::os-set-wtimer (get-waitable-timer) sec nsec)))
 
 ;;; Expiring timers
 
@@ -411,7 +402,7 @@ triggers."
               (values 0 min-nsec)
               (values s u))))))
 
-#-(or sb-wtimer win32)
+#+unix
 (progn
   (defun %set-system-timer (sec nsec)
     (sb-unix:unix-setitimer :real 0 0 sec (ceiling nsec 1000)))
@@ -468,6 +459,14 @@ triggers."
                 do (aver (eq timer (priority-queue-extract-maximum *schedule*)))
                    (push timer timers)))
         (run-timers)))))
+
+#+unix
+(defun sb-unix::sigalrm-handler (signal info context)
+  (declare (ignore signal info context))
+  ;; Safepoint invokes the "signal handler" without a signal context,
+  ;; since it's not a signal handler.
+  #-sb-safepoint (declare (type system-area-pointer context))
+  (run-expired-timers))
 
 (defun timeout-cerror (&optional seconds)
   (cerror "Continue" 'timeout :seconds seconds))

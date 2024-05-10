@@ -31,11 +31,13 @@
          (won nil)
          (asmstream (make-asmstream))
          (*asmstream* asmstream)
-         (*adjustable-vectors* nil))
+         (sb-vm::*adjustable-vectors* nil))
+    (declare (special sb-vm::*adjustable-vectors*))
     (unwind-protect
         (let ((sb-xc:*features* (cons :sb-assembling sb-xc:*features*))
               (*readtable* sb-cold:*xc-readtable*))
           (load (merge-pathnames name (make-pathname :type "lisp")))
+          (resolve-ep-labels (asmstream-code-section asmstream))
           ;; Reserve space for the jump table. The first word of the table
           ;; indicates the total length in words, counting the length word itself
           ;; as a word, and the words comprising jump tables that were registered
@@ -48,6 +50,7 @@
                 (n-data-words  ; Space for internal jump tables if needed
                  (loop for ((category . data) . label)
                        across (asmstream-constant-vector asmstream)
+                       do (progn #+host-quirks-ccl label) ; shut up the host
                        when (eq category :jump-table) sum (length data))))
             (emit (asmstream-data-section asmstream)
                   `(.lispword ,(+ n-extra-words n-data-words 1))
@@ -65,9 +68,16 @@
           (let ((segment (assemble-sections
                           asmstream nil
                           (make-segment :run-scheduler nil))))
+            (unless (= (length (remove-duplicates (mapcar 'car *entry-points*)))
+                       (length *entry-points*))
+              (error "Duplicate asm routine: ~S"
+                     (loop for (this . rest) on *entry-points*
+                           when (assoc (car this) rest)
+                           collect (car this))))
             (dump-assembler-routines segment
                                      (segment-buffer segment)
                                      (sb-assem::segment-fixup-notes segment)
+                                     (sb-assem::get-allocation-points asmstream)
                                      *entry-points*
                                      lap-fasl-output))
           (setq won t))
@@ -99,7 +109,7 @@
     (ecase kind
       (:temp)
       ((:arg :res)
-       (setf (reg-spec-temp reg) (make-symbol (symbol-name name)))))
+       (setf (reg-spec-temp reg) (symbolicate (symbol-name name) '-arg-temp))))
     reg))
 
 (defun expand-one-export-spec (export)
@@ -119,6 +129,26 @@
   (loop
     for export in exports
     collect `(push ,(expand-one-export-spec export) *entry-points*)))
+
+(defun resolve-ep-labels (section)
+  (do ((statement (stmt-next (section-start section)) (stmt-next statement)))
+      ((null statement))
+    ;; We also output some raw words using fixups; I'm not sure if they should be
+    ;; changed to labels. For now, restrict to control transfers.
+    (binding* ((patch
+                (when (member (stmt-mnemonic statement)
+                              '("B" "BEQ" "JMP" "CALL") ; KLUDGE
+                              :test 'string=)
+                  (member-if (lambda (x)
+                               (and (typep x 'fixup)
+                                    (eq (fixup-flavor x) :assembly-routine)
+                                    (eql (fixup-offset x) 0)))
+                             (stmt-operands statement)))
+                :exit-if-null)
+               (ep (assoc (fixup-name (car patch)) *entry-points*)))
+      ;; oy. what is (third ep) ? An offset?
+      (aver (and ep (= (third ep) 0)))
+      (rplaca patch (second ep)))))
 
 (defun expand-align-option (align)
   (when align
@@ -174,7 +204,8 @@
          (results (remove :res vars :key #'reg-spec-kind :test #'neq))
          (return-style (or (cadr (assoc :return-style options)) :raw))
          (cost (or (cadr (assoc :cost options)) 247))
-         (vop (make-symbol "VOP")))
+         (vop (or (cadr (assoc :vop-var options))
+                  (make-symbol "VOP"))))
     ;; :full-call-no-return entails the call site behavior for :full-call
     ;; without automatic insertion of the return sequence. This avoids some confusion
     ;; on the part of the human reading the code, especially if the asm routine
@@ -221,10 +252,12 @@
          ;; any :SAVE-P specified in options supersedes one from call-temps.
          ;; It would be wiser to signal an error about duplicate options.
          ,@(remove-if (lambda (x)
-                        (member x '(:return-style :cost :call-temps)))
+                        (member x '(:return-style :cost :call-temps
+                                    :vop-var :vop-prefix)))
                       options
                       :key #'car)
          (:generator ,cost
+           ,@(cdr (assoc :vop-prefix options))
            ,@(mapcar (lambda (arg)
                        `(move ,(reg-spec-temp arg) ,(reg-spec-name arg)))
                      args)

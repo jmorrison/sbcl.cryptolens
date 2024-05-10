@@ -61,12 +61,12 @@
   (flushable movable))
 (defknown deport-alloc (alien alien-type) t
   (flushable movable))
-(defknown %alien-value (system-area-pointer unsigned-byte alien-type) t
+(defknown %alien-value (system-area-pointer word alien-type) t
   (flushable))
-(defknown (setf %alien-value) (t system-area-pointer unsigned-byte alien-type) t
+(defknown (setf %alien-value) (t system-area-pointer word alien-type) t
   ())
 
-(defknown alien-funcall (alien-value &rest *) *
+(defknown alien-funcall (alien-value &rest t) *
   (any recursive))
 
 (defknown sb-alien::string-to-c-string (simple-string t) (or (simple-array (unsigned-byte 8) (*))
@@ -219,7 +219,7 @@
            (give-up-ir1-transform "Element alignment is unknown."))
          (if (null dims)
              (values nil 0 element-type)
-             (let* ((arg (sb-xc:gensym))
+             (let* ((arg (gensym))
                     (args (list arg))
                     (offsetexpr arg))
                (dolist (dim (cdr dims))
@@ -236,7 +236,6 @@
 
 #+nil ;; Shouldn't be necessary.
 (defoptimizer (deref derive-type) ((alien &rest noise))
-  (declare (ignore noise))
   (block nil
     (catch 'give-up-ir1-transform
       (return (make-alien-type-type (find-deref-element-type alien))))
@@ -252,7 +251,6 @@
 
 #+nil ;; ### Again, the value might be coerced.
 (defoptimizer (%set-deref derive-type) ((alien value &rest noise))
-  (declare (ignore noise))
   (block nil
     (catch 'give-up-ir1-transform
       (let ((type (make-alien-type-type
@@ -272,7 +270,6 @@
              value))))
 
 (defoptimizer (%deref-addr derive-type) ((alien &rest noise))
-  (declare (ignore noise))
   (block nil
     (catch 'give-up-ir1-transform
       (return (make-alien-type-type
@@ -321,7 +318,7 @@
           (return type))))
     *wild-type*))
 
-(deftransform %set-heap-alien ((info value) (heap-alien-info *) *)
+(deftransform %set-heap-alien ((info value) (heap-alien-info t) *)
   (multiple-value-bind (sap type) (heap-alien-sap-and-type info)
     `(setf (%alien-value ,sap 0 ',type) value)))
 
@@ -414,7 +411,6 @@
         '(error "This should be eliminated as dead code."))))
 
 (defoptimizer (%local-alien-addr derive-type) ((info var))
-  (declare (ignore var))
   (if (constant-lvar-p info)
       (let* ((info (lvar-value info))
              (alien-type (local-alien-info-type info)))
@@ -433,7 +429,6 @@
 ;;;; %CAST
 
 (defoptimizer (%cast derive-type) ((alien type))
-  (declare (ignore alien))
   (or (when (constant-lvar-p type)
         (let ((alien-type (lvar-value type)))
           (when (alien-type-p alien-type)
@@ -466,7 +461,6 @@
        (give-up-ir1-transform)))))
 
 (defoptimizer (%sap-alien derive-type) ((sap type))
-  (declare (ignore sap))
   (if (constant-lvar-p type)
       (make-alien-type-type (lvar-value type))
       *wild-type*))
@@ -503,7 +497,7 @@
 ;;;; ALIEN-FUNCALL support
 
 (deftransform alien-funcall ((function &rest args)
-                             ((alien (* t)) &rest *) *)
+                             ((alien (* t)) &rest t) *)
   (let ((names (make-gensym-list (length args))))
     (/noshow "entering first DEFTRANSFORM ALIEN-FUNCALL" function args)
     `(lambda (function ,@names)
@@ -539,17 +533,17 @@
                  ;; then snarf out the string and use it as the funarg
                  ;; unless the backend lacks the CALL-OUT-NAMED vop.
                  `(%alien-funcall
-                   ,(or (when (and (gethash 'call-out-named *backend-parsed-vops*)
-                                   (lvar-matches function :fun-names '(%sap-alien)
-                                                          :arg-count 2))
-                          (let ((sap (first (combination-args (lvar-use function)))))
-                            (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
-                                                    :arg-count 1)
-                              (let ((sym (first (combination-args (lvar-use sap)))))
-                                (when (and (constant-lvar-p sym)
-                                           (stringp (lvar-value sym)))
-                                  (setq ignore-fun t)
-                                  (lvar-value sym))))))
+                   ,(or (when-vop-existsp (:named call-out-named)
+                          (when (lvar-matches function :fun-names '(%sap-alien)
+                                                       :arg-count 2)
+                            (let ((sap (first (combination-args (lvar-use function)))))
+                              (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
+                                                      :arg-count 1)
+                                (let ((sym (first (combination-args (lvar-use sap)))))
+                                  (when (and (constant-lvar-p sym)
+                                             (stringp (lvar-value sym)))
+                                    (setq ignore-fun t)
+                                    (lvar-value sym)))))))
                         `(deport function ',alien-type))
                    ',alien-type
                    ,@(deports))))
@@ -594,19 +588,16 @@
                ,body)))))))
 
 (defoptimizer (%alien-funcall derive-type) ((function type &rest args))
-  (declare (ignore function args))
   (unless (and (constant-lvar-p type)
                (alien-fun-type-p (lvar-value type)))
     (error "Something is broken."))
-  (let ((type (lvar-value type)))
-    (values-specifier-type
-     (compute-alien-rep-type
-      (alien-fun-type-result-type type)
-      :result))))
+  (let ((spec (compute-alien-rep-type
+               (alien-fun-type-result-type (lvar-value type))
+               :result)))
+    (if (eq spec '*) *wild-type* (values-specifier-type spec))))
 
 (defoptimizer (%alien-funcall ltn-annotate)
-              ((function type &rest args) node ltn-policy)
-  (declare (ignore type ltn-policy))
+              ((function type &rest args) node)
   (setf (basic-combination-info node) :funny)
   (setf (node-tail-p node) nil)
   (unless (and (constant-lvar-p function)
@@ -651,59 +642,68 @@
       ;; KLUDGE: This is where the second half of the ARM
       ;; register-pressure change lives (see above).
       (dolist (tn #-arm arg-tns #+arm (reverse arg-tns))
-        ;; On PPC, TN might be a list. This is used to indicate
-        ;; something special needs to happen. See below.
-        ;;
-        ;; FIXME: We should implement something better than this.
-        (let* ((first-tn (if (listp tn) (car tn) tn))
-               (arg (pop args))
-               (sc (tn-sc first-tn))
-               (scn (sc-number sc))
-               (move-arg-vops (svref (sc-move-arg-vops sc) scn)))
-          (aver arg)
-          (unless (= (length move-arg-vops) 1)
-            (error "no unique move-arg-vop for moves in SC ~S" (sc-name sc)))
-          #+(or x86 x86-64) (emit-move-arg-template call
-                                                     block
-                                                     (first move-arg-vops)
-                                                     (lvar-tn call block arg)
-                                                     nsp
-                                                     first-tn)
-          #-(or x86 x86-64)
-          (cond
-            #+arm-softfp
-            ((and (proper-list-of-length-p tn 3)
-                  (symbolp (third tn)))
-             (emit-template call block
-                            (template-or-lose (third tn))
-                            (reference-tn (lvar-tn call block arg) nil)
-                            (reference-tn-list (butlast tn) t)))
-            (t
-             (let ((temp-tn (make-representation-tn
-                             (tn-primitive-type first-tn) scn)))
-               (emit-move call
-                          block
-                          (lvar-tn call block arg)
-                          temp-tn)
-               (emit-move-arg-template call
-                                       block
-                                       (first move-arg-vops)
-                                       temp-tn
-                                       nsp
-                                       first-tn))))
-          #+(and ppc darwin)
-          (when (listp tn)
-            ;; This means that we have a float arg that we need to
-            ;; also copy to some int regs. The list contains the TN
-            ;; for the float as well as the TNs to use for the int
-            ;; arg.
-            (destructuring-bind (float-tn i1-tn &optional i2-tn)
-                tn
-              (if i2-tn
-                  (vop sb-vm::move-double-to-int-arg call block
-                       float-tn i1-tn i2-tn)
-                  (vop sb-vm::move-single-to-int-arg call block
-                       float-tn i1-tn))))))
+        (if (functionp tn)
+            (funcall tn (pop args) call block nsp)
+            ;; On PPC, TN might be a list. This is used to indicate
+            ;; something special needs to happen. See below.
+            ;;
+            ;; FIXME: We should implement something better than this.
+            (let* ((first-tn (if (listp tn) (car tn) tn))
+                   (arg (pop args))
+                   (sc (tn-sc first-tn))
+                   (scn (sc-number sc))
+                   (move-arg-vops (svref (sc-move-arg-vops sc) scn)))
+              (aver arg)
+              (unless (= (length move-arg-vops) 1)
+                (error "no unique move-arg-vop for moves in SC ~S" (sc-name sc)))
+
+              (cond
+                #+arm-softfp
+                ((and (listp tn)
+                      (symbolp (car (last tn))))
+                 (emit-template call block
+                                (template-or-lose (car (last tn)))
+                                (reference-tn (lvar-tn call block arg) nil)
+                                (reference-tn-list (butlast tn) t)))
+                (t
+                 (when (eq (sb-kind (sc-sb sc)) :unbounded) ;; stacks are unbounded
+                   ;; Avoid allocating this TN on the caller's stack
+                   (setf (tn-kind first-tn) :arg-pass))
+                 #+(or x86 x86-64)
+                 (emit-move-arg-template call
+                                         block
+                                         (first move-arg-vops)
+                                         (lvar-tn call block arg)
+                                         nsp
+                                         first-tn)
+                 #-(or x86 x86-64)
+                 (let* ((primitive-type (tn-primitive-type first-tn))
+                        ;; If the destination is a stack TN make sure
+                        ;; the temporary TN is a register.
+                        (scn (if (sc-number-stack-p sc)
+                                 (car (primitive-type-scs primitive-type))
+                                 scn))
+                        (temp-tn (make-representation-tn primitive-type scn)))
+                   (emit-move call block (lvar-tn call block arg) temp-tn)
+                   (emit-move-arg-template call
+                                           block
+                                           (first move-arg-vops)
+                                           temp-tn
+                                           nsp
+                                           first-tn))))
+              #+(and ppc darwin)
+              (when (listp tn)
+                ;; This means that we have a float arg that we need to
+                ;; also copy to some int regs. The list contains the TN
+                ;; for the float as well as the TNs to use for the int
+                ;; arg.
+                (destructuring-bind (float-tn i1-tn &optional i2-tn)
+                    tn
+                  (if i2-tn
+                      (vop sb-vm::move-double-to-int-arg call block
+                           float-tn i1-tn i2-tn)
+                      (vop sb-vm::move-single-to-int-arg call block
+                           float-tn i1-tn)))))))
       (aver (null args))
       (let* ((result-tns (ensure-list result-tns))
              (arg-operands
@@ -728,12 +728,12 @@
         (cond
           #+arm-softfp
           ((and lvar
-                (fourth result-tns))
+                (symbolp (car (last result-tns))))
            (emit-template call block
-                          (template-or-lose (fourth result-tns))
+                          (template-or-lose (car (last result-tns)))
                           (reference-tn-list (butlast result-tns 2) nil)
-                          (reference-tn (third result-tns) t))
-           (move-lvar-result call block (list (third result-tns)) lvar))
+                          (reference-tn (car (last result-tns 2)) t))
+           (move-lvar-result call block (list (car (last result-tns 2))) lvar))
           (t
            (move-lvar-result call block result-tns lvar)))))))
 

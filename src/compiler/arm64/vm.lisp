@@ -11,26 +11,25 @@
 
 (in-package "SB-VM")
 
-(defconstant-eqx +fixup-kinds+ #(:absolute :cond-branch :uncond-branch :layout-id)
+(defconstant-eqx +fixup-kinds+ #(:absolute :cond-branch :uncond-branch :layout-id :ubfm-imms
+                                 :pc-relative :pc-relative-ldr-str :ldr-str :move-wide)
   #'equalp)
 
 
 ;;;; register specs
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *register-names* (make-array 32 :initial-element nil)))
+(defvar *register-names* (make-array 32 :initial-element nil))
 
 (macrolet ((defreg (name offset)
              (let ((offset-sym (symbolicate name "-OFFSET")))
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
+               `(progn
                   (defconstant ,offset-sym ,offset)
                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
+             `(defglobal ,name
                   (list ,@(mapcar #'(lambda (name)
-                                      (symbolicate name "-OFFSET")) regs))))))
+                                      (symbolicate name "-OFFSET")) regs)))))
 
   (defreg nl0 0)
   (defreg nl1 1)
@@ -41,7 +40,7 @@
   (defreg nl6 6)
   (defreg nl7 7)
   (defreg nl8 8)
-  (defreg nl9 9)
+  (defreg tmp 9)
 
   (defreg r0 10)
   (defreg r1 11)
@@ -51,41 +50,41 @@
   (defreg r5 15)
   (defreg r6 16)
   (defreg r7 17)
-  ;; Can't use it on Darwin
-  (defreg r8 18)
+  (defreg #-darwin r8 #+darwin reserved 18)
   (defreg r9 19)
 
+  (defreg #+darwin r8 #-darwin r10 20)
   #+sb-thread
-  (defreg thread 20)
+  (defreg thread 21)
   #-sb-thread
-  (defreg r10 20)
+  (defreg r11 21)
 
-  (defreg lexenv 21)
+  (defreg lexenv 22)
 
-  (defreg nargs 22)
-  (defreg nfp 23)
-  (defreg ocfp 24)
-  (defreg cfp 25)
-  (defreg csp 26)
-  (defreg tmp 27)
-  (defreg null 28)
-  (defreg code 29)
+  (defreg nargs 23)
+  (defreg nfp 24)
+  (defreg ocfp 25)
+  (defreg cfp 26)
+  (defreg csp 27)
+  (defreg cardtable 28) ; preserved across C calls
+  (defreg null 29)
   (defreg lr 30)
   (defreg nsp 31)
   (defreg zr 31)
 
   (defregset system-regs
-      null cfp nsp lr code)
+      null cfp nsp lr)
 
   (defregset descriptor-regs
-      r0 r1 r2 r3 r4 r5 r6 r7 #-darwin r8 r9 #-sb-thread r10 lexenv)
+      r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 #-darwin r10 #-sb-thread r11 lexenv)
 
+  ;; nl9 can't be selected by PACK as it is a freely usable temp reg
   (defregset non-descriptor-regs
-      nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nl9 nargs nfp ocfp)
+      nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nargs nfp ocfp lr)
 
   (defregset boxed-regs
       r0 r1 r2 r3 r4 r5 r6
-      r7 #-darwin r8 r9 #-sb-thread r10 #+sb-thread thread lexenv code)
+      r7 r8 r9 #-darwin r10 #-sb-thread r11 lexenv)
 
   ;; registers used to pass arguments
   ;;
@@ -93,7 +92,10 @@
   (defconstant register-arg-count 4)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2 r3)
-  (defparameter *register-arg-names* '(r0 r1 r2 r3)))
+  (defparameter *register-arg-names* '(r0 r1 r2 r3))
+  (defregset *descriptor-args* r0 r1 r2 r3 r4 r5 r6 r7 r8 r9)
+  (defregset *non-descriptor-args* nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8)
+  (defglobal *float-regs* (loop for i below 32 collect i)))
 
 
 ;;;; SB and SC definition:
@@ -113,7 +115,6 @@
 
   ;; Anything else that can be an immediate.
   (immediate immediate-constant)
-
 
   ;; **** The stacks.
 
@@ -186,23 +187,19 @@
   (non-descriptor-reg registers
                       :locations #.non-descriptor-regs)
 
-  ;; Pointers to the interior of objects.  Used only as a temporary.
-  (interior-reg registers
-                :locations (#.lr-offset))
-
   ;; **** Things that can go in the floating point registers.
 
-  ;; Non-Descriptor single-floats.
+  (single-immediate immediate-constant)
+  (double-immediate immediate-constant)
+
   (single-reg float-registers
               :locations #.(loop for i below 32 collect i)
-              :constant-scs ()
+              :constant-scs (single-immediate)
               :save-p t
               :alternate-scs (single-stack))
-
-  ;; Non-Descriptor double-floats.
   (double-reg float-registers
               :locations #.(loop for i below 32 collect i)
-              :constant-scs ()
+              :constant-scs (double-immediate)
               :save-p t
               :alternate-scs (double-stack))
 
@@ -219,7 +216,8 @@
                       :alternate-scs (complex-double-stack))
 
   (catch-block control-stack :element-size catch-block-size)
-  (unwind-block control-stack :element-size unwind-block-size))
+  (unwind-block control-stack :element-size unwind-block-size)
+  (zero immediate-constant))
 
 ;;;; Make some random tns for important registers.
 
@@ -233,8 +231,8 @@
 
   (defregtn null descriptor-reg)
   (defregtn lexenv descriptor-reg)
-  (defregtn code descriptor-reg)
   (defregtn tmp any-reg)
+  (defregtn cardtable any-reg)
 
   (defregtn nargs any-reg)
   (defregtn ocfp any-reg)
@@ -242,9 +240,9 @@
   (defregtn zr any-reg)
   (defregtn cfp any-reg)
   (defregtn csp any-reg)
-  (defregtn lr interior-reg)
+  (defregtn lr any-reg)
   #+sb-thread
-  (defregtn thread interior-reg))
+  (defregtn thread any-reg))
 
 ;;; If VALUE can be represented as an immediate constant, then return the
 ;;; appropriate SC number, otherwise return NIL.
@@ -258,7 +256,14 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (double-float
+     double-immediate-sc-number)
+    (single-float
+     single-immediate-sc-number)
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (eql sc immediate-sc-number))
@@ -310,56 +315,6 @@
                  (complex-double-reg "Q"))
                offset)))))
 
-(defun combination-implementation-style (node)
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (if (or (valid-funtype '(signed-word signed-word) '*)
-               (valid-funtype '(word word) '*))
-           (values :maybe nil)
-           (values :default nil)))
-      (logbitp
-       (cond
-         ((or (valid-funtype `((constant-arg (mod ,n-word-bits)) signed-word) '*)
-              (valid-funtype `((constant-arg (mod ,n-word-bits)) word) '*))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         (t (values :default nil))))
-      (%ldb
-       (flet ((validp (type width)
-                (and (valid-funtype `((constant-arg (integer 1 ,(1- width)))
-                                      (constant-arg (mod ,width))
-                                      ,type)
-                                    'unsigned-byte)
-                     (destructuring-bind (size posn integer)
-                         (sb-c::basic-combination-args node)
-                       (declare (ignore integer))
-                       (and (plusp (sb-c::lvar-value posn))
-                            (<= (+ (sb-c::lvar-value size)
-                                   (sb-c::lvar-value posn))
-                                width))))))
-         (if (or (validp 'word (1- n-word-bits))
-                 (validp 'signed-word (1- n-word-bits)))
-             (values :transform '(lambda (size posn integer)
-                                  (%%ldb integer size posn)))
-             (values :default nil))))
-      (%dpb
-       (flet ((validp (type result-type)
-                (valid-funtype `(,type
-                                 (constant-arg (integer 1 ,(1- n-word-bits)))
-                                 (constant-arg (mod ,n-word-bits))
-                                 ,type)
-                               result-type)))
-         (if (or (validp 'signed-word 'signed-word)
-                 (validp 'word 'word))
-             (values :transform '(lambda (newbyte size posn integer)
-                                  (%%dpb newbyte size posn integer)))
-             (values :default nil))))
-      (t (values :default nil)))))
-
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))
   nil)
@@ -386,5 +341,9 @@
         sb-arm64-asm::fixnum-add-sub-immediate-p
         sb-arm64-asm::encode-logical-immediate
         sb-arm64-asm::fixnum-encode-logical-immediate
+        fixnum-encode-logical-immediate-ignore-tag
         bic-encode-immediate
-        bic-fixnum-encode-immediate))
+        bic-fixnum-encode-immediate
+        logical-immediate-or-word-mask
+        sb-arm64-asm::ldr-str-offset-encodable
+        power-of-two-p))

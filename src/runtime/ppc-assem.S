@@ -3,16 +3,10 @@
 .section .note.GNU-stack,"",%progbits
 #endif
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "lispregs.h"
-#include "globals.h"
 #include "validate.h"
-
-#include "genesis/simple-fun.h"
-#include "genesis/fdefn.h"
 #include "genesis/closure.h"
-#include "genesis/code.h"
-#include "genesis/funcallable-instance.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
 
@@ -283,10 +277,12 @@ x:
 
 #endif
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-/* the CSP page sits right before the thread */
-# define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
-#endif
+#define BEGIN_PSEUDO_ATOMIC stb reg_NULL,THREAD_PSEUDO_ATOMIC_BITS_OFFSET(reg_THREAD)
+#define END_PSEUDO_ATOMIC \
+	stb reg_THREAD, THREAD_PSEUDO_ATOMIC_BITS_OFFSET(reg_THREAD) ; \
+	lhz reg_NL3, (2+THREAD_PSEUDO_ATOMIC_BITS_OFFSET)(reg_THREAD) ; \
+	twnei reg_NL3, 0
+
 	.text
 
 #ifdef LISP_FEATURE_OS_THREAD_STACK
@@ -300,9 +296,16 @@ x:
 
 	/* store old SP and switch to new stack */
         lwz     REG(10),THREAD_ALIEN_STACK_START_OFFSET(REG(3))
+#ifdef LISP_FEATURE_DARWIN /* FIXME: is this correct? */
+        addis   REG(10),REG(10),ha16(ALIEN_STACK_SIZE)
+#if ALIEN_STACK_SIZE % 65536 != 0
+        addi    REG(10),REG(10),lo16(ALIEN_STACK_SIZE)
+#endif
+#else
         addis   REG(10),REG(10),ALIEN_STACK_SIZE@ha
 #if ALIEN_STACK_SIZE % 65536 != 0
         addi    REG(10),REG(10),ALIEN_STACK_SIZE@l
+#endif
 #endif
 	stwu	REG(1),-16(REG(10))
 	mr	REG(1),REG(10)
@@ -337,12 +340,14 @@ x:
 	mr reg_A2, reg_NL2
 
 	/* Call out to obtain our TLS block. */
-	load(reg_NL0,CSYMBOL(specials))
-	/* This won't work on darwin: wrong fixup style.  And is it
-	 * supposed to be lis/ori or lis/addi?  Or does it differ
-	 * between darwin and everything else again? */
-	lis reg_CFUNC,CSYMBOL(pthread_getspecific)@h
-	ori reg_CFUNC,reg_CFUNC,CSYMBOL(pthread_getspecific)@l
+	load(reg_NL0,CSYMBOL(current_thread))
+#ifdef LISP_FEATURE_DARWIN
+	lis reg_CFUNC,hi16(CSYMBOL(arch_os_thread_getspecific))
+	ori reg_CFUNC,reg_CFUNC,lo16(CSYMBOL(arch_os_thread_getspecific))
+#else
+ 	lis reg_CFUNC,CSYMBOL(pthread_getspecific)@h
+ 	ori reg_CFUNC,reg_CFUNC,CSYMBOL(pthread_getspecific)@l
+#endif
 	mtctr reg_CFUNC
 	bctrl
 	mr reg_THREAD, reg_NL0
@@ -351,6 +356,8 @@ x:
 	mr reg_NL2, reg_A2
 	mr reg_NL1, reg_A1
 	mr reg_NL0, reg_A0
+#else
+	load(reg_THREAD,CSYMBOL(all_threads))
 #endif
 	/* store(reg_POLL,11,saver2) */
 	/* Initialize tagged registers */
@@ -367,9 +374,7 @@ x:
 	li reg_A3,0
 	li reg_L0,0
 	li reg_L1,0
-#if !defined(LISP_FEATURE_SB_THREAD)
 	li reg_L2,0
-#endif
 	li reg_LIP,0
 #ifdef LISP_FEATURE_DARWIN
 	lis reg_NULL,hi16(NIL)
@@ -380,9 +385,9 @@ x:
 #endif
 	/* Turn on pseudo-atomic */
 
-	li reg_ALLOC,flag_PseudoAtomic
+	BEGIN_PSEUDO_ATOMIC
 #if defined(LISP_FEATURE_SB_THREAD)
-	stw reg_ZERO,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	stw reg_ZERO,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 	lwz reg_BSP,THREAD_BINDING_STACK_POINTER_OFFSET(reg_THREAD)
 	lwz reg_CSP,THREAD_CONTROL_STACK_POINTER_OFFSET(reg_THREAD)
 	lwz reg_OCFP,THREAD_CONTROL_FRAME_POINTER_OFFSET(reg_THREAD)
@@ -392,17 +397,9 @@ x:
 	load(reg_CSP,CSYMBOL(current_control_stack_pointer))
 	load(reg_OCFP,CSYMBOL(current_control_frame_pointer))
 #endif
-	/* This is important for CHENEYGC: It's the allocation
-	 * pointer.  It's also important for ROOM on GENCGC:
-	 * It's a pointer to the end of dynamic space, used to
-	 * determine where to stop in MAP-ALLOCATED-OBJECTS. */
-	load(reg_NL4,CSYMBOL(dynamic_space_free_pointer))
-	add reg_ALLOC,reg_ALLOC,reg_NL4
 
 	/* No longer atomic, and check for interrupt */
-	subi reg_ALLOC,reg_ALLOC,flag_PseudoAtomic
-	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
-	twnei reg_NL3, 0
+	END_PSEUDO_ATOMIC
 
 	/* Pass in the arguments */
 
@@ -443,7 +440,7 @@ lra:
 	mr REG(3),reg_A0
 
 	/* Turn on  pseudo-atomic */
-	la reg_ALLOC,flag_PseudoAtomic(reg_ALLOC)
+	BEGIN_PSEUDO_ATOMIC
 
 #if defined(LISP_FEATURE_SB_THREAD)
 	/* Store lisp state */
@@ -452,26 +449,19 @@ lra:
 	stw reg_CFP,THREAD_CONTROL_FRAME_POINTER_OFFSET(reg_THREAD)
 
 	/* No longer in Lisp. */
-	stw reg_ALLOC,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	stw reg_THREAD,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 #else
 	/* Store lisp state */
-	clrrwi reg_NL1,reg_ALLOC,3
-	store(reg_NL1,reg_NL2,CSYMBOL(dynamic_space_free_pointer))
-	/* store(reg_POLL,reg_NL2,poll_flag) */
-	/* load(reg_NL2,current_thread) */
 	store(reg_BSP,reg_NL2,CSYMBOL(current_binding_stack_pointer))
 	store(reg_CSP,reg_NL2,CSYMBOL(current_control_stack_pointer))
 	store(reg_CFP,reg_NL2,CSYMBOL(current_control_frame_pointer))
-	/* load(reg_POLL,saver2) */
 
 	/* No longer in Lisp. */
 	store(reg_NL1,reg_NL2,CSYMBOL(foreign_function_call_active))
 #endif
 
 	/* Check for interrupt */
-	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
-	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
-	twnei reg_NL3,0
+	END_PSEUDO_ATOMIC
 
 	/* Back to C */
 	C_FULL_EPILOG
@@ -501,7 +491,7 @@ lra:
 	mr reg_NARGS,reg_NL3
 
 	/* Turn on pseudo-atomic */
-	la reg_ALLOC,flag_PseudoAtomic(reg_ALLOC)
+	BEGIN_PSEUDO_ATOMIC
 
 	/* Convert the return address to an offset and save it on the stack. */
 	sub reg_NFP,reg_LIP,reg_CODE
@@ -515,11 +505,9 @@ lra:
 	stw reg_CFP,THREAD_CONTROL_FRAME_POINTER_OFFSET(reg_THREAD)
 
 	/* No longer in Lisp. */
-	stw reg_CSP,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	stw reg_CSP,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 #else
 	/* Store Lisp state */
-	clrrwi reg_NFP,reg_ALLOC,3
-	store(reg_NFP,reg_CFUNC,CSYMBOL(dynamic_space_free_pointer))
 	/* load(reg_CFUNC,current_thread) */
 
 	store(reg_BSP,reg_CFUNC,CSYMBOL(current_binding_stack_pointer))
@@ -529,21 +517,8 @@ lra:
 	/* No longer in Lisp */
 	store(reg_CSP,reg_CFUNC,CSYMBOL(foreign_function_call_active))
 #endif
-	/* load(reg_POLL,saver2) */
 	/* Disable pseudo-atomic; check pending interrupt */
-	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
-	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
-	twnei reg_NL3, 0
-
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-	/* OK to run GC without stopping this thread from this point on. */
-#  ifdef LISP_FEATURE_SB_THREAD
-	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
-#  else
-	load(reg_CFUNC,CSYMBOL(all_threads))
-	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_CFUNC)
-#  endif
-#endif
+	END_PSEUDO_ATOMIC
 
 	mr reg_NL3,reg_NARGS
 
@@ -582,28 +557,15 @@ lra:
 	li reg_A3,0
 	li reg_L0,0
 	li reg_L1,0
-#if !defined(LISP_FEATURE_SB_THREAD)
-	/* reg_L2 is our TLS block pointer. */
 	li reg_L2,0
-#endif
 	li reg_LIP,0
 
-# ifdef LISP_FEATURE_SB_SAFEPOINT
-	/* No longer OK to run GC except at safepoints. */
-#  ifdef LISP_FEATURE_SB_THREAD
-	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
-#  else
-	load(reg_BSP,CSYMBOL(all_threads))
-	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_BSP)
-#  endif
-# endif
-
 	/* Atomic ... */
-	li reg_ALLOC,flag_PseudoAtomic
+	BEGIN_PSEUDO_ATOMIC
 
 #if defined(LISP_FEATURE_SB_THREAD)
 	/* No longer in foreign function call. */
-	stw reg_ZERO,THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET(reg_THREAD)
+	stw reg_ZERO,THREAD_FFCALL_ACTIVE_P_OFFSET(reg_THREAD)
 
 	/* The binding stack pointer isn't preserved by C. */
 	lwz reg_BSP,THREAD_BINDING_STACK_POINTER_OFFSET(reg_THREAD)
@@ -617,12 +579,6 @@ lra:
 	/* The BSP wasn't preserved by C, so load it */
 	load(reg_BSP,CSYMBOL(current_binding_stack_pointer))
 #endif
-	/* This is important for CHENEYGC: It's the allocation
-	 * pointer.  It's also important for ROOM on GENCGC:
-	 * It's a pointer to the end of dynamic space, used to
-	 * determine where to stop in MAP-ALLOCATED-OBJECTS. */
-	load(reg_NL4,CSYMBOL(dynamic_space_free_pointer))
-	add reg_ALLOC,reg_ALLOC,reg_NL4
 
 	/* Other lisp stack/frame pointers were preserved by C.
 	I can't imagine why they'd have moved */
@@ -637,9 +593,7 @@ lra:
 	mtlr reg_LIP
 
 	/* No longer atomic */
-	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
-	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
-	twnei reg_NL3, 0
+	END_PSEUDO_ATOMIC
 
 	/* Reset the lisp stack. */
 	mr reg_CSP,reg_CFP
@@ -660,11 +614,6 @@ lra:
 	.globl CSYMBOL(fun_end_breakpoint_trap)
 	.globl CSYMBOL(fun_end_breakpoint_end)
 
-	/* Due to pointer verification in MAKE-LISP-OBJ, this must
-	include its header data (the offset from the start of the
-	code-object to the LRA). */
-	.long  (((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
-
 	/* We are receiving unknown multiple values, thus must deal
 	with the single-value and multiple-value cases separately. */
 	b fun_end_breakpoint_multiple_values
@@ -676,10 +625,10 @@ lra:
 	obtain a tagged pointer to the enclosing code component.  Both
 	values are tagged OTHER_POINTER_LOWTAG, so we just have to
 	account for N words (see calculation for RETURN_PC_WIDETAG, above)
-	between the two addresses.
-	Restoring reg_CODE doesn't appear to be strictly necessary
-	here, but let's observe the niceties.*/
-	addi reg_CODE, reg_LRA, ((CODE_SIZE+1)&~1)*-N_WORD_BYTES
+	between the two addresses. */
+        /* KLUDGE: I have no idea why CODE_SIZE+4 is correct here,
+	let alone the general formula for keeping this maintenance-free */
+	addi reg_CODE, reg_LRA, (CODE_SIZE+4)*-N_WORD_BYTES
 
 	/* Multiple values are stored relative to reg_OCFP, which we
 	set to be the current top-of-stack. */
@@ -702,6 +651,7 @@ lra:
 fun_end_breakpoint_multiple_values:
 	/* Compute the correct value for reg_CODE.  See the
 	explanation for the single-value case, above. */
+        /* XXX: I have literally no idea why this constant is -24 */
 	addi reg_CODE, reg_LRA, -24
 
 	/* The actual magic trap. */

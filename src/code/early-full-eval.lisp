@@ -11,14 +11,12 @@
 
 (in-package "SB-EVAL")
 
-(defparameter *eval-level* -1) ; initialized by genesis
-(defparameter *eval-verbose* nil) ; initialized by genesis
-
 ;; !defstruct-with-alternate-metaclass is unslammable and the
 ;; RECOMPILE restart doesn't work on it.  This is the main reason why
 ;; this stuff is split out into its own file.  Also, it lets the
 ;; INTERPRETED-FUNCTION type be declared before it is used in
 ;; compiler/main and code/deftypes-for-target.
+#-sb-xc-host
 (sb-kernel:!defstruct-with-alternate-metaclass
  interpreted-function
  ;; DEBUG-NAME and DEBUG-LAMBDA-LIST are initially a copies of the proper
@@ -32,20 +30,3 @@
  :metaclass-name static-classoid
  :metaclass-constructor make-static-classoid
  :dd-type funcallable-structure)
-
-(defun make-interpreted-function
-      (&key name lambda-list env declarations documentation body source-location
-            (debug-lambda-list lambda-list))
-    (let ((function (%make-interpreted-function
-                     name name lambda-list debug-lambda-list env
-                     declarations documentation body source-location)))
-      (setf (%funcallable-instance-fun function)
-            #'(lambda (&rest args)
-                (interpreted-apply function args)))
-      function))
-
-(defmethod print-object ((obj interpreted-function) stream)
-  (print-unreadable-object (obj stream
-                            :identity (not (interpreted-function-name obj)))
-    (format stream "~A ~A" '#:interpreted-function
-            (interpreted-function-name obj))))

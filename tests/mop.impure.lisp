@@ -20,6 +20,13 @@
   (:use "CL" "SB-MOP" "ASSERTOID" "TEST-UTIL"))
 
 (in-package "MOP-TEST")
+
+;;; AMOP says these are the defaults
+(with-test (:name :standard-direct-superclasses)
+  (assert (equal (list (find-class 'standard-object))
+                 (sb-mop:class-direct-superclasses (make-instance 'standard-class))))
+  (assert (equal (list (find-class 'sb-mop:funcallable-standard-object))
+                 (sb-mop:class-direct-superclasses (make-instance 'sb-mop:funcallable-standard-class)))))
 
 ;;; Readers for Class Metaobjects (pp. 212--214 of AMOP)
 (defclass red-herring (forward-ref) ())
@@ -141,7 +148,8 @@
 (defmethod validate-superclass ((c1 automethod-class) (c2 standard-class))
   t)
 (defmethod finalize-inheritance :after ((x automethod-class))
-  (format t "~&~S ~S~%" x (find-class (class-name x))))
+  ;; not sure what this output demonstrated
+  (format (make-broadcast-stream) "~&~S ~S~%" x (find-class (class-name x))))
 (defclass automethod-object () ()
   (:metaclass automethod-class))
 (defvar *automethod-object* (make-instance 'automethod-object))
@@ -189,7 +197,10 @@
     ;;   4 words for ALLOC-XSET
     ;;   1 cons in MAKE-EQL-TYPE
     ;;   1 cons in ADD-TO-XSET
-    #-interpreter
+    ;; The %BITS slot in CTYPE is (unsigned-byte 32) so it's raw for 32-bit word size,
+    ;; which meeans we can't DX-allocate the temporary key in NEW-CTYPE unless the
+    ;; architecture allows raw words on the stack.
+    #+(and (not interpreter) (or 64-bit c-stack-is-control-stack))
     (ctu:assert-no-consing (typep 4.0 spec))))
 
 ;;; BUG #334, relating to programmatic addition of slots to a class
@@ -636,6 +647,8 @@
       (setf (slot-value slotd 'function) (fdefinition *func-slot*)))
     slotd))
 
+;; I hope this declamation doesn't change the nature of the test
+(declaim (ftype function foofoo))
 (with-test (:name :class-redefinition-changes-custom-slot-type)
   (eval `(defclass func-slot-object ()
            ((foo :initarg :foo :reader foofoo))
@@ -701,8 +714,9 @@
                   #'definitely-a-funcallable-instance)
                  type-error))
 
+(let ((*error-output* (make-broadcast-stream)))
+  (eval '(defstruct nil-slot-name nil)))
 (with-test (:name (defstruct :nil-slot-name :bug-633911))
-  (defstruct nil-slot-name nil)
   (let ((fun (compile nil '(lambda (x) (slot-value x 'nil)))))
     (assert (= 3 (funcall fun (make-nil-slot-name :nil 3))))))
 

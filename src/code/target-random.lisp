@@ -275,7 +275,6 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                   (ash y -1) (aref state (logand y 1)))))
   (values))
 
-#-sb-devel
 (declaim (start-block random %random-single-float %random-double-float
                       random-chunk big-random-chunk))
 
@@ -325,37 +324,37 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
 (defun %random-single-float (arg state)
   (declare (type (single-float ($0f0)) arg)
            (type random-state state))
-  (* arg
-     (- (make-single-float
-         (dpb (ash (random-chunk state)
-                   (- sb-vm:single-float-digits n-random-chunk-bits))
-              sb-vm:single-float-significand-byte
-              (single-float-bits $1.0)))
-        $1.0)))
+  (loop for candidate of-type single-float
+        = (* arg
+             (- (make-single-float
+                 (dpb (ash (random-chunk state)
+                           (- sb-vm:single-float-digits n-random-chunk-bits))
+                      sb-vm:single-float-significand-byte
+                      (single-float-bits $1.0)))
+                $1.0))
+        while (#+x86 eql ;; Can't use = due to 80-bit precision
+               #-x86 =
+               candidate arg)
+        finally (return candidate)))
 (declaim (ftype (function ((double-float ($0d0)) random-state)
                           (double-float $0d0))
                 %random-double-float))
 
-;;; 32-bit version
-#+nil
-(defun %random-double-float (arg state)
-  (declare (type (double-float ($0d0)) arg)
-           (type random-state state))
-  (* (float (random-chunk state) $1d0) (/ $1d0 (expt 2 32))))
-
-;;; 53-bit version
 #-x86
 (defun %random-double-float (arg state)
   (declare (type (double-float ($0d0)) arg)
            (type random-state state))
-  (* arg
-     (- (sb-impl::make-double-float
-         (dpb (ash (random-chunk state)
-                   (- sb-vm:double-float-digits n-random-chunk-bits 32))
-              sb-vm:double-float-significand-byte
-              (sb-impl::double-float-high-bits $1d0))
-         (random-chunk state))
-        $1d0)))
+  (loop for candidate of-type double-float
+        = (* arg
+             (- (sb-impl::make-double-float
+                 (dpb (ash (random-chunk state)
+                           (- sb-vm:double-float-digits n-random-chunk-bits 32))
+                      sb-vm:double-float-hi-significand-byte
+                      (sb-impl::double-float-high-bits $1d0))
+                 (random-chunk state))
+                $1d0))
+        while (= candidate arg)
+        finally (return candidate)))
 
 ;;; using a faster inline VOP
 #+x86
@@ -363,15 +362,19 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
   (declare (type (double-float ($0d0)) arg)
            (type random-state state))
   (let ((state-vector (random-state-state state)))
-    (* arg
-       (- (sb-impl::make-double-float
-           (dpb (ash (sb-vm::random-mt19937 state-vector)
-                     (- sb-vm:double-float-digits n-random-chunk-bits
-                        sb-vm:n-word-bits))
-                sb-vm:double-float-significand-byte
-                (sb-impl::double-float-high-bits $1d0))
-           (sb-vm::random-mt19937 state-vector))
-          $1d0))))
+    (loop for candidate of-type double-float
+          = (* arg
+               (- (sb-impl::make-double-float
+                   (dpb (ash (sb-vm::random-mt19937 state-vector)
+                             (- sb-vm:double-float-digits n-random-chunk-bits
+                                sb-vm:n-word-bits))
+                        sb-vm:double-float-hi-significand-byte
+                        (sb-impl::double-float-high-bits $1d0))
+                   (sb-vm::random-mt19937 state-vector))
+                  $1d0))
+          ;; Can't use = due to 80-bit precision
+          while (eql candidate arg)
+          finally (return candidate))))
 
 
 ;;;; random fixnums
@@ -409,9 +412,9 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
               (accept-reject-loop big-random-chunk))))))
 
 (defun random (arg &optional (state *random-state*))
-  #-sb-fluid (declare (inline %random-fixnum
-                               %random-single-float %random-double-float
-                               #+long-float %random-long-float))
+  (declare (inline %random-fixnum
+                   %random-single-float %random-double-float
+                   #+long-float %random-long-float))
   (declare (explicit-check))
   (cond
     ((and (fixnump arg) (> arg 0))

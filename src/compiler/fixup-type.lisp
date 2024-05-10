@@ -2,10 +2,11 @@
 
 (!begin-collecting-cold-init-forms)
 
-(define-load-time-global *!initial-parsed-types* nil)
 (!cold-init-forms
+ #-sb-xc-host
  (dovector (saetp sb-vm:*specialized-array-element-type-properties*)
-   (setf (sb-vm:saetp-ctype saetp) (specifier-type (sb-vm:saetp-specifier saetp))))
+   (setf (aref sb-vm::*saetp-widetag-ctype* (ash (- (sb-vm:saetp-typecode saetp) 128) -2))
+         (sb-vm:saetp-ctype saetp)))
   ;; This seems so weird and random. I really wanted to remove it, but
   ;; adding the :BUILTIN property makes sense because without it, the type
   ;; does not have a unique parse. Probably a missing entry in one of the
@@ -21,11 +22,6 @@
   ;; :BUILTIN essentially means :PRIMITIVE in this case.
  (let ((spec 'compiled-function))
    (setf (info :type :builtin spec) (specifier-type spec)
-         (info :type :kind spec) :primitive))
- #-sb-xc-host
- (dovector (pair *!initial-parsed-types*)
-   (destructuring-bind (spec . parse) pair
-     (drop-all-hash-caches) ; start from a relative vacuum
-     (aver (equal (type-specifier parse) spec)))))
+         (info :type :kind spec) :primitive)))
 
 (!defun-from-collected-cold-init-forms !fixup-type-cold-init)

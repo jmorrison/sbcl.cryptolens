@@ -11,12 +11,23 @@
 
 (in-package "SB-IMPL")
 
-;;;; We often use a source-transform to do macro-like rewriting of an
-;;;; ordinary function call. Source-transforms seem to pre-date the ANSI
-;;;; specification and are redundant with compiler-macros.
-;;;; In the interest of not multiplying entities needlessly, it should
-;;;; be feasible to get rid of source-transforms.
-;;;; A problem is namespace clobbering: these must not affect the host Lisp.
+;;;; Source transforms are used by the compiler to make code more
+;;;; canonical so that the compiler can compile it futher; they are
+;;;; not optional. Compiler macros are an optional source rewriting
+;;;; mechanism mainly for compile-time syntax checking and
+;;;; optimizations that can be declined for any reason, but especially
+;;;; through the use of NOTINLINE. Perhaps the actual mechanism
+;;;; outside the decision to do rewriting could be reunified. We also
+;;;; must pay special attention when writing compiler macros for the
+;;;; purposes of cross-compiling. A problem is namespace clobbering:
+;;;; these must not affect the host Lisp.
+
+;;; The function that corresponds to this macro is defined in src/code/typep.
+;;; This expansion is not particularly good for the interpreter, so just
+;;; call the function when not compiling.
+(define-compiler-macro sb-kernel::%typecase-index (layout-lists object sealed)
+  (let ((exp (sb-impl::optimize-%typecase-index layout-lists object sealed)))
+    exp))
 
 ;;; A sanity-checker for an extremely common programmer error.
 (define-compiler-macro format (&whole form destination control &rest args)
@@ -36,13 +47,6 @@
                first keyword argument.~:@>"
                 eof-error-p 'read-from-string)
     t)))
-
-(eval-when (:compile-toplevel :execute)
-  (setf (sb-int:info :function :kind 'sb-c:policy) :macro
-        (sb-int:info :function :macro-function 'sb-c:policy)
-        (lambda (form env)
-          (declare (ignore env))
-          (values (cl:macroexpand-1 form nil)))))
 
 (define-compiler-macro read-from-string (&whole form string &rest args
                                          &environment env)
@@ -76,7 +80,7 @@
                           (:preserve-whitespace 2)
                           (otherwise (return-from read-from-string form))))
                  (var (if (logbitp index seen)
-                          (let ((x (sb-xc:gensym "IGNORE")))
+                          (let ((x (gensym "IGNORE")))
                             (push x ignore)
                             x)
                           (setf seen (logior (ash 1 index) seen)

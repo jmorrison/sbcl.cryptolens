@@ -280,7 +280,8 @@
 (with-test (:name (:printing-unintitialized-condition :bug-1184586))
   (prin1-to-string (make-condition 'simple-type-error)))
 
-(with-test (:name (:print-undefined-function-condition))
+(with-test (:name (:print-undefined-function-condition)
+            :fails-on :ppc64)
   (handler-case (funcall '#:foo)
     (undefined-function (c) (princ-to-string c))))
 
@@ -423,9 +424,10 @@ is not of type
 
 ;;; Instances of LAYOUT for condition classoids created by genesis
 ;;; should resemble ones created normally. Due to a bug, they did not.
+;;; (The LENGTH slot had the wrong value)
 (with-test (:name :condition-layout-lengths)
   (loop for layout being each hash-value of (sb-kernel:classoid-subclasses
-                                             (sb-kernel:find-classoid 'condition))
+                                              (sb-kernel:find-classoid 'condition))
         for len = (sb-kernel:layout-length layout)
         minimize len into min
         maximize len into max
@@ -447,3 +449,23 @@ is not of type
     (error (e)
       (assert (equal (sb-kernel:type-error-datum-stored-type e)
                      '(simple-vector 3))))))
+
+(with-test (:name (:handler-bind-evaluation-count :lp1916302))
+  (let (list)
+    (handler-bind ((condition (let ((x 0))
+                                (lambda (c)
+                                  (declare (ignore c))
+                                  (push (incf x) list)))))
+      (signal 'condition)
+      (signal 'condition))
+    (assert (equalp '(2 1) list))))
+
+(with-test (:name (:handler-bind-evaluation-count :separate-establishment))
+  (let (list)
+    (dotimes (i 2)
+      (handler-bind ((condition (let ((x 0))
+                                  (lambda (c)
+                                    (declare (ignore c))
+                                    (push (incf x) list)))))
+        (signal 'condition)))
+    (assert (equalp '(1 1) list))))

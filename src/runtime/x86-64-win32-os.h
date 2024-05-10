@@ -3,9 +3,7 @@
 
 typedef struct os_context_t {
   CONTEXT* win32_context;
-#ifdef LISP_FEATURE_SB_THREAD
   sigset_t sigmask;
-#endif
 } os_context_t;
 
 typedef intptr_t os_context_register_t;
@@ -19,5 +17,7 @@ static inline DWORD NT_GetLastError() {
 unsigned long os_context_fp_control(os_context_t *context);
 void os_restore_fp_control(os_context_t *context);
 os_context_register_t * os_context_fp_addr(os_context_t *context);
+
+#define OS_CONTEXT_PC(context) context->win32_context->Rip
 
 #endif /* _X86_64_WIN32_OS_H */

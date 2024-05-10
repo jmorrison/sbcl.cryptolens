@@ -11,29 +11,23 @@
 
 (in-package "SB-VM")
 
-;;; Make sure to always write back into our return register so that
-;;; backtracing in assembly routines work correctly.
-(defun invoke-asm-routine (routine)
-  (inst jal lip-tn (make-fixup routine :assembly-routine)))
-
 (defun generate-call-sequence (name style vop options)
   (declare (ignore vop options))
   (ecase style
-    ((:none :raw)
+    (:raw
+     (let ((ra (make-symbol "RA")))
+       (values
+        `((inst jal ,ra (make-fixup ',name :assembly-routine)))
+        `((:temporary (:sc descriptor-reg :from (:eval 0) :to (:eval 1)
+                       :offset ra-offset)
+                      ,ra)))))
+    (:none
      (values
-      `((inst jal lip-tn (make-fixup ',name :assembly-routine)))
+      `((inst jal zero-tn (make-fixup ',name :assembly-routine)))
       `()))))
 
 (defun generate-return-sequence (style)
   (ecase style
-    (:none)
     (:raw
-     `((inst jalr zero-tn lip-tn 0)))))
-
-#-sb-xc-host ; CONTEXT-REGISTER is not defined at xc-time
-(defun return-machine-address (scp)
-  ;; KLUDGE: Taken from SPARC backend. Why does `8' need to be added
-  ;; to the return address? Without it, backtraces get truncated and
-  ;; are incorrect. Are the other backends wrong as well by not adding
-  ;; 8?
-  (+ (context-register scp lip-offset) 8))
+     `((inst jalr zero-tn ra-tn 0)))
+    (:none)))

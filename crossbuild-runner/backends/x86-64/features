@@ -1,5 +1,8 @@
+:int3-breakpoints
 :64-bit
 :gencgc
+:use-cons-region
+:soft-card-marks
 :stack-grows-downward-not-upward
 :c-stack-is-control-stack
 :compare-and-swap-vops
@@ -7,8 +10,8 @@
 :fp-and-pc-standard-save
 :alien-callbacks
 :cycle-counter
-:integer-eql-vop
 :undefined-fun-restarts
 :call-symbol
+:executable-funinstances
 :unbind-in-unwind
 :no-continue-unwind

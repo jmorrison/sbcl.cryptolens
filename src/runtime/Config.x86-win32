@@ -40,7 +40,7 @@ __LDFLAGS__ =
 
 OS_LIBS = -l ws2_32 -ladvapi32
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-  OS_LIBS += -lz
+  OS_LIBS += -lzstd
 endif
 ifdef LISP_FEATURE_SB_FUTEX
   OS_LIBS += -lSynchronization
@@ -48,7 +48,7 @@ endif
 
 GC_SRC = fullcgc.c gencgc.c traceroot.c
 
-CFLAGS = -g -Wall -O3 \
+CFLAGS += -g -Wall -O3 \
         -fno-omit-frame-pointer -march=i686 -DWINVER=0x600 -D_WIN32_WINNT=0x600 \
         -D__W32API_USE_DLLIMPORT__ \
 	-mpreferred-stack-boundary=2
@@ -57,6 +57,6 @@ CFLAGS = -g -Wall -O3 \
 
 CC = gcc
 
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:
+ifeq ($(shell $(LD) --disable-dynamicbase 2>&1 | grep disable-dynamicbase),)
+LINKFLAGS += -Wl,--disable-dynamicbase,--disable-nxcompat
+endif

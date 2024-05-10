@@ -11,7 +11,7 @@
 
 (in-package "SB-KERNEL")
 
-(defparameter *break-on-signals* nil ; initialized by genesis
+(defvar *break-on-signals* nil
   "When (TYPEP condition *BREAK-ON-SIGNALS*) is true, then calls to SIGNAL will
    enter the debugger prior to signalling that condition.")
 
@@ -79,10 +79,10 @@
   (declare (explicit-check))
   (%signal (apply #'coerce-to-condition datum 'simple-condition 'signal arguments)))
 (defun %signal (condition)
-  (let ((handler-clusters *handler-clusters*)
-        (sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint* '%signal)))
+  (let ((handler-clusters *handler-clusters*))
     (when *break-on-signals*
-      (maybe-break-on-signal condition))
+      (let ((sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint* '%signal)))
+        (maybe-break-on-signal condition)))
     (do ((cluster (pop handler-clusters) (pop handler-clusters)))
         ((null cluster)
          nil)
@@ -93,29 +93,17 @@
       ;; would lead to infinite recursive SIGNAL calls.
       (let ((*handler-clusters* handler-clusters))
         (dolist (handler cluster)
-          (macrolet ((cast-to-fun (f possibly-symbolp)
-                       ;; For efficiency the cases are tested in this order:
-                       ;;  - FUNCTIONP is just a lowtag test
-                       ;;  - FDEFN-P is a lowtag + widetag.
-                       ;; Avoiding a SYMBOLP test is fine because
-                       ;; SYMBOL-FUNCTION rejects bogosity anyway.
-                       `(let ((f ,f))
-                          (cond ((functionp f) f)
-                                (,(if possibly-symbolp `(fdefn-p f) 't)
-                                  (sb-c:safe-fdefn-fun f))
-                                ,@(if possibly-symbolp
-                                      `((t (symbol-function f))))))))
-            (let ((test (car (truly-the cons handler))))
-              (when (if (%instancep test) ; a condition classoid cell
-                        (classoid-cell-typep test condition)
-                        (funcall (cast-to-fun test nil) condition))
-                (funcall (cast-to-fun (cdr handler) t) condition)))))))))
+          (let ((test (car (truly-the cons handler))))
+            (when (if (%instancep test) ; a condition classoid cell
+                      (classoid-cell-typep test condition)
+                      (funcall test condition))
+              (funcall (cdr handler) condition))))))))
 
 ;;;; working with *CURRENT-ERROR-DEPTH* and *MAXIMUM-ERROR-DEPTH*
 
 ;;; counts of nested errors (with internal errors double-counted)
 (defvar *maximum-error-depth*) ; this gets set to 10 in !COLD-INIT
-(defparameter *current-error-depth* 0) ; initialized by genesis
+(defvar *current-error-depth* 0)
 
 ;;; INFINITE-ERROR-PROTECT is used by ERROR and friends to keep us out
 ;;; of hyperspace.
@@ -188,6 +176,23 @@
             (invoke-debugger condition))))))
   nil)
 
+(defun %simple-error (datum format-control &rest format-arguments)
+  (declare (explicit-check)
+           (notinline error)
+           (optimize (debug 0))) ;; enable tail calls for ERROR
+  (error datum :format-control format-control
+               :format-arguments format-arguments))
+
+(defun %simple-type-error (condition datum expected-type format-control &rest format-arguments)
+  (declare (explicit-check)
+           (notinline error)
+           (optimize (debug 0))) ;; enable tail calls for ERROR
+  (error condition
+         :datum datum
+         :expected-type expected-type
+         :format-control format-control
+         :format-arguments format-arguments))
+
 ;;; like BREAK, but without rebinding *DEBUGGER-HOOK* to NIL, so that
 ;;; we can use it in system code (e.g. in SIGINT handling) without
 ;;; messing up --disable-debugger mode (which works by setting
@@ -209,9 +214,10 @@ of condition handling occurring."
     (apply #'%break 'break datum arguments)))
 
 ;;; These functions definitions are for cold-init.
-;;; The real definitions are found in 'condition.lisp'
-(defvar *!cold-warn-action* nil)
+;;; The real definitions are found in 'warm-error.lisp'
+(defvar *!cold-warn-action* #+sb-devel 'print #-sb-devel nil)
 (defun warn (datum &rest arguments)
+  (declare (explicit-check datum)) ;; CONDITION-CLASS not yet defined
   (when (and (stringp datum) (plusp (mismatch "defining setf macro" datum)))
     (return-from warn nil))
   (let ((action (cond ((boundp '*!cold-warn-action*) *!cold-warn-action*)
@@ -221,14 +227,30 @@ of condition handling occurring."
                        'print))))
     (when (member action '(lose print))
       (let ((*package* *cl-package*))
-        (write-string "cold WARN: datum=") ; WRITE could be too broken as yet
+        (write-string "cold WARN: datum=")
         (write (get-lisp-obj-address datum) :radix t :base 16)
         (write-string " = ")
         (write datum)
         (write-char #\space)
         (write (get-lisp-obj-address arguments) :radix t :base 16)
-        (terpri)))
-    (when (eq action 'lose) (sb-sys:%primitive sb-c:halt))))
+        (terpri)
+        (cond ((typep datum 'instance)
+               (dotimes (i (%instance-length datum))
+                 (write-string "  Slot ")
+                 (write i)
+                 (write-string " = ")
+                 (write (%instance-ref datum i))
+                 (terpri)))
+              (arguments
+               (write-string "Args:")
+               (terpri)
+               (do-rest-arg ((arg) arguments)
+                 (write-string " | ")
+                 (write arg)
+                 (terpri))))))
+    (when (eq action 'lose)
+      (sb-sys:%primitive sb-c:halt)
+      (sb-impl::critically-unreachable "losing-warn"))))
 (defun style-warn (datum &rest arguments)
   (declare (notinline warn))
   (apply 'warn datum arguments))

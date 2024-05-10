@@ -11,9 +11,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#+(or :win32 (not :sb-thread))
-(sb-ext:exit :code 104)
+#+(or :openbsd :win32 (not :sb-thread)) (invoke-restart 'run-tests::skip-file)
 
+#+sb-thread (sb-impl::finalizer-thread-stop)
 (use-package :sb-alien)
 
 (defun run (program &rest arguments)
@@ -40,18 +40,17 @@
 
 (with-test (:name :kill-non-lisp-thread
             :broken-on :win32)
-  (let ((receivedp nil))
+  (let ((sem (sb-thread:make-semaphore)))
     (push (lambda ()
-            (setq receivedp t))
+            (sb-thread:signal-semaphore sem))
           (sb-thread::thread-interruptions sb-thread:*current-thread*))
-    #+sb-thruption
-    ;; On sb-thruption builds, the usual resignalling of SIGURG will
+    #+sb-safepoint
+    ;; On sb-safepoint builds, the usual resignalling of SIGURG will
     ;; work without problems, but the signal handler won't ordinarily
     ;; think that there's anything to be done.  Since we're poking at
     ;; INTERRUPT-THREAD internals anyway, let's help it along.
     (setf sb-unix::*thruption-pending* t)
     (kill-non-lisp-thread)
-    (sleep 1)
-    (assert receivedp)))
+    (assert (sb-thread:wait-on-semaphore sem))))
 
 (when *delete* (delete-file "kill-non-lisp-thread.so"))

@@ -123,99 +123,230 @@
 
 ;;; SXHASH of FLOAT values is defined directly in terms of DEFTRANSFORM in
 ;;; order to avoid boxing.
-(defglobal +sxhash-single-float-expr+
-  `(let ((bits (logand (single-float-bits x) ,(1- (ash 1 32)))))
-     (logxor 66194023
-             (sxhash (the sb-xc:fixnum
-                          (logand most-positive-fixnum
-                                  (logxor bits (ash bits -7))))))))
-(deftransform sxhash ((x) (single-float)) '#.+sxhash-single-float-expr+)
-
-#-64-bit
-(defglobal +sxhash-double-float-expr+
-  `(let* ((hi (logand (double-float-high-bits x) ,(1- (ash 1 32))))
-          (lo (double-float-low-bits x))
-          (hilo (logxor hi lo)))
-     (logxor 475038542
-             (sxhash (the fixnum
-                          (logand most-positive-fixnum
-                                  (logxor hilo
-                                          (ash hilo -7))))))))
+(deftransform sxhash ((x) (single-float)) '#.(sxhash-single-float-xform 'x))
 
 ;;; SXHASH of FIXNUM values is defined as a DEFTRANSFORM because it's so
 ;;; simple.
-(defglobal +sxhash-fixnum-expr+
-  (let ((c (logand 1193941380939624010 most-positive-fixnum)))
-    ;; shift by -1 to get sign bit into hash
-    `(logand (logxor (ash x 4) (ash x -1) ,c) most-positive-fixnum)))
-(deftransform sxhash ((x) (fixnum)) '#.+sxhash-fixnum-expr+)
+(deftransform sxhash ((x) (fixnum)) '#.(sxhash-fixnum-xform 'x))
 
-;;; Treat double-float essentially the same as a fixnum if words are 64 bits.
-#+64-bit
-(defglobal +sxhash-double-float-expr+
-  ;; logical negation of magic constant ensures that 0.0d0 hashes to something
-  ;; other than what the fixnum 0 hashes to (as tested in hash.impure.lisp)
-  (let ((c (logandc1 1193941380939624010 most-positive-fixnum)))
-    `(let ((x (double-float-bits x)))
-       ;; ensure we mix the sign bit into the hash
-       (logand (logxor (ash x 4)
-                       (ash x (- (1+ sb-vm:n-fixnum-tag-bits)))
-                       ,c)
-               most-positive-fixnum))))
+(deftransform sxhash ((x) (double-float)) '#.(sxhash-double-float-xform 'x))
 
-(deftransform sxhash ((x) (double-float)) '#.+sxhash-double-float-expr+)
+;;; All symbols have a precomputed hash.
+;;; Here are the behaviors I plan on implementing:
+;;; 32-bit:
+;;;   * SYMBOL-NAME-HASH, SYMBOL-HASH, and (SXHASH sym) are all the same.
+;;;
+;;; x86-64 (initially, then others as I am able):
+;;;   * SYMBOL-HASH returns 40 significant bits, the low 8 being pseudorandom
+;;;   * SYMBOL-NAME-HASH returns 32 significant bits
+;;;   * (SXHASH sym) uses the name hash mixed with itself
+;;; Given only 32 bits of name-based hash, we will have call MIX to make it appear that
+;;; the values of SXHASH are "well distributed within the range of non-negative fixnums"
+;;; (per CLHS) even though it doesn't add any more entropy to do that.
+;;;
+;;; not-x86-64 (until I do them):
+;;;   * SYMBOL-HASH returns all hash bits, but no bits are pseudorandom
+;;;   * SYMBOL-NAME-HASH returns the low 32 bits
+;;;   * (SXHASH sym) returns symbol-hash
+;;;
+;;; The use-cases are as follows:
+;;; - SYMBOL-HASH is for hash-tables, for XSET membership testing (which abhors collisions),
+;;;   for mapping slot names to slot indices in PCL, and/or anything else wanting an opaque
+;;;   pseudorandom value. There is literally no reason that symbols spelled the same must
+;;;   hash to the same numerical value in most situations.
+;;;
+;;; - SYMBOL-NAME-HASH is for compile-time computation of hash-based lookup tables since it
+;;;   deterministic, and meets the CLHS requirement for SXHASH, and has at most 32 significant
+;;;   bits for feeding into the Jenkins perfect hash generator.
+;;;
+;;; - SXHASH is required by the language to have behavior that precludes randomizing the
+;;;   hash, and encourages using all the range of positive fixnums.
+;;;
+(deftransform sxhash ((x) (symbol)) '#.(sxhash-symbol-xform 'x))
 
-(deftransform sxhash ((x) (symbol))
-  (cond ((csubtypep (lvar-type x) (specifier-type 'keyword))
-         ;; All interned symbols have a precomputed hash.
-         ;; There's no way to ask the type system whether a symbol is known to
-         ;; be interned, but we *can* test for the specific case of keywords.
-         ;; Even if it gets uninterned, this shortcut remains valid.
-         `(symbol-hash x)) ; Never need to lazily compute and memoize
-        ((gethash 'ensure-symbol-hash *backend-parsed-vops*)
-         ;; A vop might emit slightly better code than the expression below
-         `(ensure-symbol-hash x))
-        (t
-         ;; Cache the value of the symbol's sxhash in the symbol-hash
-         ;; slot.
-         '(let ((result (symbol-hash x)))
-            ;; 0 marks uninitialized slot. We can't use negative
-            ;; values for the uninitialized slots since NIL might be
-            ;; located so high in memory on some platforms that its
-            ;; SYMBOL-HASH (which contains NIL itself) is a negative
-            ;; fixnum.
-            (if (= 0 result)
-                (ensure-symbol-hash x)
-                result)))))
+(deftransform hash-as-if-symbol-name ((object) (symbol) * :important nil)
+  `(symbol-name-hash object))
 
-(deftransform symbol-hash* ((object predicate) (symbol null) * :important nil)
-  `(symbol-hash* object 'symbolp)) ; annotate that object satisfies SYMBOLP
-(deftransform symbol-hash* ((object predicate)
-                            ((and (not null) symbol)
-                             (constant-arg (member nil symbolp)))
-                            * :important nil)
-  `(symbol-hash* object 'non-null-symbol-p)) ; etc
+#-salted-symbol-hash
+(define-source-transform symbol-name-hash (s) `(ldb (byte 32 0) (symbol-hash ,s)))
 
-;;; To define SXHASH compatibly without repeating the logic in the transforms
-;;; that define the numeric cases, we do some monkey business involving #. to paste
-;;; in the expressions that the transforms would return.
-#+sb-xc-host
-(progn
-  (defvar *sxhash-crosscheck* nil)
-  (defun sxhash (x)
-    (let ((answer
-           (etypecase x ; croak on anything but these
-            (symbol
-             (cond ((string= x "NIL") ; :NIL must hash the same as NIL
-                    (ash sb-vm:nil-value (- sb-vm:n-fixnum-tag-bits)))
-                   (t
-                    ;; (STRING X) could be a non-simple string, it's OK.
-                    (let ((hash (logxor (sb-impl::%sxhash-simple-string (string x))
-                                        most-positive-fixnum)))
-                      (aver (ldb-test (byte (- 32 sb-vm:n-fixnum-tag-bits) 0) hash))
-                      hash))))
-            (sb-xc:fixnum #.+sxhash-fixnum-expr+)
-            (single-float #.+sxhash-single-float-expr+)
-            (double-float #.+sxhash-double-float-expr+))))
-      (push (cons x answer) *sxhash-crosscheck*)
-      answer)))
+(intern "SCRAMBLE" "SB-C")
+(intern "TAB" "SB-C")
+
+(defun ub32-collection-uniquep (array)
+  (declare (type (simple-array (unsigned-byte 32) (*)) array))
+  (let ((dedup (alloc-xset)))
+    (dovector (x array t)
+      (when (xset-member-p x dedup)
+        (return-from ub32-collection-uniquep nil))
+      (add-to-xset x dedup))))
+
+;;; This cache is not used for cross-compiling because there's already
+;;; another cache-like layer (the journal files)
+(defglobal *phash-lambda-cache* nil)
+
+;;; MINIMAL (the default) returns a a function that returns an output
+;;; in the range 0..N-1 for N possible symbols. If non-minimal, the output
+;;; range is the power-of-2-ceiling of N.
+;;; It could be worth using a non-minimal perfect hash if it avoids needing
+;;; a lookup table and can be done entirely with arithmetic and logical ops.
+;;; That seldom seems to be the case.
+;;; FAST should make the generator try less hard to do a good job.
+;;; Practically speaking it does not often make the generator run faster,
+;;; and it might run slower! In no way does it say anything about the speed
+;;; of the generated function. So you pretty much don't want to supply it.
+;;; Indeed one should avoid passing either optional arg to this function.
+(defun make-perfect-hash-lambda (array &optional objects
+                                       (minimal t) (fast nil)
+                                       (cacheable #-sb-xc-host t))
+  (declare (type (simple-array (unsigned-byte 32) (*)) array))
+  (declare (ignorable objects minimal fast))
+  (when (or (< (length array) 3) ; one or two keys - why are you doing this?
+            (>= (length array) (ash 1 31))) ; insanity if this many
+    (return-from make-perfect-hash-lambda))
+  (unless (ub32-collection-uniquep array)
+    (return-from make-perfect-hash-lambda))
+  ;; no dups present
+  (let* ((cache *phash-lambda-cache*)
+         ;; LOGXOR is commutative and associative, which matters to
+         ;; EMULATE-GENERATE-PERFECT-HASH-SEXPR. Cross-compiling sorts the key array
+         ;; to make the xperfecthash files insensitive to the exact manner by which
+         ;; consumers of this function provide the keys. It's not important for the
+         ;; target compiler- the cache only helps repeated calls, in contrast
+         ;; to the cross-compiler which lives or dies by the journal file.
+         (digest (reduce #'logxor array))
+         (invert-keys)
+         ;; The cross-compiler records the string directly. Regression tests look for
+         ;; certain comments in the string to assert coverage of the generator.
+         (string)
+         (expr))
+    #+sb-xc-host
+    (setq string (sb-cold::emulate-generate-perfect-hash-sexpr array objects digest)
+            ;; don't rebind anything except *PACKAGE* for read-from-string,
+            ;; especially as we need to keep our #\A charmacro
+          expr (let ((*package* #.(find-package "SB-C"))) (read-from-string string)))
+    #-sb-xc-host
+    (flet ((generate-ph (keys)
+             (sb-unix::newcharstar-string
+              (sb-sys:with-pinned-objects (array)
+                (alien-funcall
+                 (extern-alien
+                  "lisp_perfhash_with_options"
+                  (function (* char) int system-area-pointer int))
+                 (logior (if minimal 1 0) (if fast 2 0))
+                 (sb-sys:vector-sap keys) (length keys))))))
+      (unless cache
+        ;; A race that clobbers the global is benign. At worst it discards
+        ;; work done some in another thread to cache something.
+        (setf cache (make-hash-table :test 'equalp :synchronized t)
+              *phash-lambda-cache* cache))
+      (dx-let ((cache-key (cons digest array)))
+        ;; Purposely return empty-string if we hit the cache
+        (awhen (gethash cache-key cache)
+          (return-from make-perfect-hash-lambda (values it ""))))
+      (setq string (generate-ph array))
+      ;; generator might have trouble with 0 key
+      (when (and (not string) (position 0 array))
+        (setq string (generate-ph (map '(simple-array (unsigned-byte 32) (*))
+                                       (lambda (x) (logxor x #xFFFFFFFF))
+                                       array))
+              invert-keys t))
+      (unless string
+        (return-from make-perfect-hash-lambda (values nil nil)))
+      ;; string won't account for inverted keys but that's fine
+      ;; as the resulting expression will
+      (setq expr (with-standard-io-syntax
+                     (let ((*package* #.(find-package "SB-C")))
+                       (read-from-string string)))))
+    (let ((tables))
+      ;; Change array constants into symbol-macrolets
+      (dotimes (i 2)
+        (unless (typep expr '(cons (cons (eql let))))
+          (return))
+        (destructuring-bind (bindings . body) (cdar expr)
+          (aver (singleton-p bindings))
+          (unless (member (caar bindings) '(tab scramble)) (return))
+          (setf tables (append tables bindings))
+          (setq expr body)))
+      ;; {>>,<<} can appear with a 2nd arg of 0. Remove them because
+      ;; the 32-bit expression evaluator vop won't.
+      (setq expr
+            (named-let recurse ((expr expr))
+              (cond ((listp expr)
+                     (if (and (member (first expr) '(>> <<)) (eql (third expr) 0))
+                         (recurse (second expr))
+                         (mapcar #'recurse expr)))
+                    (t
+                     expr))))
+      ;; Inject 32-bit LOGNOT if keys need to be bitwise inverted
+      (when invert-keys
+        (setq expr `((^= val #xFFFFFFFF) ,@expr)))
+      (let* ((result-type `(mod ,(power-of-two-ceiling (length array))))
+             (calc `(the ,result-type (uint32-modularly val ,@expr)))
+             (lambda
+        ;; Noting that the output of Bob's perfect hash generator was originally
+        ;; intended to be compiled into C, and we've adapted it to Lisp,
+        ;; it is not necessary to insert array-bounds-checks
+        ;; even if users declaim that optimization quality to be 3.
+                `(lambda (val)
+                   (declare (optimize (safety 0) (speed 3) (debug 0)
+                                      (sb-c:insert-array-bounds-checks 0)
+                                      (sb-c:store-source-form 0)))
+                   (declare (type (unsigned-byte 32) val))
+                   ,(if tables `(symbol-macrolet ,tables ,calc) calc))))
+        (when cacheable
+          (setf (gethash (cons digest array) cache) lambda))
+        (values lambda string)))))
+
+(sb-xc:defmacro uint32-modularly (input &body exprs &environment env)
+  (declare (ignore input env)) ; might use ENV to detect compiled vs interpreted code
+  (let ((uint-max #xFFFFFFFF))
+    ;; Replace C-ish operators with Lisp functions.
+    (labels
+        ((u32+ (a b) `(logand (+ ,a ,b) ,UINT-MAX))
+         (u32- (a) `(logand (- ,a) ,UINT-MAX))
+         (<< (n c) `(logand (ash ,n ,c) ,UINT-MAX))
+         (>> (n c) `(ash ,n ,(- c)))
+         (rewrite (expr)
+           ;; Naive code-walking is OK here. Forms shaped like calls are calls.
+           (when (atom expr)
+             (return-from rewrite expr))
+           (let ((subst
+                  (case (car expr)
+                    (^=   '(logxor))
+                    (+=   '(u32+))
+                    (&    'logand)
+                    (^    'logxor)
+                    (u32+ #'u32+)
+                    (u32- #'u32-)
+                    (<<   #'<<)
+                    (>>   #'>>)
+                    (t (return-from rewrite (mapcar #'rewrite expr))))))
+             (rewrite
+              (cond ((functionp subst) (apply subst (cdr expr)))
+                    ((listp subst) ; becomes SETQ
+                     `(setq ,(cadr expr) (,(car subst) ,(cadr expr) ,(caddr expr))))
+                    (t (cons subst (cdr expr)))))))) ; simply a name change
+      `(progn ,@(rewrite exprs)))))
+;;; Neither sb-xc:define-compiler-macro nor (setf sb-xc:compiler-macro-function) exists
+#+x86-64
+(setf (info :function :compiler-macro-function 'uint32-modularly)
+      #'sb-c::optimize-for-calc-phash)
+
+;;; The CASE macro can use this predicate to decide whether to expand in a way
+;;; that selects a clause via a perfect hash versus the customary expansion
+;;; as a sequence of IFs.
+(defun perfectly-hashable (objects)
+  (flet ((hash (x)
+           (cond ((fixnump x) (ldb (byte 32 0) x))
+                 ((symbolp x) (symbol-name-hash x))
+                 ((characterp x) (char-code x)))))
+    (let* ((n (length objects))
+           (hashes (make-array n :element-type '(unsigned-byte 32))))
+      (loop for o in objects
+            for i from 0
+            do (let ((h (hash o)))
+                 (if h
+                     (setf (aref hashes i) h)
+                     (return-from perfectly-hashable nil))))
+      (make-perfect-hash-lambda hashes objects))))

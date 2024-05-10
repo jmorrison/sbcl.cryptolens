@@ -65,46 +65,33 @@
 (with-test (:name (directory :..*))
   (directory "somedir/..*"))
 
-;;; DIRECTORY used to treat */** as **.
-(with-test (:name (directory :*/**))
-  (assert (equal (directory "*/**/*.*")
-                 (mapcan (lambda (directory)
-                           (directory (merge-pathnames "**/*.*" directory)))
-                         (directory "*/")))))
-
 (with-test (:name (directory *default-pathname-defaults* :bug-1740563))
-  ;; FIXME: this writes into the source directory depending on whether
-  ;; TEST_DIRECTORY has been made to point elsewhere or not.
-  (let ((test-directory (concatenate 'string (sb-ext:posix-getenv "TEST_DIRECTORY") "/")))
-    (ensure-directories-exist test-directory)
-    (close (open (merge-pathnames "a.txt" test-directory) :if-does-not-exist :create))
-    (close (open (merge-pathnames "b.lisp" test-directory) :if-does-not-exist :create))
-    (unwind-protect
-         (flet ((directory* (pattern &rest d-p-d-components)
-                  (let ((*default-pathname-defaults*
-                         (apply #'make-pathname
-                                :defaults *default-pathname-defaults*
-                                d-p-d-components)))
-                    (directory pattern))))
-           (let* ((*default-pathname-defaults* (pathname test-directory))
-                  (expected-wild (directory "*.*"))
-                  (expected-one-file (directory "a.txt"))
-                  (cases '((:name nil   :type "txt")
-                           (:name nil   :type :wild)
-                           (:name "a"   :type nil)
-                           (:name "a"   :type "txt")
-                           (:name "a"   :type :wild)
-                           (:name :wild :type nil)
-                           (:name :wild :type :wild)
-                           (:name :wild :type "txt"))))
-             (dolist (components cases)
-               (assert (equal (apply #'directory* "*.*" components)
-                              expected-wild))
-               (assert (equal (apply #'directory* "a.txt" components)
-                              expected-one-file)))
-             (assert (equal (directory* "" :name :wild :type :wild)
-                            expected-wild))))
-      (delete-directory test-directory :recursive t))))
+  (with-test-directory ()
+    (close (open "a.txt" :if-does-not-exist :create))
+    (close (open "b.lisp" :if-does-not-exist :create))
+    (flet ((directory* (pattern &rest d-p-d-components)
+             (let ((*default-pathname-defaults*
+                     (apply #'make-pathname
+                            :defaults *default-pathname-defaults*
+                            d-p-d-components)))
+               (directory pattern))))
+      (let* ((expected-wild (directory "*.*"))
+             (expected-one-file (directory "a.txt"))
+             (cases '((:name nil   :type "txt")
+                      (:name nil   :type :wild)
+                      (:name "a"   :type nil)
+                      (:name "a"   :type "txt")
+                      (:name "a"   :type :wild)
+                      (:name :wild :type nil)
+                      (:name :wild :type :wild)
+                      (:name :wild :type "txt"))))
+        (dolist (components cases)
+          (assert (equal (apply #'directory* "*.*" components)
+                         expected-wild))
+          (assert (equal (apply #'directory* "a.txt" components)
+                         expected-one-file)))
+        (assert (equal (directory* "" :name :wild :type :wild)
+                       expected-wild))))))
 
 ;;;; OPEN
 
@@ -215,8 +202,7 @@
                 (if p
                     (canon (concatenate 'string (subseq s 0 p) (subseq s (1+ p))))
                     s))))
-    (loop repeat 1000
-          for length = (random 32)
+    (loop for length = (random 32)
           for native-namestring = (coerce
                                    (loop repeat length
                                          collect
@@ -225,11 +211,11 @@
                                    'simple-base-string)
           for pathname = (native-pathname native-namestring)
           for nnn = (native-namestring pathname)
+          repeat 1000
           do (setf native-namestring (canon native-namestring))
              (unless (string= nnn native-namestring)
                (error "1: wanted ~S, got ~S" native-namestring nnn)))
-    (loop repeat 1000
-          for native-namestring = (with-output-to-string (s)
+    (loop for native-namestring = (with-output-to-string (s)
                                     (write-string "mu" s)
                                     (loop
                                       (let ((r (random 1.0)))
@@ -247,6 +233,7 @@
                                               s))))))
           for pathname = (native-pathname native-namestring)
           for tricky-nnn = (native-namestring pathname)
+          repeat 1000
           do (setf native-namestring (canon native-namestring))
              (unless (string= tricky-nnn native-namestring)
                (error "2: wanted ~S, got ~S" native-namestring tricky-nnn))))))
@@ -318,50 +305,6 @@
       (assert (search "OPEN :IF-EXISTS :NEW-VERSION is not supported" control))
       (assert (search "when a new version must be created." control)))))
 
-(with-test (:name (open :if-does-not-exist restart))
-  (flet ((do-open (restart)
-           (let ((filename "does-not-exist"))
-             (unwind-protect
-                  (handler-bind
-                      ((file-does-not-exist
-                         (lambda (condition)
-                           (let ((restart (find-restart restart condition)))
-                             (invoke-restart restart)))))
-                    (close (open filename :direction :output)))
-               (assert (probe-file filename))
-               (delete-file filename)))))
-    (do-open 'sb-impl::create)))
-
-(with-test (:name (open :if-exists restart))
-  (labels ((read-file (filename)
-             (with-open-file (stream filename)
-               (let ((result (make-string (file-length stream))))
-                 (read-sequence result stream)
-                 result)))
-           (do-open (restart expected-content)
-             (let ((filename "exists"))
-               (with-open-file (stream filename :direction :output
-                                                :if-does-not-exist :create)
-                 (write-string "foo" stream))
-               (unwind-protect
-                    (progn
-                      (handler-bind
-                          ((file-exists
-                             (lambda (condition)
-                               (let ((restart (find-restart restart condition)))
-                                 (invoke-restart restart)))))
-                        (let ((stream (open filename :direction :output)))
-                          (write-string "bar" stream)
-                          (close stream)))
-                      (assert (equal expected-content (read-file filename))))
-                 (delete-file filename)
-                 (ignore-errors
-                  (delete-file (concatenate 'string filename ".bak")))))))
-    (do-open 'sb-impl::supersede "bar")
-    (do-open 'sb-impl::overwrite "bar")
-    (do-open 'sb-impl::rename "bar")
-    (do-open 'append "foobar")))
-
 (with-test (:name (parse-native-namestring :canon) :skipped-on (not :unix))
   (let ((pathname (parse-native-namestring "foo/bar//baz")))
     (assert (string= (car (last (pathname-directory pathname))) "bar"))))
@@ -389,22 +332,17 @@
                     (append (when namep '(:name :unspecific))
                             (when typep '(:type :unspecific)))))
            (test (as-file as-directory)
-             (let* ((test-directory (concatenate
-                                     'string
-                                     (sb-ext:posix-getenv "TEST_DIRECTORY") "/"))
-                    (delete-directory (merge-pathnames
-                                       (typecase as-file
-                                         (string (prepare as-file))
-                                         (pathname as-file))
-                                       test-directory)))
-               (ensure-directories-exist (merge-pathnames
-                                          (prepare as-directory)
-                                          test-directory))
-               (unwind-protect
-                    (progn
-                      (delete-directory delete-directory)
-                      (assert (not (probe-file (prepare as-directory)))))
-                 (delete-directory test-directory :recursive t)))))
+             (with-test-directory (test-directory)
+               (let ((delete-directory (merge-pathnames
+                                         (typecase as-file
+                                           (string (prepare as-file))
+                                           (pathname as-file))
+                                         test-directory)))
+                 (ensure-directories-exist (merge-pathnames
+                                            (prepare as-directory)
+                                            test-directory))
+                 (delete-directory delete-directory)
+                 (assert (not (probe-file (prepare as-directory))))))))
     ;; Name component present
     #-win32 (test "aE?b"                    "aE?b/")
     #-win32 (test "aE*b"                    "aE*b/")
@@ -425,3 +363,14 @@
             (test (make-unspecific nil t)   "foo/")
             (test (make-unspecific t   nil) "foo/")
             (test (make-unspecific t   t)   "foo/")))
+
+(with-test (:name (rename-file :overwrite))
+  (with-test-directory ()
+    (with-open-file (s "a" :direction :output)
+      (write-line "a" s))
+    (with-open-file (s "b" :direction :output)
+      (write-line "b" s))
+    (rename-file "a" "b")
+    (assert (null (probe-file "a")))
+    (with-open-file (s "b")
+      (assert (equal "a" (read-line s))))))

@@ -32,13 +32,6 @@ modification. Defaults to SAFETY.")
    see \"SBCL User Manual\", Compiler->Handling of Types->
    Implementation Limitations for details).")
 
-(define-optimization-quality check-tag-existence
-    (cond ((= safety 0) 0)
-          (t 3))
-  ("no" "maybe" "yes" "yes")
-  "Control whether GO and RETURN-FROM check liveness of the destination tag.
-Enabling this option can increase heap consing of closures.")
-
 (define-optimization-quality let-conversion
     (if (<= debug speed) 3 0)
   ("off" "maybe" "on" "on")
@@ -95,7 +88,7 @@ and will refer to the new function, bound to FOO.")
     (if (> debug (max speed space compilation-speed))
         debug
         0)
-  ("no" "no" "partial" "full")
+  ("no" "no" "no" "yes")
   "Control instrumentation of code, enabling single-stepping through
 it in the debugger.
 
@@ -123,8 +116,16 @@ optimizations.
 When enabled, the variable is preserved and can be seen in the
 debugger.")
 
+(define-optimization-quality preserve-constants
+  0
+  ("no" "no" "no" "yes"))
+
 (define-optimization-quality insert-array-bounds-checks
     (if (= safety 0) 0 3)
+  ("no" "yes" "yes" "yes"))
+(define-optimization-quality aref-trapping
+    #-ubsan (if (= safety 3) 3 0) ; equiv. to safety unless expressed otherwise
+    #+ubsan 2 ; default to yes
   ("no" "yes" "yes" "yes"))
 
 (define-optimization-quality store-xref-data
@@ -158,22 +159,6 @@ compiled with this declaration in effect.")
     0
   ("no" "no" "yes" "yes"))
 
-;;; ALLOW-NON-RETURNING-TAIL-CALL unsupresses the supression of tail-call
-;;; optimization of nil-returning functions.
-;;;
-;;; At present this is used only by the ARG-COUNT-ERROR function, but would be
-;;; useful in similar functions whose sole purpose is to accept positional
-;;; arguments, shaping them into keyword arguments with which to call ERROR.
-;;; Generally any function tail-calling a nil-returning function remains on the
-;;; stack to allow a debugger to see variables in the signaling frame.
-;;; However ARG-COUNT-ERROR is not supposed to be visible.
-;;; Techniques that evolved to address its invisibility were brittle:
-;;; undocumented DEBUG versus SPEED policy-based decisions in TAIL-ANNOTATE,
-;;; or inefficient (performing FIND-CALLER-FRAME before calling ERROR).
-;;; Frobbing *STACK-TOP-HINT* seems no better than a declaration saying
-;;; "do what I mean," as the latter at least produces a consistent backtrace
-;;; between Lisp and ldb or gdb.
-;;;
-(define-optimization-quality allow-non-returning-tail-call
-    0
-  ("no" "no" "no" "yes"))
+(define-optimization-quality jump-table
+  1
+  ("no" "auto" "yes" "without-hashing"))

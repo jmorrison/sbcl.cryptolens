@@ -19,8 +19,9 @@
 
 (declaim (maybe-inline
           tree-equal %setnth nthcdr nth
-          tailp union
-          nunion intersection nintersection set-difference nset-difference
+          tailp
+          #| union nunion |# ; what the ????
+          intersection nintersection set-difference nset-difference
           set-exclusive-or nset-exclusive-or subsetp acons
           subst subst-if
           ;; NSUBLIS is >400 lines of assembly. How is it helpful to inline?
@@ -391,15 +392,23 @@
        (result '() (cons initial-element result)))
       ((<= count 0) result)
     (declare (type index count))))
+
+(defun %sys-make-list (size initial-element)
+  (declare (type index size)
+           (sb-c::tlab :system))
+  (do ((count size (1- count))
+       (result '() (cons initial-element result)))
+      ((<= count 0) result)
+    (declare (type index count))))
 
 (defun append (&rest lists)
   "Construct and return a list by concatenating LISTS."
-  (let* ((result (list nil))
+  (let* ((result (unaligned-dx-cons nil))
          (tail result)
          (index 0)
          (length (length lists))
          (last (1- length)))
-    (declare (truly-dynamic-extent result))
+    (declare (dynamic-extent result))
     (loop
      (cond
        ((< (truly-the index index) last)
@@ -419,16 +428,14 @@
        (cdr result)))))
 
 (defun append2 (x y)
-  (declare (optimize (sb-c:verify-arg-count 0)))
   (if (null x)
       y
-      (let ((result (list (car x))))
-        (do ((more (cdr x) (cdr more))
-             (tail result (cdr tail)))
+      (let* ((result (cons (car x) y))
+             (tail result))
+        (do ((more (cdr x) (cdr more)))
             ((null more)
-             (rplacd (truly-the cons tail) y)
              result)
-                    (rplacd (truly-the cons tail) (list (car more)))))))
+          (rplacd (truly-the cons tail) (setf tail (cons (car more) y)))))))
 
 
 ;;;; list copying functions
@@ -436,6 +443,25 @@
 (defun copy-list (list)
   "Return a new list which is EQUAL to LIST. LIST may be improper."
   (copy-list-macro list))
+
+(defun copy-list-to (list tail)
+  (declare (explicit-check))
+  (the list (cdr (truly-the cons tail)))
+  (do ((orig list (cdr orig))
+       (splice tail
+               (let ((cell (list (car orig))))
+                 (rplacd (truly-the cons splice) cell)
+                 cell)))
+      ((atom orig) (rplacd (truly-the cons splice) orig))))
+
+(defun ensure-heap-list (list)
+  (declare (sb-c::tlab :system))
+  ;; If some cons is not on the heap then copy the whole list
+  (if (do ((cons list (cdr cons)))
+          ((null cons) nil)
+        (unless (dynamic-space-obj-p cons) (return t)))
+      (copy-list-macro list)
+      list))
 
 (defun copy-alist (alist)
   "Return a new association list which is EQUAL to ALIST."
@@ -931,17 +957,34 @@
 
      ,@body))
 
-(defconstant +list-based-union-limit+ 80)
+(flet ((hashing-p (notp testp test n1 n2)
+         (declare (index n1 n2))
+         ;; If there is no TEST-NOT, and both lists are long enough, and the
+         ;; test function is that of a standard hash-table, then use a hash-table.
+         (and (not notp)
+              ;; no :TEST, or a standard hash-table test
+              (or (not testp)
+                  (eq test #'eql)
+                  (eq test #'eq)
+                  (eq test #'equal)
+                  (eq test #'equalp))
+              (or (and (> n1 20) (> n2 20)) ; both lists are non-short
+                  ;; or one list is very long, and the other is not tiny
+                  (and (>= n1 3) (>= n2 100))
+                  (and (>= n2 3) (>= n1 100)))))
+       (unionize (testp test key n1 n2 set1 set2)
+         (let ((table (make-hash-table :test (if testp test #'eql)
+                                       :size (+ n1 n2))))
+           (dolist (elt set1)
+             (setf (gethash (apply-key key elt) table) elt))
+           (dolist (elt set2)
+             (setf (gethash (apply-key key elt) table) elt))
+           table)))
 
-(defun hash-table-test-p (fun)
-  (or (eq fun #'eq)
-      (eq fun #'eql)
-      (eq fun #'equal)
-      (eq fun #'equalp)
-      (eq fun 'eq)
-      (eq fun 'eql)
-      (eq fun 'equal)
-      (eq fun 'equalp)))
+;;; "If there is a duplication between list-1 and list-2, only one of the duplicate
+;;;  instances will be in the result. If either list-1 or list-2 has duplicate entries
+;;;  within it, the redundant entries might or might not appear in the result."
+;;; Our answer differs based on whether a hash-table is employed or not.
 
 (defun union (list1 list2 &key key (test nil testp) (test-not nil notp))
   "Return the union of LIST1 and LIST2."
@@ -949,39 +992,26 @@
   (declare (dynamic-extent key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  ;; We have two possibilities here: for shortish lists we pick up the
-  ;; shorter one as the result, and add the other one to it. For long
-  ;; lists we use a hash-table when possible.
-  (let ((n1 (length list1))
-        (n2 (length list2)))
-    (multiple-value-bind (short long n-short)
-        (if (< n1 n2)
-            (values list1 list2 n1)
-            (values list2 list1 n2))
-      (if (or (< n-short +list-based-union-limit+)
-              notp
-              (and testp
-                   (not (hash-table-test-p test))))
-          (with-member-test (member-test)
-            (let ((orig short))
-              (dolist (elt long)
-                (unless (funcall member-test elt orig key test)
-                  (push elt short)))
-              short))
-          (let ((table (make-hash-table :test (if testp
-                                                  test
-                                                  #'eql) :size (+ n1 n2)))
-                (key (and key (%coerce-callable-to-fun key)))
-                (union nil))
-            (dolist (elt long)
-              (setf (gethash (apply-key key elt) table) elt))
-            (dolist (elt short)
-              (setf (gethash (apply-key key elt) table) elt))
-            (maphash (lambda (k v)
-                       (declare (ignore k))
-                       (push v union))
-                     table)
-            union)))))
+  ;; "The result list may be eq to either list-1 or list-2 if appropriate."
+  ;; (and a 1000-element list unioned with NIL should not cons a hash-table)
+  (cond ((null list1) (return-from union list2))
+        ((null list2) (return-from union list1)))
+  (with-member-test (member-test)
+    (let ((n1 (length list1))
+          (n2 (length list2)))
+      (if (hashing-p notp testp test n1 n2)
+          ;; "The order of elements in the result do not have to reflect the ordering
+          ;;  of list-1 or list-2 in any way."
+          (loop for k being the hash-values of (unionize testp test key n1 n2 list1 list2)
+                collect k)
+          ;; Start with the initial result being the shorter of the inputs.
+          ;; Search for each element of the longer in the shorter, adding the missing ones.
+          (multiple-value-bind (short long)
+              (if (< n1 n2) (values list1 list2) (values list2 list1))
+            (let ((result short))
+              (dolist (elt long result)
+                (unless (funcall member-test elt short key test)
+                  (push elt result)))))))))
 
 (defun nunion (list1 list2 &key key (test nil testp) (test-not nil notp))
   "Destructively return the union of LIST1 and LIST2."
@@ -989,45 +1019,30 @@
   (declare (dynamic-extent key test test-not))
   (when (and testp notp)
     (error ":TEST and :TEST-NOT were both supplied."))
-  ;; We have two possibilities here: for shortish lists we pick up the
-  ;; shorter one as the result, and add the other one to it. For long
-  ;; lists we use a hash-table when possible.
-  (let ((n1 (length list1))
-        (n2 (length list2)))
-    (multiple-value-bind (short long n-short)
-        (if (< n1 n2)
-            (values list1 list2 n1)
-            (values list2 list1 n2))
-      (if (or (< n-short +list-based-union-limit+)
-              notp
-              (and testp
-                   (not (hash-table-test-p test))))
-          (with-member-test (member-test)
-            (do ((orig short)
-                 (elt (car long) (car long)))
-                ((endp long))
-              (if (funcall member-test elt orig key test)
-                  (pop long)
-                  (shiftf long (cdr long) short long)))
-            short)
-          (let ((table (make-hash-table :test (if testp
-                                                  test
-                                                  #'eql) :size (+ n1 n2)))
-                (key (and key (%coerce-callable-to-fun key))))
-            (dolist (elt long)
-              (setf (gethash (apply-key key elt) table) elt))
-            (dolist (elt short)
-              (setf (gethash (apply-key key elt) table) elt))
-            (let ((union long)
-                  (head long))
-              (maphash (lambda (k v)
-                         (declare (ignore k))
-                         (if head
-                             (setf (car head) v
-                                   head (cdr head))
-                             (push v union)))
-                      table)
-              union))))))
+  (cond ((null list1) (return-from nunion list2))
+        ((null list2) (return-from nunion list1)))
+  (with-member-test (member-test)
+    (binding* ((n1 (length list1))
+               (n2 (length list2))
+               ((short long) (if (< n1 n2) (values list1 list2) (values list2 list1))))
+      (if (hashing-p notp testp test n1 n2)
+          (let ((table (unionize testp test key n1 n2 short long))
+                (union long)
+                (head long))
+            (maphash (lambda (k v)
+                       (declare (ignore k))
+                       (if head
+                           (setf (car head) v
+                                 head (cdr head))
+                           (push v union))) ; easier than re-using cons cells of SHORT
+                     table)
+            union)
+          (do ((orig short)
+               (elt (car long) (car long)))
+              ((endp long) short)
+            (if (funcall member-test elt orig key test)
+                (pop long)
+                (shiftf long (cdr long) short long))))))))
 
 (defun intersection (list1 list2
                      &key key (test nil testp) (test-not nil notp))
@@ -1107,7 +1122,11 @@
       (dolist (elt list1)
         (unless (funcall member-test elt list2 key test)
           (push elt result)))
-      (dx-flet ((test (x y) (funcall (truly-the function test) y x)))
+      (dx-flet ((test (x y)
+                      ;; This local function is never called if TEST is NIL,
+                      ;; but the compiler doesn't know that, suppress the warning.
+                      (funcall (the* (function :truly t :silent-conflict t) test)
+                               y x)))
         (dolist (elt list2)
           (unless (funcall member-test elt list1 key #'test)
             (push elt result)))))
@@ -1190,7 +1209,11 @@
 
 (defun acons (key datum alist)
   "Construct a new alist by adding the pair (KEY . DATUM) to ALIST."
-  (cons (cons key datum) alist))
+  ;; This function is maybe-inline, so can't use vop-existsp
+  ;; which does not remain in the image post-build.
+  #.(if (gethash 'acons sb-c::*backend-template-names*)
+        '(acons key datum alist) ; vop translated
+        '(cons (cons key datum) alist)))
 
 (defun pairlis (keys data &optional (alist '()))
   "Construct an association list from KEYS and DATA (adding to ALIST)."
@@ -1312,6 +1335,7 @@
         (if accumulate
             (cdr ret-list)
             non-acc-result))
+    (declare (dynamic-extent ret-list))
     (do ((l arglists (cdr l))
          (arg args (cdr arg)))
         ((null l))
@@ -1321,14 +1345,8 @@
     (case accumulate
       (:nconc
        (when res
-         (setf (cdr temp) res)
-         ;; KLUDGE: it is said that MAPCON is equivalent to
-         ;; (apply #'nconc (maplist ...)) which means (nconc 1) would
-         ;; return 1, but (nconc 1 1) should signal an error.
-         ;; The transformed MAP code returns the last result, do that
-         ;; here as well for consistency and simplicity.
-         (when (consp res)
-           (setf temp (last res)))))
+         (psetf temp res
+                (cdr (last temp)) res)))
       (:list (setf (cdr temp) (list res)
                    temp (cdr temp))))))
 
@@ -1368,7 +1386,6 @@
                 (let* ((body-loop
                         `(do ((list list (cdr list)))
                              ((null list) nil)
-                           (declare (list list))
                            (let ((this (car list)))
                              ,(let ((cxx (if (char= #\A (char (string name) 0))
                                              'car    ; assoc, assoc-if, assoc-if-not
@@ -1414,7 +1431,6 @@
                                  body-loop)))
                   `(defun ,(intern (format nil "%~A~{-~A~}~@[-~A~]" name funs variant))
                        (x list ,@funs)
-                     (declare (optimize speed (sb-c:verify-arg-count 0)))
                      ,@(when funs `((declare (function ,@funs)
                                              (dynamic-extent ,@funs))))
                      ,@(unless (member name '(member assoc adjoin rassoc))
@@ -1451,3 +1467,8 @@
       (funcall test x target))
   (def (test-not)
       (not (funcall test-not x target))))
+
+(defun sys-tlab-append (a b)
+  (declare (sb-c::tlab :system))
+  (named-let recurse ((a a) (b b))
+    (if a (cons (car a) (recurse (cdr a) b)) b)))

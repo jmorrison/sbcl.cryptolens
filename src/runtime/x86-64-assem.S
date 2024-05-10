@@ -18,15 +18,12 @@
 .section .note.GNU-stack,"",%progbits
 #endif
 
-#include "genesis/config.h"
+#include "genesis/sbcl.h"
 #include "validate.h"
-#include "sbcl.h"
 #include "genesis/closure.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
-#include "genesis/ratio.h"
-#include "genesis/complex.h"
 
 /* Minimize conditionalization for different OS naming schemes. */
 #if defined __linux__  || defined LISP_FEATURE_HAIKU || defined LISP_FEATURE_FREEBSD || \
@@ -39,26 +36,17 @@
 // Produce position-independent code.
 // macOS does not like the general way we do this, so do something different.
 #if defined(LISP_FEATURE_DARWIN) || defined(LISP_FEATURE_WIN32)
-#define PIC_CALL(x) x
 #define LOAD_PIC_VAR(x,dest) mov GNAME(x)(%rip), dest
 #else
-#define PIC_CALL(x) x@PLT
 #define LOAD_PIC_VAR(x,dest) mov GNAME(x)@GOTPCREL(%rip), dest ; mov (dest), dest
 #endif
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
  * want alignment in bytes. */
 #if defined(__linux__) || defined(LISP_FEATURE_FREEBSD) || defined(__OpenBSD__) || defined __NetBSD__ || defined(__sun) || defined _WIN64 || defined(__DragonFly__)
-#define align_4byte	4
-#define align_8byte	8
 #define align_16byte	16
-#define align_32byte	32
-#define align_page	32768
 #else
-#define	align_4byte	2
-#define	align_8byte	3
 #define	align_16byte	4
-#define	align_page	15
 #endif
 
 /*
@@ -82,6 +70,7 @@
 #define TRAP int3
 #endif
 
+#define CARD_TABLE_REG %r12
 #define THREAD_BASE_REG %r13
 
 #ifdef LISP_FEATURE_WIN32
@@ -124,8 +113,8 @@ GNAME(funcall1_switching_stack):
 #endif
 
 	.text
-	.globl  GNAME(call_into_lisp_first_time)
-	TYPE(GNAME(call_into_lisp_first_time))
+	.globl  GNAME(call_into_lisp_first_time_)
+	TYPE(GNAME(call_into_lisp_first_time_))
 
 /* We don't worry too much about saving registers
  * here, because we never expect to return from the initial call to lisp
@@ -133,7 +122,7 @@ GNAME(funcall1_switching_stack):
 
 	.align	align_16byte,0x90
 	.cfi_startproc
-GNAME(call_into_lisp_first_time):
+GNAME(call_into_lisp_first_time_):
 GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
@@ -142,8 +131,8 @@ GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 	jmp     Lstack
 
 	.text
-	.globl  GNAME(call_into_lisp)
-	TYPE(GNAME(call_into_lisp))
+	.globl  GNAME(call_into_lisp_)
+	TYPE(GNAME(call_into_lisp_))
 
 /*
  * amd64 calling convention: C expects that
@@ -155,7 +144,7 @@ GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 # define SUPPORT_FOMIT_FRAME_POINTER
 #endif
 	.align	align_16byte,0x90
-GNAME(call_into_lisp):
+GNAME(call_into_lisp_):
 #ifdef SUPPORT_FOMIT_FRAME_POINTER
 	mov	%rbp,%rax
 #endif
@@ -179,23 +168,7 @@ Lstack:
 	push	%rdi	# args from C
 	push	%rsi	#
 	push	%rdx	#
-#ifdef LISP_FEATURE_SB_THREAD
-#ifdef LISP_FEATURE_GCC_TLS
-	movq	GNAME(current_thread)@GOTTPOFF(%rip), THREAD_BASE_REG
-	movq	%fs:(THREAD_BASE_REG), THREAD_BASE_REG
-#elif defined LISP_FEATURE_WIN32
-	call    PIC_CALL(GNAME(get_current_vm_thread))
-	mov	%rax, THREAD_BASE_REG
-#else
-	LOAD_PIC_VAR(specials, %rdi)
-	call    PIC_CALL(GNAME(pthread_getspecific))
-	mov	%rax, THREAD_BASE_REG
-#endif
-#elif defined(LISP_FEATURE_SB_SAFEPOINT)
-        /* We need this to find the CSP trap page.  This does no harm,
-	 * as the compiler doesn't use THREAD_BASE_REG on non-threaded builds. */
-        LOAD_PIC_VAR(all_threads, THREAD_BASE_REG)
-#endif
+	movq	%rcx, THREAD_BASE_REG
 	pop	%rcx	# num args
 	pop	%rbx	# arg vector
 	pop	%rax	# function ptr/lexenv
@@ -222,12 +195,17 @@ Lzero:
 	push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
 	mov	%rsp,%rbp	# The current sp marks start of new frame.
+#ifndef LISP_FEATURE_DARWIN
+        # This call frame info is valid but it makes macOS print a warning
+        # that I'm tired of seeing. I can't even remember why this helps.
 	# Inform unwinder that the new frame has not been entered yet.
 	# The CFA is what it was (old RBP+16) before the preceding mov.
 	# This sequence encodes DW_CFA_def_cfa_expression
 	# DW_OP_breg6 (rbp): 0 / DW_OP_deref / DW_OP_lit16 / DW_OP_plus
 	.cfi_escape 0x0f, 5, 0x76, 0, 6, 0x40, 0x22
+#endif
 Lcall:
+	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 	/* If the function returned multiple values, the carry flag will be set.
@@ -255,7 +233,7 @@ LsingleValue:
 #endif
 	ret
 	.cfi_endproc
-	SIZE(GNAME(call_into_lisp))
+	SIZE(GNAME(call_into_lisp_))
 
 	.text
 	.globl  GNAME(funcall_alien_callback)
@@ -294,6 +272,7 @@ GNAME(funcall_alien_callback):
 #else
         mov     (ENTER_ALIEN_CALLBACK_FDEFN+FDEFN_FUN_OFFSET),%rax
 #endif
+	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 /* Restore C regs */
@@ -430,7 +409,11 @@ GNAME(arch_scrub_control_stack):
 	 * guard page upper bound in R8, and our hard guard
 	 * page upper bound in R9. */
 	lea	-8(%rsp), %rax
+#ifdef LISP_FEATURE_WIN32
+	LOAD_PIC_VAR(win32_page_size, %r9)
+#else
 	LOAD_PIC_VAR(os_vm_page_size, %r9)
+#endif
 	lea	(%rsi,%r9), %r8
 	lea	(%rdx,%r9), %r9
 

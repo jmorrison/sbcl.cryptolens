@@ -18,6 +18,7 @@
 (defvar *contexts*)
 (declaim (type (vector t) *contexts*))
 (defvar *local-call-context*)
+(defvar *location-context* nil)
 
 ;;;; debug blocks
 
@@ -43,6 +44,7 @@
             (:copier nil))
   (label nil :type (or null label))
   (tn nil :type (or null tn) :read-only t))
+(!set-load-form-method restart-location (:xc :target) :ignore-it)
 
 ;;; This is called during code generation in places where there is an
 ;;; "interesting" location: someplace where we are likely to end up
@@ -77,10 +79,10 @@
                          (- posn (segment-header-skew segment))))))
   (values))
 
-(declaim (inline ir2-block-physenv))
-(defun ir2-block-physenv (2block)
+(declaim (inline ir2-block-environment))
+(defun ir2-block-environment (2block)
   (declare (type ir2-block 2block))
-  (block-physenv (ir2-block-block 2block)))
+  (block-environment (ir2-block-block 2block)))
 
 (defun make-lexenv-var-cache (lexenv)
   (or (lexenv-var-cache lexenv)
@@ -106,8 +108,8 @@
 
 (defun optional-leaf-p (leaf)
   (let ((home (lambda-var-home leaf)))
-    (case (functional-kind home)
-      (:external
+    (functional-kind-case home
+      (external
        (let ((entry (lambda-entry-fun home)))
          (when (optional-dispatch-p entry)
            (let ((pos (position leaf (lambda-vars home))))
@@ -120,8 +122,8 @@
 ;;; optional is alive at that point.
 (defun optional-processed (leaf)
   (let ((home (lambda-var-home leaf)))
-    (case (functional-kind home)
-      (:external
+    (functional-kind-case home
+      (external
        (let ((entry (lambda-entry-fun home)))
          (if (and (optional-dispatch-p entry)
                   *local-call-context*)
@@ -140,10 +142,11 @@
 ;;; variables dumped, compute a bit-vector representing the set of
 ;;; live variables. If the TN is environment-live, we only mark it as
 ;;; live when it is in scope at NODE.
-(declaim (ftype (sfunction (local-tn-bit-vector node ir2-block hash-table (or null vop))
-                           simple-bit-vector)
-                compute-live-vars))
 (defun compute-live-vars (live node block var-locs vop)
+  (declare (type ir2-block block) (type local-tn-bit-vector live)
+           (type hash-table var-locs) (type node node)
+           (type (or vop null) vop)
+           #-sb-xc-host (values simple-bit-vector))
   (let ((res (make-array (logandc2 (+ (hash-table-count var-locs) 7) 7)
                          :element-type 'bit
                          :initial-element 0))
@@ -182,6 +185,13 @@
            (the fixnum (logior (ash offset registers-size)
                                (tn-offset tn)))
            offset)))
+    (cons (let ((last (cdr (last x))))
+            (if (restart-location-p last)
+                (let ((new (copy-list x)))
+                  (setf (cdr (last new))
+                        (encode-restart-location location last))
+                  new)
+                x)))
     (t
      x)))
 
@@ -196,12 +206,12 @@
 ;;; the code/source map and live info. If true, VOP is the VOP
 ;;; associated with this location, for use in determining whether TNs
 ;;; are spilled.
-(defun dump-1-location (node block kind label live var-locs vop
+(defun dump-1-location (node block kind tlf-num label live var-locs vop
                         &optional context)
   (declare (type node node) (type ir2-block block)
            (type (or null local-tn-bit-vector) live)
            (type (or label index) label)
-           (type location-kind kind)
+           (type location-kind kind) (type (or index null) tlf-num)
            (type hash-table var-locs) (type (or vop null) vop))
   (let* ((byte-buffer *byte-buffer*)
          (stepping (and (combination-p node)
@@ -221,10 +231,7 @@
 
          (path (node-source-path node))
          (loc (if (fixnump label) label (label-position label)))
-         (form-number (source-path-form-number path))
-         (context (if (opaque-box-p context)
-                      (opaque-box-value context)
-                      context)))
+         (form-number (source-path-form-number path)))
     (vector-push-extend
      (logior
       (if context
@@ -257,6 +264,8 @@
     (write-var-integer (- loc *previous-location*) byte-buffer)
     (setq *previous-location* loc)
 
+    (unless tlf-num
+      (write-var-integer (source-path-tlf-number path) byte-buffer))
     (unless (zerop form-number)
       (setf *previous-form-number* form-number)
       (write-var-integer form-number byte-buffer))
@@ -276,13 +285,14 @@
 
 ;;; Extract context info from a Location-Info structure and use it to
 ;;; dump a compiled code-location.
-(defun dump-location-from-info (loc var-locs)
-  (declare (type location-info loc)
+(defun dump-location-from-info (loc tlf-num var-locs)
+  (declare (type location-info loc) (type (or index null) tlf-num)
            (type hash-table var-locs))
   (let ((vop (location-info-vop loc)))
     (dump-1-location (vop-node vop)
                      (vop-block vop)
                      (location-info-kind loc)
+                     tlf-num
                      (location-info-label loc)
                      (vop-save-set vop)
                      var-locs
@@ -290,21 +300,44 @@
                      (location-info-context loc)))
   (values))
 
+;;; Scan all the blocks, determining if all locations are in the same
+;;; TLF, and returning it or NIL.
+(defun find-tlf-number (fun)
+  (declare (type clambda fun))
+  (let ((res (source-path-tlf-number (node-source-path (lambda-bind fun)))))
+    (declare (type (or index null) res))
+    (do-environment-ir2-blocks (2block (lambda-environment fun))
+      (let ((block (ir2-block-block 2block)))
+        (when (eq (block-info block) 2block)
+          (unless (eql (source-path-tlf-number
+                        (node-source-path
+                         (block-start-node block)))
+                       res)
+            (setq res nil)))
+
+        (dolist (loc (ir2-block-locations 2block))
+          (unless (eql (source-path-tlf-number
+                        (node-source-path
+                         (vop-node (location-info-vop loc))))
+                       res)
+            (setq res nil)))))
+    res))
+
 ;;; Dump out the number of locations and the locations for Block.
-(defun dump-block-locations (block locations var-locs)
+(defun dump-block-locations (block locations tlf-num var-locs)
   (declare (type cblock block) (list locations))
   (unless (and locations
                (eq (location-info-kind (first locations))
                    :non-local-entry))
       (let ((2block (block-info block)))
         (dump-1-location (block-start-node block)
-                         2block :block-start
+                         2block :block-start tlf-num
                          (ir2-block-%label 2block)
                          (ir2-block-live-out 2block)
                          var-locs
                          nil)))
   (dolist (loc locations)
-    (dump-location-from-info loc var-locs))
+    (dump-location-from-info loc tlf-num var-locs))
   (values))
 
 ;;; Return a vector and an integer (or null) suitable for use as the
@@ -314,18 +347,19 @@
   (let ((*previous-location* 0)
         *previous-live*
         *previous-form-number*
-        (physenv (lambda-physenv fun))
+        (tlf-num (find-tlf-number fun))
+        (env (lambda-environment fun))
         (byte-buffer *byte-buffer*)
         prev-block
         locations
         elsewhere-locations)
     (setf (fill-pointer byte-buffer) 0)
-    (do-physenv-ir2-blocks (2block physenv)
+    (do-environment-ir2-blocks (2block env)
       (let ((block (ir2-block-block 2block)))
         (when (eq (block-info block) 2block)
           (when prev-block
             (dump-block-locations prev-block (nreverse (shiftf locations nil))
-                                  var-locs))
+                                  tlf-num var-locs))
           (setf prev-block block)))
       (dolist (loc (ir2-block-locations 2block))
         (if (label-elsewhere-p (location-info-label loc)
@@ -333,13 +367,15 @@
             (push loc elsewhere-locations)
             (push loc locations))))
 
-    (dump-block-locations prev-block (nreverse locations) var-locs)
+    (dump-block-locations prev-block (nreverse locations)
+                          tlf-num var-locs)
 
     (when elsewhere-locations
       (dolist (loc (nreverse elsewhere-locations))
-        (dump-location-from-info loc var-locs)))
+        (dump-location-from-info loc tlf-num var-locs)))
     ;; lz-compress accept any array of octets and returns a simple-array
-    (logically-readonlyize (lz-compress byte-buffer))))
+    (values (logically-readonlyize (lz-compress byte-buffer))
+            tlf-num)))
 
 ;;; Return DEBUG-SOURCE structure containing information derived from
 ;;; INFO.
@@ -347,19 +383,33 @@
   (declare (type source-info info))
   (let ((file-info (get-toplevelish-file-info info)))
     (multiple-value-call
-        (if function #'sb-c::make-core-debug-source #'make-debug-source)
+        (if function 'sb-di::make-core-debug-source 'make-debug-source)
      :namestring (or *source-namestring*
                      (make-file-info-namestring
                       (let ((pathname
                              (case *name-context-file-path-selector*
-                               (pathname (file-info-untruename file-info))
-                               (truename (file-info-name file-info)))))
+                               (pathname (file-info-pathname file-info))
+                               (truename (file-info-truename file-info)))))
                         (if (pathnamep pathname) pathname))
                       file-info))
-     :created (file-info-write-date file-info)
+      :created
+      #+sb-xc-host (file-info-write-date file-info)
+      #-sb-xc-host (let ((source-date-epoch (posix-getenv "SOURCE_DATE_EPOCH"))
+                         (file-write-date (file-info-write-date file-info)))
+                     (if source-date-epoch
+                         (multiple-value-bind (val end)
+                             (parse-integer source-date-epoch :junk-allowed t)
+                           (if (and (= end (length source-date-epoch))
+                                    (and val file-write-date)
+                                    (< (+ val unix-to-universal-time) file-write-date))
+                               (+ val unix-to-universal-time)
+                               file-write-date))
+                         file-write-date))
+      :start-positions (coerce-to-smallest-eltype
+                        (file-info-positions file-info))
      (if function
          (values :form (let ((direct-file-info (source-info-file-info info)))
-                         (when (eq :lisp (file-info-name direct-file-info))
+                         (when (eq :lisp (file-info-truename direct-file-info))
                            (elt (file-info-forms direct-file-info) 0)))
                  :function function)
          (values)))))
@@ -382,6 +432,7 @@
 ;;; During cross-compilation the in-memory representation is opaque -
 ;;; we don't care how it looks, but can recover the intended specialization.
 (defun coerce-to-smallest-eltype (seq)
+  (declare (type sequence seq))
   (let ((max-positive 0)
         (max-negative 0)
         (length 0))
@@ -441,85 +492,68 @@
 (defun dump-1-var (fun var tn minimal buffer &optional name same-name-p)
   (declare (type lambda-var var) (type (or tn null) tn)
            (type clambda fun))
-  (let* ((save-tn (and tn (tn-save-tn tn)))
+  (let* ((package (sb-xc:symbol-package name))
+         (package-p (and package (not (eq package *package*))))
+         (save-tn (and tn (tn-save-tn tn)))
          (kind (and tn (tn-kind tn)))
          (flags 0)
-         (info (lambda-var-arg-info var))
          (indirect (and (lambda-var-indirect var)
                         (not (lambda-var-explicit-value-cell var))
-                        (neq (lambda-physenv fun)
-                             (lambda-physenv (lambda-var-home var)))))
-         ;; Keep this condition in sync with PARSE-COMPILED-DEBUG-VARS
-         (large-fixnums (>= (integer-length most-positive-fixnum) 62))
-         more)
-    (declare (type index flags))
-    (when minimal
-      (setq flags (logior flags compiled-debug-var-minimal-p))
-      (unless (and tn (tn-offset tn))
-        (setq flags (logior flags compiled-debug-var-deleted-p))))
+                        (neq (lambda-environment fun)
+                             (lambda-environment (lambda-var-home var))))))
+    (declare (type (and sb-xc:fixnum unsigned-byte) flags))
+    (let ((info (lambda-var-arg-info var)))
+      ;; &more vars need no name
+      (when (and info
+                 (memq (arg-info-kind info)
+                       '(:more-context :more-count)))
+        (setq minimal t)))
+    (cond (minimal
+           (setq flags (logior flags compiled-debug-var-minimal-p))
+           (unless (and tn (tn-offset tn))
+             (setq flags (logior flags compiled-debug-var-deleted-p))))
+          (t
+           (unless package
+             (setq flags (logior flags compiled-debug-var-uninterned)))
+           (when package-p
+             (setq flags (logior flags compiled-debug-var-packaged)))))
     (when (and (or (eq kind :environment)
                    (and (eq kind :debug-environment)
                         (null (basic-var-sets var))))
                (not (gethash tn (ir2-component-spilled-tns
                                  (component-info *component-being-compiled*))))
-               (lexenv-contains-lambda fun
-                                       (lambda-lexenv (lambda-var-home var)))
+               (or (eq (lambda-var-home var) fun)
+                   (member var (environment-closure (lambda-environment fun))))
                (not (optional-leaf-p var))) ;; not always initialized
       (setq flags (logior flags compiled-debug-var-environment-live)))
     (when save-tn
       (setq flags (logior flags compiled-debug-var-save-loc-p)))
     (when indirect
       (setq flags (logior flags compiled-debug-var-indirect-p)))
-    (when info
-      (case (arg-info-kind info)
-        (:more-context
-         (setq flags (logior flags compiled-debug-var-more-context-p)
-               more t))
-        (:more-count
-         (setq flags (logior flags compiled-debug-var-more-count-p)
-               more t))))
-    (when (and same-name-p
-               (not (or more minimal)))
-      (setf flags (logior flags compiled-debug-var-same-name-p)))
-    (when large-fixnums
-      (cond (indirect
-             (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
-             (when save-tn
-               (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn))))
-            (t
-             (if (and tn (tn-offset tn))
-                 (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
-                 (aver minimal))
-             (when save-tn
-               (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn))))))
+    (when (and same-name-p (not minimal))
+      (setq flags (logior flags compiled-debug-var-same-name-p)))
     (vector-push-extend flags buffer)
-    (unless (or minimal
-                same-name-p
-                more) ;; &more vars need no name
-      ;; Dumping uninterned symbols as debug var names is kinda silly.
-      ;; Reconstruction of the name on fasl load produces a new gensym anyway.
-      ;; So rather than waste symbol space, just dump such symbols as strings,
-      ;; and PARSE-COMPILED-DEBUG-VARS can create the interned symbol.
-      ;; This reduces core size by omitting zillions of symbols whose names
-      ;; are spelled the same.
-      (vector-push-extend (if (cl:symbol-package name) name (string name)) buffer))
+    (unless minimal
+      (unless same-name-p
+        (write-var-string (symbol-name name) buffer))
+      (when package-p
+        (write-var-string (sb-xc:package-name package) buffer)))
 
     (cond (indirect
            ;; Indirect variables live in the parent frame, and are
            ;; accessed through a saved frame pointer.
            ;; The first one/two sc-offsets are for the frame pointer,
            ;; the third is for the stack offset.
-           (unless large-fixnums
-             (vector-push-extend (tn-sc+offset tn) buffer)
-             (when save-tn
-               (vector-push-extend (tn-sc+offset save-tn) buffer)))
-           (vector-push-extend (tn-sc+offset (leaf-info var)) buffer))
-          ((not large-fixnums)
+           (write-var-integer (tn-sc+offset tn) buffer)
+           (when save-tn
+             (write-var-integer (tn-sc+offset save-tn) buffer))
+           (write-var-integer (tn-sc+offset (leaf-info var)) buffer))
+          (t
            (if (and tn (tn-offset tn))
-               (vector-push-extend (tn-sc+offset tn) buffer)
+               (write-var-integer (tn-sc+offset tn) buffer)
                (aver minimal))
            (when save-tn
-             (vector-push-extend (tn-sc+offset save-tn) buffer)))))
+             (write-var-integer (tn-sc+offset save-tn) buffer)))))
   (values))
 
 (defun leaf-principal-name (leaf)
@@ -552,7 +586,7 @@
                  (frob-leaf leaf (leaf-info leaf) gensym-p))))
       (frob-lambda fun t)
       (when (>= level 1)
-        (dolist (x (ir2-physenv-closure (physenv-info (lambda-physenv fun))))
+        (dolist (x (ir2-environment-closure (environment-info (lambda-environment fun))))
           (let ((thing (car x)))
             (when (lambda-var-p thing)
               (frob-leaf thing (cdr x) (>= level 2)))))
@@ -560,36 +594,36 @@
         (dolist (let (lambda-lets fun))
           (frob-lambda let (>= level 2)))))
 
+    (setf (fill-pointer *byte-buffer*) 0)
     (let ((sorted (sort (vars) #'string<
                         :key (lambda (x)
                                (symbol-name (car x)))))
           (prev-name nil)
           (i 0)
-          (buffer (make-array 0 :fill-pointer 0 :adjustable t))
           ;; XEPs don't have any useful variables
-          (minimal (eq (functional-kind fun) :external)))
+          (minimal (functional-kind-eq fun external)))
       (declare (type index i))
       (loop for (name var . tn) in sorted
             do
-            (dump-1-var fun var tn minimal buffer
+            (dump-1-var fun var tn minimal *byte-buffer*
                         name
                         (and prev-name (eq prev-name name)))
             (setf prev-name name)
             (setf (gethash var var-locs) i)
             (incf i))
-      (compact-vector buffer))))
+      (copy-seq *byte-buffer*))))
 
 ;;; Return a vector suitable for use as the DEBUG-FUN-VARS of
 ;;; FUN, representing the arguments to FUN in minimal variable format.
 (defun compute-minimal-vars (fun)
   (declare (type clambda fun))
-  (let ((buffer (make-array 0 :fill-pointer 0 :adjustable t)))
-    (dolist (var (lambda-vars fun))
-      (dump-1-var fun var (leaf-info var) t buffer))
-    (compact-vector buffer)))
+  (setf (fill-pointer *byte-buffer*) 0)
+  (dolist (var (lambda-vars fun))
+    (dump-1-var fun var (leaf-info var) t *byte-buffer*))
+  (copy-seq *byte-buffer*))
 
 ;;; Return VAR's relative position in the function's variables (determined
-;;; from the VAR-LOCS hashtable).  If VAR is deleted, then return DEBUG-INFO-VAR-DELETED.
+;;; from the VAR-LOCS hashtable).  If VAR is deleted, then return DELETED.
 (defun debug-location-for (var var-locs)
   (declare (type lambda-var var) (type hash-table var-locs))
   (let ((res (gethash var var-locs)))
@@ -597,7 +631,7 @@
           (t
            (aver (or (null (leaf-refs var))
                      (not (tn-offset (leaf-info var)))))
-           debug-info-var-deleted))))
+           'deleted))))
 
 ;;;; arguments/returns
 
@@ -630,16 +664,16 @@
                                             (return-from one-arg))
                                            (more
                                             (setf (arg-info-default info) t)))
-                                     (res debug-info-var-rest)))
+                                     (res 'rest-arg)))
                                   (:more-context
-                                   (res debug-info-var-more))
+                                   (res 'more-arg))
                                   (:optional
                                    (unless saw-optional
-                                     (res debug-info-var-optional)
+                                     (res 'optional-args)
                                      (setq saw-optional t))))
                                 (res (debug-location-for actual var-locs))
                                 (when (arg-info-supplied-p info)
-                                  (res debug-info-var-supplied-p)
+                                  (res 'supplied-p)
                                   (res (debug-location-for (pop actual-vars) var-locs))))
                                 (t
                                  (res (debug-location-for actual var-locs)))))))
@@ -648,7 +682,7 @@
           (dolist (var (lambda-vars fun))
             (res (debug-location-for var var-locs)))))
 
-    (compact-vector (res))))
+    (coerce-to-smallest-eltype (res))))
 
 ;;; Return a vector of SC offsets describing FUN's return locations.
 ;;; (Must be known values return...)
@@ -662,16 +696,21 @@
 ;;; Return a C-D-F structure with all the mandatory slots filled in.
 (defun dfun-from-fun (fun)
   (declare (type clambda fun))
-  (let* ((2env (physenv-info (lambda-physenv fun)))
+  (let* ((2env (environment-info (lambda-environment fun)))
          (dispatch (lambda-optional-dispatch fun))
          (main-p (and dispatch
                       (eq fun (optional-dispatch-main-entry dispatch))))
-         (kind (if main-p nil (functional-kind fun)))
+         (kind (if main-p nil (ecase (functional-kind fun)
+                                (#.(functional-kind-attributes nil) nil)
+                                (#.(functional-kind-attributes optional) :optional)
+                                (#.(functional-kind-attributes external) :external)
+                                (#.(functional-kind-attributes toplevel) :toplevel)
+                                (#.(functional-kind-attributes cleanup) :cleanup))))
          (name (leaf-debug-name fun))
          (name (if (consp name)
                    (case (car name)
                      ((xep tl-xep)
-                      (aver (eq kind :external))
+                      (aver (eql kind :external))
                       (second name))
                      (&optional-processor
                       (setf kind :optional)
@@ -682,29 +721,30 @@
                      (t
                       name))
                    name)))
-    (funcall (compiled-debug-fun-ctor kind)
-             :name name
-             #-fp-and-pc-standard-save :return-pc
-             #-fp-and-pc-standard-save (tn-sc+offset (ir2-physenv-return-pc 2env))
-             #-fp-and-pc-standard-save :return-pc-pass
-             #-fp-and-pc-standard-save (tn-sc+offset (ir2-physenv-return-pc-pass 2env))
-             #-fp-and-pc-standard-save :old-fp
-             #-fp-and-pc-standard-save (tn-sc+offset (ir2-physenv-old-fp 2env))
-             :encoded-locs
-             (cdf-encode-locs
-              (label-position (ir2-physenv-environment-start 2env))
-              (label-position (ir2-physenv-elsewhere-start 2env))
-              (source-path-form-number (node-source-path (lambda-bind fun)))
-              (label-position (block-label (lambda-block fun)))
-              (when (ir2-physenv-closure-save-tn 2env)
-                (tn-sc+offset (ir2-physenv-closure-save-tn 2env)))
-              #+unwind-to-frame-and-call-vop
-              (when (ir2-physenv-bsp-save-tn 2env)
-                (tn-sc+offset (ir2-physenv-bsp-save-tn 2env)))
-              #-fp-and-pc-standard-save
-              (label-position (ir2-physenv-lra-saved-pc 2env))
-              #-fp-and-pc-standard-save
-              (label-position (ir2-physenv-cfp-saved-pc 2env))))))
+    (make-compiled-debug-fun
+     :name name
+     :kind kind
+     #-fp-and-pc-standard-save :return-pc
+     #-fp-and-pc-standard-save (tn-sc+offset (ir2-environment-return-pc 2env))
+     #-fp-and-pc-standard-save :return-pc-pass
+     #-fp-and-pc-standard-save (tn-sc+offset (ir2-environment-return-pc-pass 2env))
+     #-fp-and-pc-standard-save :old-fp
+     #-fp-and-pc-standard-save (tn-sc+offset (ir2-environment-old-fp 2env))
+     #-fp-and-pc-standard-save :lra-saved-pc
+     #-fp-and-pc-standard-save (label-position (ir2-environment-lra-saved-pc 2env))
+     #-fp-and-pc-standard-save :cfp-saved-pc
+     #-fp-and-pc-standard-save (label-position (ir2-environment-cfp-saved-pc 2env))
+     :closure-save
+     (when (ir2-environment-closure-save-tn 2env)
+       (tn-sc+offset (ir2-environment-closure-save-tn 2env)))
+     #+unwind-to-frame-and-call-vop :bsp-save
+     #+unwind-to-frame-and-call-vop
+     (when (ir2-environment-bsp-save-tn 2env)
+       (tn-sc+offset (ir2-environment-bsp-save-tn 2env)))
+     :start-pc
+     (label-position (ir2-environment-environment-start 2env))
+     :elsewhere-pc
+     (label-position (ir2-environment-elsewhere-start 2env)))))
 
 ;;; Return a complete C-D-F structure for FUN. This involves
 ;;; determining the DEBUG-INFO level and filling in optional slots as
@@ -730,9 +770,14 @@
                  (compute-vars fun level var-locs))
            (setf (compiled-debug-fun-arguments dfun)
                  (compute-args fun var-locs))))
-    (when (>= level 1)
-      (setf (compiled-debug-fun-blocks dfun)
-            (compute-debug-blocks fun var-locs)))
+
+    (if (>= level 1)
+        (multiple-value-bind (blocks tlf-num)
+            (compute-debug-blocks fun var-locs)
+          (setf (compiled-debug-fun-blocks dfun) blocks
+                (compiled-debug-fun-tlf-number dfun) tlf-num))
+        (setf (compiled-debug-fun-tlf-number dfun) (find-tlf-number fun)))
+
     (if (xep-p fun)
         (setf (compiled-debug-fun-returns dfun) :standard)
         (let ((info (tail-set-info (lambda-tail-set fun))))
@@ -740,19 +785,170 @@
             (cond ((eq (return-info-kind info) :unknown)
                    (setf (compiled-debug-fun-returns dfun)
                          :standard))
+                  ((eq (return-info-kind info) :unboxed))
                   ((/= level 0)
                    (setf (compiled-debug-fun-returns dfun)
                          (compute-debug-returns fun)))))))
     dfun))
+
+
+;;;; Packed debug functions:
+
+;;; Dump a packed binary representation of a DFUN into *BYTE-BUFFER*.
+;;; PREV-START and START are the byte offsets in the code where the
+;;; previous function started and where this one starts.
+;;; PREV-ELSEWHERE is the previous function's elsewhere PC.
+(defun dump-1-packed-dfun (dfun prev-start start prev-elsewhere)
+  (declare (type compiled-debug-fun dfun)
+           (type index prev-start start prev-elsewhere))
+  (let ((name (compiled-debug-fun-name dfun)))
+    (let ((options 0))
+      (setf (ldb packed-debug-fun-kind-byte options)
+            (position-or-lose (compiled-debug-fun-kind dfun)
+                              packed-debug-fun-kinds))
+      (setf (ldb packed-debug-fun-returns-byte options)
+            (etypecase (compiled-debug-fun-returns dfun)
+              ((member :standard) packed-debug-fun-returns-standard)
+              ((member :fixed) packed-debug-fun-returns-fixed)
+              (vector packed-debug-fun-returns-specified)))
+      (vector-push-extend options *byte-buffer*))
+
+    (let ((flags 0))
+      (when (compiled-debug-fun-vars dfun)
+        (setq flags (logior flags packed-debug-fun-variables-bit)))
+      (when (compiled-debug-fun-blocks dfun)
+        (when (typep (compiled-debug-fun-blocks dfun) '(simple-array (signed-byte 8) (*)))
+          (setq flags (logior flags packed-debug-fun-blocks-compressed-bit)))
+        (setq flags (logior flags packed-debug-fun-blocks-bit)))
+      (when (compiled-debug-fun-tlf-number dfun)
+        (setq flags (logior flags packed-debug-fun-tlf-number-bit)))
+      (unless (memq (compiled-debug-fun-arguments dfun) '(nil :minimal))
+        (setq flags (logior flags packed-debug-fun-non-minimal-arguments-bit)))
+      (when (compiled-debug-fun-closure-save dfun)
+        (setq flags (logior flags packed-debug-fun-closure-save-loc-bit)))
+      #+unwind-to-frame-and-call-vop
+      (when (compiled-debug-fun-bsp-save dfun)
+        (setq flags (logior flags packed-debug-fun-bsp-save-loc-bit)))
+      (vector-push-extend flags *byte-buffer*))
+
+    (write-var-integer (or (position name *contexts* :test #'equal)
+                           (vector-push-extend name *contexts*))
+                       *byte-buffer*)
+
+    (let ((vars (compiled-debug-fun-vars dfun)))
+      (when vars
+        (let ((len (length vars)))
+          (write-var-integer len *byte-buffer*)
+          (dotimes (i len)
+            (vector-push-extend (aref vars i) *byte-buffer*)))))
+
+    (let ((blocks (compiled-debug-fun-blocks dfun)))
+      (when blocks
+        (let ((len (length blocks)))
+          (write-var-integer len *byte-buffer*)
+          (dotimes (i len)
+            (vector-push-extend (mask-field (byte 8 0) (aref blocks i))
+                                *byte-buffer*)))))
+
+    (when (compiled-debug-fun-tlf-number dfun)
+      (write-var-integer (compiled-debug-fun-tlf-number dfun)
+                         *byte-buffer*))
+
+    (let ((arguments (compiled-debug-fun-arguments dfun)))
+      (unless (memq arguments '(nil :minimal))
+        (let ((len (length arguments)))
+          (write-var-integer len *byte-buffer*)
+          (dotimes (i len)
+            (let ((argument (aref arguments i)))
+              (case argument
+                (deleted
+                 (write-var-integer packed-debug-fun-arg-deleted
+                                    *byte-buffer*))
+                (supplied-p
+                 (write-var-integer packed-debug-fun-arg-supplied-p
+                                    *byte-buffer*))
+                (optional
+                 (write-var-integer packed-debug-fun-arg-optional
+                                    *byte-buffer*))
+                (rest
+                 (write-var-integer packed-debug-fun-arg-rest
+                                    *byte-buffer*))
+                (more
+                 (write-var-integer packed-debug-fun-arg-more
+                                    *byte-buffer*))
+                (otherwise
+                 (cond ((integerp argument)
+                        (write-var-integer (+ argument
+                                              packed-debug-fun-arg-index-offset)
+                                           *byte-buffer*))
+                       ((keywordp argument)
+                        (write-var-integer packed-debug-fun-key-arg-keyword
+                                           *byte-buffer*)
+                        (write-var-string (symbol-name argument)
+                                          *byte-buffer*))
+                       ((sb-xc:symbol-package argument)
+                        (write-var-integer packed-debug-fun-key-arg-packaged
+                                           *byte-buffer*)
+                        (write-var-string (symbol-name argument)
+                                          *byte-buffer*)
+                        (write-var-string (sb-xc:package-name
+                                           (sb-xc:symbol-package argument))
+                                          *byte-buffer*))
+                       (t
+                        (write-var-integer packed-debug-fun-key-arg-uninterned
+                                           *byte-buffer*)
+                        (write-var-string (symbol-name argument)
+                                          *byte-buffer*))))))))))
+
+    (let ((returns (compiled-debug-fun-returns dfun)))
+      (when (vectorp returns)
+        (let ((len (length returns)))
+          (write-var-integer len *byte-buffer*)
+          (dotimes (i len)
+            (write-var-integer (aref returns i) *byte-buffer*)))))
+
+    #-fp-and-pc-standard-save
+    (progn
+      (write-var-integer (compiled-debug-fun-return-pc dfun)
+                         *byte-buffer*)
+      (write-var-integer (compiled-debug-fun-return-pc-pass dfun)
+                         *byte-buffer*)
+      (write-var-integer (compiled-debug-fun-old-fp dfun)
+                         *byte-buffer*)
+      (write-var-integer (compiled-debug-fun-lra-saved-pc dfun)
+                         *byte-buffer*)
+      (write-var-integer (compiled-debug-fun-cfp-saved-pc dfun)
+                         *byte-buffer*))
+    (when (compiled-debug-fun-closure-save dfun)
+      (write-var-integer (compiled-debug-fun-closure-save dfun)
+                         *byte-buffer*))
+    #+unwind-to-frame-and-call-vop
+    (when (compiled-debug-fun-bsp-save dfun)
+      (write-var-integer (compiled-debug-fun-bsp-save dfun)
+                         *byte-buffer*))
+    (write-var-integer (- start prev-start) *byte-buffer*)
+    (write-var-integer (- (compiled-debug-fun-start-pc dfun) start)
+                       *byte-buffer*)
+    (write-var-integer (- (compiled-debug-fun-elsewhere-pc dfun)
+                          prev-elsewhere)
+                       *byte-buffer*)))
+
+;;; Return a byte-vector holding all the debug functions for a
+;;; component in the packed binary PACKED-DEBUG-FUN format.
+(defun compute-packed-debug-funs (dfuns)
+  (declare (list dfuns))
+  (setf (fill-pointer *byte-buffer*) 0)
+  (let ((prev-start 0)
+        (prev-elsewhere 0))
+    (dolist (dfun dfuns)
+      (let ((start (car dfun))
+            (elsewhere (compiled-debug-fun-elsewhere-pc (cdr dfun))))
+        (dump-1-packed-dfun (cdr dfun) prev-start start prev-elsewhere)
+        (setq prev-start start prev-elsewhere elsewhere))))
+  (coerce-to-smallest-eltype *byte-buffer*))
+
 
 ;;;; full component dumping
-
-;;; Compute the full form function map.
-(defun compute-debug-fun-map (sorted)
-  (declare (list sorted))
-  (loop for (fun next) on sorted
-        do (setf (compiled-debug-fun-next fun) next))
-  (car sorted))
 
 (defun empty-fun-p (fun)
   (let* ((2block (block-info (lambda-block fun)))
@@ -763,8 +959,8 @@
      (eq start (ir2-block-last-vop 2block))
      (eq (vop-name start) 'note-environment-start)
      next
-     (neq (ir2-block-physenv 2block)
-          (ir2-block-physenv next)))))
+     (neq (ir2-block-environment 2block)
+          (ir2-block-environment next)))))
 
 ;;; Return a DEBUG-INFO structure describing COMPONENT. This has to be
 ;;; called after assembly so that source map information is available.
@@ -778,20 +974,14 @@
                                    :adjustable t))
         (*contexts* (make-array 10
                                 :fill-pointer 0
-                                :adjustable t))
-        component-tlf-num)
+                                :adjustable t)))
     (dolist (lambda (component-lambdas component))
       (unless (empty-fun-p lambda)
-       (clrhash var-locs)
-       (let ((tlf-num (source-path-tlf-number
-                       (node-source-path (lambda-bind lambda)))))
-         (if component-tlf-num
-             (aver (or (block-compile *compilation*)
-                       (= component-tlf-num tlf-num)))
-             (setf component-tlf-num tlf-num))
-         (push (compute-1-debug-fun lambda var-locs) dfuns))))
-    (let* ((sorted (sort dfuns #'< :key #'compiled-debug-fun-offset))
-           (fun-map (compute-debug-fun-map sorted)))
+        (clrhash var-locs)
+        (push (cons (label-position (block-label (lambda-block lambda)))
+                    (compute-1-debug-fun lambda var-locs))
+              dfuns)))
+    (let ((sorted (sort dfuns #'< :key #'car)))
       (make-compiled-debug-info
        ;; COMPONENT-NAME is often not useful, and sometimes completely fubar.
        ;; Function names, on the other hand, are seldom unhelpful,
@@ -802,13 +992,8 @@
                (or (and (not (cdr entries))
                         (sb-c::entry-info-name (car entries)))
                    (component-name component)))
-       :fun-map fun-map
-       :tlf-num+offset (pack-tlf-num+offset
-                        component-tlf-num
-                        (and component-tlf-num
-                             (aref (file-info-positions
-                                    (source-info-file-info *source-info*))
-                                   component-tlf-num)))
+       :package *package*
+       :fun-map (compute-packed-debug-funs sorted)
        :contexts (compact-vector *contexts*)))))
 
 ;;; Write BITS out to BYTE-BUFFER in backend byte order. The length of

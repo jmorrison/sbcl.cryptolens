@@ -18,16 +18,12 @@
                     ;; Toggle some bits so that the hash is not equal to the hash
                     ;; for a classoid of this name (relevant for named type T only)
                     (perturbed-bit-string
-                     (let ((string (format nil "~32,'0b" name-hash)))
-                       (concatenate 'string
-                                    (subseq string 0 22) (reverse (subseq string 22)))))
-                    (bits `(pack-interned-ctype-bits
+                      (let ((string (format nil "~32,'0b" name-hash)))
+                        (concatenate 'string
+                                     (subseq string 0 22) (reverse (subseq string 22)))))
+                    (bits `(make-ctype-bits
                             'named
-                            ,(parse-integer perturbed-bit-string :radix 2)
-                            ,(case type
-                              ((*) 31)
-                              ((nil t) (sb-vm::saetp-index-or-lose type))
-                              (t nil)))))
+                            ,(parse-integer perturbed-bit-string :radix 2))))
                (declare (ignorable bits)) ; not used in XC
                `(progn
                   #+sb-xc-host
@@ -35,55 +31,62 @@
                          ;; Make it known as a constant in the cross-compiler.
                          (setf (info :variable :kind ',global-sym) :constant))
                   (!cold-init-forms
-                   #+sb-xc (sb-c::%defconstant ',global-sym ,global-sym
-                                               (sb-c:source-location))
-                   (setf (info :type :builtin ',type) ,global-sym
+                   #+sb-xc (sb-impl::%defconstant ',global-sym ,(symbol-value global-sym)
+                                                  (sb-c:source-location))
+                   (setf (info :type :builtin ',type) #+sb-xc-host ,global-sym #-sb-xc-host ,(symbol-value global-sym)
                          (info :type :kind ',type) :primitive))))))
-   ;; KLUDGE: In ANSI, * isn't really the name of a type, it's just a
-   ;; special symbol which can be stuck in some places where an
-   ;; ordinary type can go, e.g. (ARRAY * 1) instead of (ARRAY T 1).
-   ;; In SBCL it also used to denote universal VALUES type.
-   (frob * *wild-type*)
-   (frob nil *empty-type*)
-   (frob t *universal-type*)
-   ;; new in sbcl-0.9.5: these used to be CLASSOID types, but that
-   ;; view of them was incompatible with requirements on the MOP
-   ;; metaobject class hierarchy: the INSTANCE and
-   ;; FUNCALLABLE-INSTANCE types are disjoint (instances have
-   ;; instance-pointer-lowtag; funcallable-instances have
-   ;; fun-pointer-lowtag), while FUNCALLABLE-STANDARD-OBJECT is
-   ;; required to be a subclass of STANDARD-OBJECT.  -- CSR,
-   ;; 2005-09-09
-   (frob instance *instance-type*)
-   (frob funcallable-instance *funcallable-instance-type*)
-   ;; new in sbcl-1.0.3.3: necessary to act as a join point for the
-   ;; extended sequence hierarchy.  (Might be removed later if we use
-   ;; a dedicated FUNDAMENTAL-SEQUENCE class for this.)
-   (frob extended-sequence *extended-sequence-type*))
+  ;; KLUDGE: In ANSI, * isn't really the name of a type, it's just a
+  ;; special symbol which can be stuck in some places where an
+  ;; ordinary type can go, e.g. (ARRAY * 1) instead of (ARRAY T 1).
+  ;; In SBCL it also used to denote universal VALUES type.
+  (frob * *wild-type*)
+  (frob nil *empty-type*)
+  (frob t *universal-type*)
+  ;; new in sbcl-0.9.5: these used to be CLASSOID types, but that
+  ;; view of them was incompatible with requirements on the MOP
+  ;; metaobject class hierarchy: the INSTANCE and
+  ;; FUNCALLABLE-INSTANCE types are disjoint (instances have
+  ;; instance-pointer-lowtag; funcallable-instances have
+  ;; fun-pointer-lowtag), while FUNCALLABLE-STANDARD-OBJECT is
+  ;; required to be a subclass of STANDARD-OBJECT.  -- CSR,
+  ;; 2005-09-09
+  (frob instance *instance-type*)
+  (frob funcallable-instance *funcallable-instance-type*)
+  ;; new in sbcl-1.0.3.3: necessary to act as a join point for the
+  ;; extended sequence hierarchy.  (Might be removed later if we use
+  ;; a dedicated FUNDAMENTAL-SEQUENCE class for this.)
+  (frob extended-sequence *extended-sequence-type*))
+
+#-sb-xc-host
+(progn
+;;; a vector that maps widetags to layouts, used for quickly finding
+;;; the layouts of built-in classes
+(define-load-time-global **primitive-object-layouts** nil)
+(declaim (type simple-vector **primitive-object-layouts**)))
+
+#-sb-xc-host
+(!cold-init-forms
+
+;; This vector is allocated into immobile fixedobj space if #+compact-instance-header.
+;; There isn't a way to do that from lisp, so it's special-cased in genesis.
+#-compact-instance-header (setq **primitive-object-layouts** (make-array 256))
+(map-into **primitive-object-layouts**
+          (lambda (name) (classoid-layout (find-classoid name)))
+          #.(let ((table (make-array 256 :initial-element 'sb-kernel::random-class)))
+              (dolist (x sb-kernel::*builtin-classoids*)
+                (destructuring-bind (name &key codes &allow-other-keys) x
+                  (dolist (code codes)
+                    (setf (svref table code) name))))
+              ;; widetag-of can return n-widetag-bits-long result for immediates/conses/functions.
+              (loop for i from sb-vm:list-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
+                    below 256
+                    do (setf (aref table i) 'cons))
+              (loop for i from sb-vm:fun-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
+                    below 256
+                    do (setf (aref table i) 'function))
+              (loop for i from sb-vm:even-fixnum-lowtag by (ash 1 sb-vm:n-fixnum-tag-bits)
+                    below 256
+                    do (setf (aref table i) 'fixnum))
+              table)))
 
 (!defun-from-collected-cold-init-forms !primordial-type-cold-init)
-
-;;; A HAIRY-TYPE represents anything too weird to be described
-;;; reasonably or to be useful, such as NOT, SATISFIES, unknown types,
-;;; and unreasonably complicated types involving AND. We just remember
-;;; the original type spec.
-;;; A possible improvement would be for HAIRY-TYPE to have a subtype
-;;; named SATISFIES-TYPE for the hairy types which are specifically
-;;; of the form (SATISFIES pred) so that we don't have to examine
-;;; the sexpr repeatedly to decide whether it takes that form.
-;;; And as a further improvement, we might want a table that maps
-;;; predicates to their exactly recognized type when possible.
-;;; We have such a table in fact - *BACKEND-PREDICATE-TYPES*
-;;; as a starting point. But something like PLUSP isn't in there.
-;;; On the other hand, either of these points may not be sources of
-;;; inefficiency, and the latter if implemented might have undesirable
-;;; user-visible ramifications, though it seems unlikely.
-(defstruct (hairy-type (:include ctype)
-                       (:constructor %make-hairy-type
-                           (specifier &aux (%bits (pack-ctype-bits hairy))))
-                       (:constructor !make-interned-hairy-type
-                           (specifier &aux (%bits (pack-interned-ctype-bits 'hairy))))
-                       (:copier nil))
-  ;; the Common Lisp type-specifier of the type we represent.
-  ;; For other than an unknown type, this must be a (SATISFIES f) expression.
-  (specifier nil :type t :read-only t))

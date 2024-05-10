@@ -1,6 +1,8 @@
 #include <signal.h>
 #include <machine/cpu.h>
-#include "sbcl.h"
+#include <errno.h>
+#include "genesis/sbcl.h"
+#include "interr.h"
 #include "runtime.h"
 #include "thread.h"
 
@@ -24,17 +26,6 @@ os_context_sp_addr(os_context_t *context)
 #endif
 }
 #endif
-
-
-int *
-os_context_pc_addr(os_context_t *context)
-{
-#if defined(LISP_FEATURE_NETBSD)
-    return &(_UC_MACHINE_PC(context));
-#elif defined(LISP_FEATURE_OPENBSD)
-    return &context->sc_frame.srr0;
-#endif
-}
 
 int *
 os_context_lr_addr(os_context_t *context)
@@ -86,7 +77,8 @@ int arch_os_thread_init(struct thread *thread) {
     sigstack.ss_sp    = calc_altstack_base(thread);
     sigstack.ss_flags = 0;
     sigstack.ss_size  = calc_altstack_size(thread);
-    sigaltstack(&sigstack,0);
+    if (sigaltstack(&sigstack,0)<0)
+        lose("Cannot sigaltstack: %s",strerror(errno));
 #endif
     return 1;                  /* success */
 }

@@ -159,8 +159,7 @@
                          (convert-to-system-type type2))))))))
 
 (defun make-class-symbol (class-name)
-  (format-symbol #.(find-package "SB-PCL")
-                 "*THE-CLASS-~A*" (symbol-name class-name)))
+  (pcl-symbolicate "*THE-CLASS-" class-name "*"))
 
 (defvar *standard-method-combination*)
 (defvar *or-method-combination*)
@@ -169,6 +168,10 @@
   (getf (object-plist object) name))
 
 (defun (setf plist-value) (new-value object name)
+  ;; HACK: exploit the fact we know the expansion of (SETF (GETF ...)) involves %PUTF.
+  ;; This keeps PCL plists in the system TLAB if this whole file is compiled in a global
+  ;; policy that does so. REMF is ok since it's a non-consing destructive operation.
+  (declare (inline sb-impl::%putf))
   (if new-value
       (setf (getf (object-plist object) name) new-value)
       (progn
@@ -177,50 +180,52 @@
 
 ;;;; built-in classes
 
-;;; Grovel over SB-KERNEL::+!BUILT-IN-CLASSES+ in order to set
+;;; Grovel over SB-KERNEL::*BUILTIN-CLASSOIDS* in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
 (define-load-time-global *built-in-classes*
-  (labels ((direct-supers (class)
-             (/noshow "entering DIRECT-SUPERS" (classoid-name class))
-             (if (typep class 'built-in-classoid)
-                 (built-in-classoid-direct-superclasses class)
-                 (let ((inherits (layout-inherits
-                                  (classoid-layout class))))
-                   (/noshow inherits)
-                   (list (svref inherits (1- (length inherits)))))))
-           (direct-subs (class)
-             (/noshow "entering DIRECT-SUBS" (classoid-name class))
-             (collect ((res))
-               (let ((subs (classoid-subclasses class)))
-                 (/noshow subs)
-                 (when subs
-                   (dohash ((sub v) subs)
-                     (declare (ignore v))
-                     (/noshow sub)
-                     (when (member class (direct-supers sub) :test #'eq)
-                       (res sub)))))
-               (res))))
-    (mapcar (lambda (kernel-bic-entry)
-              (/noshow "setting up" kernel-bic-entry)
-              (let* ((name (car kernel-bic-entry))
-                     (class (find-classoid name)))
-                (/noshow name class)
-                `(,name
-                  ,(mapcar #'classoid-name (direct-supers class))
-                  ,(mapcar #'classoid-name (direct-subs class))
-                  ,(map 'list
-                        (lambda (x) (classoid-name (layout-classoid x)))
-                        (reverse (layout-inherits (classoid-layout class))))
-                  ,(eval (getf (cdr kernel-bic-entry) :prototype-form)))))
-            (remove-if (lambda (kernel-bic-entry)
-                         (member (first kernel-bic-entry)
-                                 ;; remove special classes (T and our
-                                 ;; SYSTEM-CLASSes) from the
-                                 ;; BUILT-IN-CLASS list
-                                 '(t function stream sequence
-                                     file-stream string-stream)))
-                       sb-kernel::+!built-in-classes+))))
+    (macrolet
+        ((frob ()
+           (labels ((direct-supers (class)
+                      (/noshow "entering DIRECT-SUPERS" (classoid-name class))
+                      (if (typep class 'built-in-classoid)
+                          (built-in-classoid-direct-superclasses class)
+                          (let ((inherits (layout-inherits (classoid-layout class))))
+                            (/noshow inherits)
+                            (list (svref inherits (1- (length inherits)))))))
+                    (direct-subs (class)
+                      (/noshow "entering DIRECT-SUBS" (classoid-name class))
+                      (collect ((res))
+                        (let ((subs (classoid-subclasses class)))
+                          (/noshow subs)
+                          (when subs
+                            (sb-kernel::do-subclassoids ((sub wrapper) class)
+                              (declare (ignore wrapper))
+                              (/noshow sub)
+                              (when (member class (direct-supers sub) :test #'eq)
+                                (res sub)))))
+                        (sort (res) #'string< :key #'classoid-name))))
+             `(list ,@(mapcar (lambda (kernel-bic-entry)
+                                (/noshow "setting up" kernel-bic-entry)
+                                (let* ((name (car kernel-bic-entry))
+                                       (class (find-classoid name)))
+                                  (/noshow name class)
+                                  `(list ',name
+                                         ',(mapcar #'classoid-name (direct-supers class))
+                                         ',(mapcar #'classoid-name (direct-subs class))
+                                         ',(map 'list #'layout-classoid-name
+                                                (reverse (layout-inherits (classoid-layout class))))
+                                         ,(getf (cdr kernel-bic-entry) :prototype-form))))
+                              (remove-if (lambda (kernel-bic-entry)
+                                           (member (first kernel-bic-entry)
+                                                   ;; remove special classes (T and our
+                                                   ;; SYSTEM-CLASSes) from the
+                                                   ;; BUILT-IN-CLASS list
+                                                   '(t function stream sequence
+                                                     file-stream string-stream
+                                                     slot-object)))
+                                         sb-kernel::*builtin-classoids*))))))
+      (frob)))
 (/noshow "done setting up SB-PCL::*BUILT-IN-CLASSES*")
 
 ;;;; the classes that define the kernel of the metabraid
@@ -348,8 +353,6 @@
 
 (defclass standard-reader-method (standard-accessor-method) ())
 (defclass standard-writer-method (standard-accessor-method) ())
-;;; an extension, apparently.
-(defclass standard-boundp-method (standard-accessor-method) ())
 
 ;;; for (SLOT-VALUE X 'FOO) / ACCESSOR-SLOT-VALUE optimization, which
 ;;; can't be STANDARD-READER-METHOD because there is no associated
@@ -357,21 +360,21 @@
 (defclass global-reader-method (accessor-method) ())
 (defclass global-writer-method (accessor-method) ())
 (defclass global-boundp-method (accessor-method) ())
+(defclass global-makunbound-method (accessor-method) ())
 
 (defclass method-combination (metaobject)
   ((%documentation :initform nil :initarg :documentation)))
 
-(defun make-gf-hash-table ()
-  (make-hash-table :test 'eq
-                   :hash-function #'fsc-instance-hash ; stable hash
-                   :weakness :key
+(defun make-gf-hashset ()
+  (make-hashset 64 #'eq #'fsc-instance-hash
+                   :weakness t
                    :synchronized t))
 
 (defclass standard-method-combination (definition-source-mixin
                                        method-combination)
   ((type-name :reader method-combination-type-name :initarg :type-name)
    (options :reader method-combination-options :initarg :options)
-   (%generic-functions :initform (make-gf-hash-table)
+   (%generic-functions :initform (make-gf-hashset)
                        :reader method-combination-%generic-functions)))
 
 (defclass long-method-combination (standard-method-combination)
@@ -441,7 +444,11 @@
    (internal-writer-function
      :initform nil
      :initarg :internal-writer-function
-     :accessor slot-definition-internal-writer-function)))
+     :accessor slot-definition-internal-writer-function)
+   (always-bound-p
+     :initform t
+     :initarg :always-bound-p
+     :accessor slot-definition-always-bound-p)))
 
 (defclass direct-slot-definition (slot-definition)
   ((readers
@@ -459,6 +466,11 @@
    (info
     :accessor slot-definition-info)))
 
+(defun uninitialized-accessor-function (type slotd)
+  (lambda (&rest args)
+    (declare (ignore args))
+    (error "~:(~A~) function~@[ for ~S~] not yet initialized."
+           type slotd)))
 ;;; We use a structure here, because fast slot-accesses to this information
 ;;; are critical to making SLOT-VALUE-USING-CLASS &co fast: places that need
 ;;; these functions can access the SLOT-INFO directly, avoiding the overhead
@@ -467,15 +479,17 @@
             (:copier nil)
             (:constructor make-slot-info
                 (&key slotd typecheck allocation location
-                 (reader (uninitialized-accessor-function :reader slotd))
-                 (writer (uninitialized-accessor-function :writer slotd))
-                 (boundp (uninitialized-accessor-function :boundp slotd)))))
+                   (reader (uninitialized-accessor-function :reader slotd))
+                   (writer (uninitialized-accessor-function :writer slotd))
+                   (boundp (uninitialized-accessor-function :boundp slotd))
+                   (makunbound (uninitialized-accessor-function :makunbound slotd)))))
   (typecheck nil :type (or null function))
   (allocation nil)
   (location nil)
   (reader (missing-arg) :type function)
   (writer (missing-arg) :type function)
-  (boundp (missing-arg) :type function))
+  (boundp (missing-arg) :type function)
+  (makunbound (missing-arg) :type function))
 (declaim (freeze-type slot-info))
 
 (defclass standard-direct-slot-definition (standard-slot-definition
@@ -544,11 +558,6 @@
                            specializer-with-object)
   ((object :initarg :object :reader specializer-object
            :reader eql-specializer-object)
-   ;; created on demand (if and when needed), the CTYPE is the representation
-   ;; of this metaobject as an internalized type object understood by the
-   ;; kernel's type machinery. The CLOS object is really just a MEMBER-TYPE,
-   ;; but the type system doesn't know that.
-   (sb-kernel:ctype)
    ;; Because EQL specializers are interned, any two putative instances
    ;; of EQL-specializer referring to the same object are in fact EQ to
    ;; each other. Therefore a list of direct methods in the specializer can

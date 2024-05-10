@@ -138,16 +138,15 @@
   (check-does-not-assemble `(movzx (:byte :byte) ,r8b ,cl))
   (test-assemble `(movzx (:byte :word)  ,r8w ,cl) "66440FB6C1       MOVZX R8W, CL")
   (test-assemble `(movzx (:byte :dword) ,r8d ,cl) "440FB6C1         MOVZX R8D, CL")
-  (test-assemble `(movzx (:byte :qword) ,r8-tn  ,cl) "440FB6C1         MOVZX R8D, CL") ; R8D, not R8
+  (test-assemble `(movzx (:byte :qword) ,r8-tn  ,cl) "4C0FB6C1         MOVZX R8, CL")
   ;; source = :WORD, signed
   (test-assemble `(movsx (:word :dword) ,r8d ,cx) "440FBFC1         MOVSX R8D, CX")
   (test-assemble `(movsx (:word :qword) ,r8-tn ,cx)  "4C0FBFC1         MOVSX R8, CX")
   ;; source = :WORD, unsigned
   (test-assemble `(movzx (:word :dword) ,r8d ,cx) "440FB7C1         MOVZX R8D, CX")
-  (test-assemble `(movzx (:word :qword) ,r8-tn ,cx)  "440FB7C1         MOVZX R8D, CX") ; R8D, not R8
+  (test-assemble `(movzx (:word :qword) ,r8-tn ,cx)  "4C0FB7C1         MOVZX R8, CX")
   ;; source = :DWORD, signed and unsigned
-  (test-assemble `(movsx (:dword :qword) ,r8-tn ,ecx) "4C63C1           MOVSX R8, ECX")
-  (test-assemble `(movzx (:dword :qword) ,r8-tn ,ecx) "448BC1           MOV R8D, ECX"))
+  (test-assemble `(movsx (:dword :qword) ,r8-tn ,ecx) "4C63C1           MOVSX R8, ECX"))
 
 (test-util:with-test (:name :disassemble-movabs-instruction :skipped-on (not :x86-64))
   (let* ((bytes (coerce '(#x48 #xA1 8 7 6 5 4 3 2 1
@@ -255,7 +254,7 @@
 ;;; which I guess was broken.  immobile-code has no fdefns in static space.
 (test-util:with-test (:name :disassemble-static-fdefn
             :skipped-on (or (not :x86-64) :immobile-code))
-  (assert (< (get-lisp-obj-address (sb-kernel::find-fdefn 'sb-impl::sub-gc))
+  (assert (< (get-lisp-obj-address (sb-int:find-fdefn 'sb-impl::sub-gc))
              sb-vm:static-space-end))
   ;; Cause SUB-GC to become un-statically-linked
   (progn (trace sb-impl::sub-gc) (untrace))
@@ -298,3 +297,58 @@
                  "8AF5             MOV DH, CH")
   ;; can not use legacy high byte reg in a REX-prefixed instruction
   (check-does-not-assemble `(movsx (:byte :qword) ,rax-tn (,rbx-tn . :high-byte))))
+
+(defun try (inst)
+  (let ((segment (sb-assem:make-segment)))
+    (sb-assem:assemble (segment 'nil)
+        (apply #'sb-assem:inst* (car inst) (cdr inst)))
+    (let* ((buf (sb-assem:segment-buffer segment))
+           (string
+             (with-output-to-string (stream)
+               (with-pinned-objects (buf)
+                 (let ((sb-disassem:*disassem-location-column-width* 0))
+                   (sb-disassem:disassemble-memory
+                    (sap-int (vector-sap buf))
+                    (sb-assem::segment-current-posn segment)
+                    :stream stream)))))
+           (line (string-left-trim'(#\; #\ )
+                                  (subseq string (1+ (position #\newline string))
+                                          (1- (length string)))))) ; chop final newline
+      (declare (ignorable line))
+      (print line)
+      )))
+
+#+x86-64
+(test-util:with-test (:name :muldiv)
+  ;; This just assserts that we can assemble. It doesn't check
+  ;; against the expected encoding or disassembly.
+  (dolist (size '(:byte :word :dword :qword nil))
+    (dolist (op '(mul div idiv))
+      (if size
+          (try `(,op ,size ,rbx-tn))
+          (try `(,op ,rbx-tn))))))
+
+#+x86-64
+(test-util:with-test (:name :imul)
+  (dolist (reg `(,r9-tn)) ;
+    ;; 1-operand form yielding a double-width result into rAX:rDX
+    (dolist (size '(:byte :word :dword :qword))
+      (try `(imul ,size ,reg))
+      (try `(imul ,size ,(ea reg)))
+      (try `(imul ,size ,(ea #x1000))))
+    (try `(imul ,reg)) ; default to :QWORD
+    ;; 2-operand form. There is no :BYTE size
+    (dolist (size '(:word :dword :qword))
+      (try `(imul ,size ,reg ,reg))
+      (try `(imul ,size ,reg ,(ea reg)))
+      (try `(imul ,size ,reg ,(ea #x1000))))
+    (try `(imul ,reg ,r10-tn)) ; default to :QWORD
+    ;; 3-operand form with 8-bit signed imm
+    (try `(imul :word ,rbx-tn ,(ea rdx-tn) -128))
+    (try `(imul :dword ,rbx-tn ,(ea rdx-tn) -128))
+    (try `(imul :qword ,rbx-tn ,(ea rdx-tn) -128))
+    ;; 3-operand form with 16-bit signed imm
+    (try `(imul :word ,rbx-tn ,(ea rdx-tn) -32768))
+    ;; 3-operand form with 32-bit signed imm
+    (try `(imul :dword ,rbx-tn ,(ea rdx-tn) #xbaba))
+    (try `(imul :qword ,rbx-tn ,(ea rdx-tn) #xbaba))))

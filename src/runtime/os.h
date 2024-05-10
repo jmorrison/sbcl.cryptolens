@@ -17,14 +17,16 @@
 
 #define _OS_H_INCLUDED_
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 
 #include <inttypes.h>
+#include <stdbool.h>
 
-#if defined(LISP_FEATURE_GENCGC) && !defined(ENABLE_PAGE_PROTECTION)
+#if defined LISP_FEATURE_GENERATIONAL && !defined ENABLE_PAGE_PROTECTION
 /* Should we use page protection to help avoid the scavenging of pages
  * that don't have pointers to younger generations?
+ * (Protection can mean either MMU-based or logical protection)
  * You can change this to 0 if you want SBCL not to install the handlers
  * for SIGSEGV and SIGBUS. That will slow down GC, but might be desirable
  * for debugging or for exploring GC strategies such as remembered sets */
@@ -34,7 +36,7 @@
 #if defined LISP_FEATURE_CHENEYGC || defined LISP_FEATURE_SB_SAFEPOINT
 // safepoint traps always require a signal handler
 #define INSTALL_SIG_MEMORY_FAULT_HANDLER 1
-#elif defined LISP_FEATURE_GENCGC
+#elif defined LISP_FEATURE_GENERATIONAL
 #define INSTALL_SIG_MEMORY_FAULT_HANDLER ENABLE_PAGE_PROTECTION
 #endif
 
@@ -58,6 +60,12 @@
 
 #include "target-os.h"
 
+#ifndef LISP_FEATURE_WIN32
+// all posix systems can use the same #defines
+#define OS_VM_PROT_READ    PROT_READ
+#define OS_VM_PROT_WRITE   PROT_WRITE
+#define OS_VM_PROT_EXECUTE PROT_EXEC
+#endif
 
 #define OS_VM_PROT_ALL \
   (OS_VM_PROT_READ | OS_VM_PROT_WRITE | OS_VM_PROT_EXECUTE)
@@ -66,9 +74,8 @@
 
 extern os_vm_size_t os_vm_page_size;
 
-#if (defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)) \
-  || defined(LISP_FEATURE_LINUX)
-boolean os_preinit(char *argv[], char *envp[]);
+#if defined LISP_FEATURE_WIN32 || defined LISP_FEATURE_LINUX
+int os_preinit(char *argv[], char *envp[]);
 #else
 #define os_preinit(dummy1,dummy2) (0)
 #endif
@@ -77,7 +84,7 @@ void os_unlink_runtime();
 
 /* Do anything we need to do when starting up the runtime environment
  * in this OS. */
-extern void os_init(char *argv[], char *envp[]);
+extern void os_init();
 
 /* Install any OS-dependent low-level signal handlers which are needed
  * by the runtime environment. E.g. the signals raised by a violation
@@ -107,17 +114,12 @@ extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
 #define IS_THREAD_STRUCT 4
 #define MOVABLE_LOW      (MOVABLE|ALLOCATE_LOW)
 #define IS_GUARD_PAGE    8
-extern os_vm_address_t os_validate(int movable,
-                                   os_vm_address_t addr,
-                                   os_vm_size_t len, int execute, int jit);
+extern os_vm_address_t os_alloc_gc_space(int space_id, int attributes,
+                                         os_vm_address_t addr, os_vm_size_t len);
 
 #ifdef LISP_FEATURE_WIN32
-void* os_commit_memory(os_vm_address_t addr, os_vm_size_t len);
-os_vm_address_t os_validate_nocommit(int attributes, os_vm_address_t addr, os_vm_size_t len);
+void os_commit_memory(os_vm_address_t addr, os_vm_size_t len);
 #endif
-
-/* This function seems to undo the effect of os_validate(..). */
-extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 
 /* This maps a file into memory, or calls lose(..) for various
  * failures. */
@@ -146,9 +148,9 @@ extern void os_protect(os_vm_address_t addr,
 
 /* Return true for an address (with or without lowtag bits) within
  * any range of memory understood by the garbage collector. */
-extern boolean gc_managed_addr_p(lispobj addr);
+extern bool gc_managed_addr_p(lispobj addr);
 /* As for above, but consider only the heap spaces, not stacks */
-extern boolean gc_managed_heap_space_p(lispobj addr);
+extern bool gc_managed_heap_space_p(lispobj addr);
 
 /* Given a signal context, return the address for storage of the
  * register, of the specified offset, for that context. The offset is
@@ -160,9 +162,6 @@ os_context_register_addr(os_context_t *context, int offset);
 os_context_register_t *
 os_context_float_register_addr(os_context_t *context, int offset);
 
-/* Given a signal context, return the address for storage of the
- * program counter for that context. */
-os_context_register_t *os_context_pc_addr(os_context_t *context);
 #ifdef ARCH_HAS_NPC_REGISTER
 os_context_register_t *os_context_npc_addr(os_context_t *context);
 #endif
@@ -174,12 +173,14 @@ os_context_register_t *os_context_lr_addr(os_context_t *context);
  * system stack pointer for that context. */
 #ifdef ARCH_HAS_STACK_POINTER
 os_context_register_t *os_context_sp_addr(os_context_t *context);
-#if (defined(LISP_FEATURE_X86)||defined(LISP_FEATURE_X86_64)) && \
-    (defined(LISP_FEATURE_DARWIN)||defined(LISP_FEATURE_LINUX)||defined(LISP_FEATURE_WIN32))
+// os_context_fp_addr might not be defined
 os_context_register_t *os_context_fp_addr(os_context_t *context);
-#define os_context_frame_pointer(context) *os_context_fp_addr(context)
+#if defined LISP_FEATURE_X86_64
+#  define os_context_frame_pointer(context) *os_context_register_addr(context,reg_RBP)
+#elif defined LISP_FEATURE_X86
+#  define os_context_frame_pointer(context) *os_context_register_addr(context,reg_EBP)
 #else
-#define os_context_frame_pointer(context) 0
+#  define os_context_frame_pointer(context) 0
 #endif
 #endif
 /* Given a signal context, return the address for storage of the
@@ -193,7 +194,7 @@ sigset_t *os_context_sigmask_addr(os_context_t *context);
 
 /* These are not architecture-specific functions, but are instead
  * general utilities defined in terms of the architecture-specific
- * function os_validate(..) and os_invalidate(..).
+ * function os_alloc_gc_space(..) and os_deallocate(..).
  */
 extern os_vm_address_t os_allocate(os_vm_size_t len);
 extern void os_deallocate(os_vm_address_t addr, os_vm_size_t len);
@@ -227,17 +228,37 @@ extern char *os_get_runtime_executable_path();
 #define OS_VM_SIZE_FMT PRIuPTR
 #define OS_VM_SIZE_FMTX PRIxPTR
 
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT
-#  ifndef CANNOT_USE_POSIX_SEM_T
+#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX
+#  if !defined USE_DARWIN_GCD_SEMAPHORES && !defined CANNOT_USE_POSIX_SEM_T
 #    include <semaphore.h>
      typedef sem_t os_sem_t;
 #  endif
    void os_sem_init(os_sem_t *sem, unsigned int value);
-   void os_sem_wait(os_sem_t *sem, char *what);
-   void os_sem_post(os_sem_t *sem, char *what);
+   void os_sem_wait(os_sem_t *sem);
+   void os_sem_post(os_sem_t *sem);
    void os_sem_destroy(os_sem_t *sem);
 #endif
 
 extern int os_reported_page_size;
+
+// Opaque context accessor
+uword_t os_context_pc(os_context_t*);
+void set_os_context_pc(os_context_t*, uword_t);
+
+#ifdef LISP_FEATURE_WIN32
+
+#define GETPAGESIZE 4096
+#  define FTELL _ftelli64
+#  define FSEEK _fseeki64
+#  define LSEEK _lseeki64
+typedef __int64 ftell_type;
+
+#else
+#define GETPAGESIZE getpagesize()
+#define FTELL ftell
+#define FSEEK fseek
+#define LSEEK lseek
+typedef long ftell_type;
+#endif
 
 #endif

@@ -45,13 +45,48 @@
       (do-mfuns *tagged-modular-class*)))
   `(progn ,@(forms)))
 
-#.`
-(defun ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits)
-                "SB-VM")
+(defun #.(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits) "SB-VM")
     (integer amount)
-  (ldb (byte ,sb-vm:n-machine-word-bits 0) (ash integer amount)))
+  (ldb (byte #.sb-vm:n-machine-word-bits 0) (ash integer amount)))
 
 #+(or x86 x86-64 arm arm64)
 (defun sb-vm::ash-left-modfx (integer amount)
   (mask-signed-field (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)
                      (ash integer amount)))
+
+;;;; these cross-compiler compatibility functions have vops for
+;;;; the target machine.
+;;;; COUNT is regarded as having either 5 (for 32-machines) or 6
+;;;; (for 64-bit machines) significant bits. Excess bits must be ignored
+;;;; either explicitly in the vops (arm[64], ppc[64]) or by the CPU
+;;;; (x86, sparc, mips, riscv).
+
+;;; Shift NUMBER by the low-order bits of COUNT, adding zero bits
+;;; at the "end" and removing bits from the "start". On big-endian
+;;; machines this is a left-shift and on little-endian machines this
+;;; is a right-shift.
+(defun shift-towards-start (number count)
+  (declare (type word number) (fixnum count))
+  (let ((count (ldb (byte (1- (integer-length sb-vm:n-word-bits)) 0) count)))
+    #+big-endian (logand (ash number count) most-positive-word)
+    #+little-endian (ash number (- count))))
+
+;;; Shift NUMBER by the low-order bits of COUNT, adding zero bits
+;;; at the "start" and removing bits from the "end". On big-endian
+;;; machines this is a right-shift and on little-endian machines this
+;;; is a left-shift.
+(defun shift-towards-end (number count)
+  (declare (type word number) (fixnum count))
+  (let ((count (ldb (byte (1- (integer-length sb-vm:n-word-bits)) 0) count)))
+    #+big-endian (ash number (- count))
+    #+little-endian (logand (ash number count) most-positive-word)))
+
+(defun get-lisp-obj-address (x)
+  (etypecase x
+    (standard-char
+     (dpb (char-code x)
+          (byte (- sb-vm:n-word-bits
+                   sb-vm:n-widetag-bits) sb-vm:n-widetag-bits)
+          sb-vm:character-widetag))
+    (sb-xc:fixnum
+     (ldb (byte sb-vm:n-word-bits 0) (ash x sb-vm:n-fixnum-tag-bits)))))

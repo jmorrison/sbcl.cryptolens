@@ -1,4 +1,4 @@
-#+(or (not sb-thread) win32) (sb-ext:exit :code 104)
+#+(or (not sb-thread) win32) (invoke-restart 'run-tests::skip-file)
 
 ;;; Not an exactly an "exit hang" test, but there was a different hang
 ;;; regarding concurrent JOIN-THREAD on 1 thread.
@@ -28,7 +28,7 @@
                           `("run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
                             "-o" ,solib "fcb-threads.c"))
       (sb-alien:load-shared-object solib)))
-
+#+(and linux gc-stress) (invoke-restart 'run-tests::skip-file)
 ;;; Final test: EXIT does not lock up due to (simulated) C++ destructors
 ;;; or free() or most anything else involved in stopping the main thread.
 ;;; The point of the test is to mock a Lisp thread that uses foreign code
@@ -74,4 +74,3 @@
 ;;; Give ourselves 3 seconds to exit.
 (alien-funcall (extern-alien "prepare_exit_test" (function void int)) 3)
 (setq sb-ext:*forcibly-terminate-threads-on-exit* nil)
-(exit :code 104)

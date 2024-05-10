@@ -11,10 +11,14 @@
 
 (in-package sb-vm)
 
-(defun collect-slot-values (obj)
-  (collect ((slots))
+(test-util:with-test (:name :safe-layoutless-instance)
+  (assert (not (sb-vm::references-p (sb-kernel:%make-instance 5) '(foo)))))
+
+(defun collect-slot-values (obj &aux result)
+  (flet ((slots (x)
+           (push x result)))
     (do-referenced-object (obj slots))
-    (slots)))
+    (nreverse result)))
 
 (defun walk-slots-test (obj expect)
   (assert (equal (collect-slot-values obj) expect)))
@@ -23,7 +27,8 @@
 
 (defstruct foo (z 0 :type sb-ext:word) (x 'x) (y 'y))
 
-(test-util:with-test (:name :walk-slots-trivial) ; lists and vectors
+(test-util:with-test (:name :walk-slots-trivial ; lists and vectors
+                            :fails-on :interpreter)
   (walk-slots-test '(a . b) '(a b))
   (walk-slots-test #(a b c) '(a b c))
   (walk-slots-test #(a b c d) '(a b c d))
@@ -49,7 +54,8 @@
          (info '((bork 42))))
     (import s "CL-USER")
     (set s 'hi)
-    (setf (symbol-info s) info)
+    (setf (symbol-plist s) (car info) info (sb-kernel:symbol-%info s))
+    ;; ASSUMPTION: slot ordering
     (walk-slots-test s `(hi ,info ,name ,(find-package "CL-USER")))))
 
 (test-util:with-test (:name :walk-slots-closure)
@@ -65,26 +71,27 @@
 
 (test-util:with-test (:name :walk-slots-fdefn)
   (let* ((closure (funcall (compile nil '(lambda (x)  (lambda () x))) t))
-         (symbol (gensym)))
-    (setf (fdefinition symbol) closure)
+         (fname `(cas ,(gensym))))
+    (setf (fdefinition fname) closure)
     (walk-slots-test*
-     (sb-kernel::find-fdefn symbol)
+     (sb-int:find-fdefn fname)
      (lambda (slots)
-       #+immobile-code
+       #+(and immobile-code x86-64)
        (and (= (length slots) 3)
-            (symbolp (first slots))
+            (equal (first slots) fname)
             (closurep (second slots))
-            (code-component-p (third slots)))
-       #-immobile-code
+            (funcallable-instance-p (third slots)))
+       #-(and immobile-code x86-64)
        (and (= (length slots) 2)
-            (symbolp (first slots))
+            (equal (first slots) fname)
             (closurep (second slots)))))))
 
 (defclass mystdinst ()
   ((a :initform 1) (b :initform 2)
    (c :initform 3) (d :initform 4) (e :initform 5)))
 
-(test-util:with-test (:name :walk-slots-standard-instance)
+(test-util:with-test (:name :walk-slots-standard-instance
+                            :fails-on :interpreter)
   (let ((o (make-instance 'mystdinst)))
     (walk-slots-test* o
                       (lambda (slots)
@@ -93,11 +100,11 @@
                                (eq clos-slots (sb-pcl::std-instance-slots o))))))))
 
 (define-condition cfoo (simple-condition) ((a :initarg :a) (b :initarg :b) (c :initform 'c)))
-(test-util:with-test (:name :walk-slots-condition-instance)
+(test-util:with-test (:name :walk-slots-condition-instance
+                            :fails-on :interpreter)
   (let ((instance (make-condition 'cfoo :a 'ay :b 'bee :format-arguments "wat")))
     (walk-slots-test instance
-                     `(,(find-layout 'cfoo)
-                       (c c format-control nil)
+                     `(,(find-layout 'cfoo) ((c . c) (format-control . nil))
                        :a  ay :b bee :format-arguments "wat"))))
 
 (defun make-random-funinstance (&rest values)
@@ -109,7 +116,7 @@
     ;; Whether GC should trace the word is a different question,
     ;; on whose correct answer I waver back and forth.
     (when (evenp (sb-kernel:get-closure-length ctor)) ; payload length
-      (let ((max (reduce #'max (sb-kernel:dd-slots (sb-kernel:layout-info layout))
+      (let ((max (reduce #'max (sb-kernel:dd-slots (sb-kernel:layout-dd layout))
                          :key 'sb-kernel:dsd-index)))
         (setf (sb-kernel:%funcallable-instance-info ctor (1+ max))
               (elt sb-vm:+static-symbols+ 0))))
@@ -130,46 +137,15 @@
     (funcall f 1 2 3) ; compute the digested slots
     (walk-slots-test* f
                       (lambda (slots)
-                        (destructuring-bind (layout fin-fun a b c d) slots
+                        (destructuring-bind (type fin-fun a b c d) slots
                           (declare (ignore a b c))
-                          (and (typep layout 'layout)
+                          (and (typep type 'layout)
                                (typep fin-fun 'closure)
                                (typep d '(and integer (not (eql 0))))))))))
 
-;;; Compute size of OBJ including descendants.
-;;; LEAFP specifies what object types to treat as not reaching
-;;; any other object. You pretty much have to treat symbols
-;;; as leaves, otherwise you reach a package and then the result
-;;; just explodes to beyond the point of being useful.
-;;; (It works, but might reach the entire heap)
-;;; To turn this into an actual thing, we'd want to reduce the consing.
-(defun deep-size (obj &optional (leafp (lambda (x)
-                                         (typep x '(or package symbol fdefn
-                                                       function code-component
-                                                       layout classoid)))))
-  (let ((worklist (list obj))
-        (seen (make-hash-table :test 'eq))
-        (tot-bytes 0))
-    (setf (gethash obj seen) t)
-    (flet ((visit (thing)
-             (when (is-lisp-pointer (get-lisp-obj-address thing))
-               (unless (or (funcall leafp thing)
-                           (gethash thing seen))
-                 (push thing worklist)
-                 (setf (gethash thing seen) t)))))
-      (loop
-        (unless worklist (return))
-        (let ((x (pop worklist)))
-          (incf tot-bytes (primitive-object-size x))
-          (do-referenced-object (x visit)))))
-    ;; Secondary values is number of visited objects not incl. original one.
-    (values tot-bytes
-            (1- (hash-table-count seen))
-            seen)))
-
 (test-util:with-test (:name :deep-sizer)
   (multiple-value-bind (tot-bytes n-kids)
-      (deep-size #(a b c d (e f) #*0101))
+      (test-util:deep-size #(a b c d (e f) #*0101))
     ;; 8 words for the vector
     ;; 4 words for 2 conses
     ;; 4 words for a bit-vector: header/length/bits/padding

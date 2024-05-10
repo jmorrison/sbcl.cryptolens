@@ -16,30 +16,34 @@
     (inst andi. temp value fixnum-tag-mask)
     (inst b? (if not-p :ne :eq) target)))
 
-(defun %test-fixnum-and-headers (value temp target not-p headers &key value-tn-ref)
+(defun %test-fixnum-and-headers (value temp target not-p headers
+                                 &key value-tn-ref immediate-tested)
   (let ((drop-through (gen-label)))
     (assemble ()
       (inst andi. temp value fixnum-tag-mask)
       (inst beq (if not-p drop-through target)))
     (%test-headers value temp target not-p nil headers
                    :drop-through drop-through
-                   :value-tn-ref value-tn-ref)))
+                   :value-tn-ref value-tn-ref
+                   :immediate-tested immediate-tested)))
 
-(defun %test-immediate (value temp target not-p immediate)
+(defun %test-immediate (value temp target not-p immediate &key value-tn-ref)
+  (declare (ignore value-tn-ref))
   (assemble ()
     (inst andi. temp value widetag-mask)
     (inst cmpwi temp immediate)
     (inst b? (if not-p :ne :eq) target)))
 
-(defun %test-lowtag (value temp target not-p lowtag)
+(defun %test-lowtag (value temp target not-p lowtag &key value-tn-ref)
+  (declare (ignore value-tn-ref))
   (assemble ()
     (inst andi. temp value lowtag-mask)
     (inst cmpwi temp lowtag)
     (inst b? (if not-p :ne :eq) target)))
 
 (defun %test-headers (value temp target not-p function-p headers
-                      &key (drop-through (gen-label)) value-tn-ref)
-  (declare (ignore value-tn-ref))
+                      &key (drop-through (gen-label)) value-tn-ref immediate-tested)
+  (declare (ignore value-tn-ref immediate-tested))
   (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
     (multiple-value-bind (when-true when-false)
         (if not-p
@@ -109,7 +113,7 @@
 
 (define-vop (signed-byte-32-p type-predicate)
   (:translate signed-byte-32-p)
-  (:generator 45
+  (:generator 10
     (let ((not-target (gen-label)))
       (multiple-value-bind
           (yep nope)
@@ -131,7 +135,7 @@
 
 (define-vop (unsigned-byte-32-p type-predicate)
   (:translate unsigned-byte-32-p)
-  (:generator 45
+  (:generator 10
     (let ((not-target (gen-label))
           (single-word (gen-label))
           (fixnum (gen-label)))

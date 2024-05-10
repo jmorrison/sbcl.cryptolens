@@ -14,7 +14,8 @@
 (use-package :test-util)
 
 (sb-ext:finalize (list 1) (lambda ()))
-(with-test (:name (:async-unwind :specials))
+(with-test (:name (:async-unwind :specials)
+                  :skipped-on (:and :sb-safepoint :linux)) ; hangs
   (let ((*x0* nil) (*x1* nil) (*x2* nil) (*x3* nil) (*x4* nil))
     (declare (special *x0* *x1* *x2* *x3* *x4*))
     (loop repeat 10 do
@@ -72,13 +73,20 @@
 ;; for POSIX (i.e. not win32), but it doesn't, at least not now.
 ;; The special case in kill_safely() for the current thread is pthread_kill()
 ;; and not a thing more, unless on win32, which skips this test.
-#-win32
+;; Note also that RAISE sends a thread-directed signal as per the man page
+;; "In a multithreaded program it is equivalent to pthread_kill(pthread_self(), sig);"
+;; but thread-directed SIGINT is not the right thing, as it does not accurately
+;; model the effect of pressing control-C; hence we should use UNIX-KILL here,
+;; which sends a process-directed signal, letting the OS pick a thread.
+;; Whether it picks the finalizer thread or main thread, things should work,
+;; because we forward to the signal to our foreground thread.
+#+unix
 (with-test (:name :handle-interactive-interrupt)
   (assert (eq :condition
               (handler-case
                   (progn
-                    (sb-thread::raise sb-unix:sigint)
-                    #+sb-safepoint-strictly
+                    (sb-unix:unix-kill (sb-unix:unix-getpid) sb-unix:sigint)
+                    #+sb-safepoint
                     ;; In this case, the signals handler gets invoked
                     ;; indirectly through an INTERRUPT-THREAD.  Give it
                     ;; enough time to hit.
@@ -86,7 +94,8 @@
                 (sb-sys:interactive-interrupt ()
                   :condition)))))
 
-(with-test (:name :bug-640516)
+(with-test (:name :bug-640516
+                  :skipped-on :gc-stress)
   ;; On Darwin interrupting a SLEEP so that it took longer than
   ;; the requested amount caused it to hang.
   (assert

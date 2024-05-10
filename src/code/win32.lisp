@@ -63,6 +63,8 @@
 (defconstant file-type-unknown 0)
 
 (defconstant invalid-file-attributes (mod -1 (ash 1 32)))
+(defun sb-impl::file-exists-p (path)
+  (/= (get-file-attributes path) invalid-file-attributes))
 
 ;;;; File Type Introspection by handle
 (define-alien-routine ("GetFileType" get-file-type) dword
@@ -128,7 +130,9 @@
   (nevents (* dword)))
 
 (define-alien-routine "socket_input_available" int
-  (socket handle))
+  (socket handle)
+  (time long)
+  (utime long))
 
 (define-alien-routine "console_handle_p" boolean
   (handle handle))
@@ -139,7 +143,7 @@
 ;;; introspect it, so we have to try various things until we find
 ;;; something that works.  Returns true if there could be input
 ;;; available, or false if there is not.
-(defun handle-listen (handle)
+(defun handle-listen (handle &optional (time 0) (utime 0))
   (cond ((console-handle-p handle)
          (alien-funcall (extern-alien "win32_tty_listen"
                                       (function boolean handle))
@@ -151,7 +155,7 @@
              (cond
                ((not (zerop res)) (return-from handle-listen (plusp avail)))
                ((= code error-broken-pipe) (return-from handle-listen t)))))
-         (let ((res (socket-input-available handle)))
+         (let ((res (socket-input-available handle time utime)))
            (unless (zerop res)
              (return-from handle-listen (= res 1))))
          t)))
@@ -171,20 +175,23 @@
 
 ;;;; System Functions
 
-#-sb-thread
-(define-alien-routine ("Sleep" millisleep) void
-  (milliseconds dword))
+(define-alien-type wtimer system-area-pointer) ;HANDLE, but that's not defined yet
 
-#+sb-thread
+(define-alien-routine "os_create_wtimer" wtimer)
+(define-alien-routine "os_wait_for_wtimer" int (wt wtimer))
+(define-alien-routine "os_close_wtimer" void (wt wtimer))
+(define-alien-routine "os_cancel_wtimer" void (wt wtimer))
+(define-alien-routine "os_set_wtimer" void (wt wtimer) (sec int) (nsec int))
+
 (defun sb-unix:nanosleep (sec nsec)
   (let ((*allow-with-interrupts* *interrupts-enabled*))
     (without-interrupts
-      (let ((timer (sb-impl::os-create-wtimer)))
-        (sb-impl::os-set-wtimer timer sec nsec)
+      (let ((timer (os-create-wtimer)))
+        (os-set-wtimer timer sec nsec)
         (unwind-protect
              (do () ((with-local-interrupts
-                       (zerop (sb-impl::os-wait-for-wtimer timer)))))
-          (sb-impl::os-close-wtimer timer))))))
+                       (zerop (os-wait-for-wtimer timer)))))
+          (os-close-wtimer timer))))))
 
 (define-alien-routine ("win32_wait_object_or_signal" wait-object-or-signal)
     dword
@@ -314,11 +321,13 @@
            (values result (if result 0 (get-last-error)))
            name nil))
 
+(defconstant +movefile-replace-existing+ 1)
+
 (defun sb-unix:unix-rename (name1 name2)
   (declare (type sb-unix:unix-pathname name1 name2))
-  (syscall (("MoveFile" t) lispbool system-string system-string)
+  (syscall (("MoveFileEx" t) lispbool system-string system-string dword)
            (values result (if result 0 (get-last-error)))
-           name1 name2))
+           name1 name2 +movefile-replace-existing+))
 
 (defun sb-unix::posix-getenv (name)
   (declare (type simple-string name))

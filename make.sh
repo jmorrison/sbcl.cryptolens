@@ -29,6 +29,11 @@ sh make-config.sh "$@" --check-host-lisp || exit $?
 . output/prefix.def
 . output/build-config
 
+echo //building host tools
+# Build the perfect-hash-generator. It's actually OK if this fails,
+# as long as xperfecthash.lisp-expr is up-to-date
+$GNUMAKE -C tools-for-build perfecthash || true
+
 build_started=`date`
 echo "//Starting build: $build_started"
 # Apparently option parsing succeeded. Print out the results.
@@ -53,7 +58,7 @@ $SBCL_XC_HOST < tools-for-build/canonicalize-whitespace.lisp || exit 1
 #     system.
 #   On the target system:
 #     sh make-target-1.sh
-#   Copy src/runtime/sbcl.nm and output/stuff-groveled-from-headers.lisp
+#   Copy output/stuff-groveled-from-headers.lisp
 #     from the target system to the host system.
 #   On the host system:
 #     SBCL_XC_HOST=<whatever> sh make-host-2.sh
@@ -82,22 +87,67 @@ maybetime sh make-host-2.sh
 maybetime sh make-target-2.sh
 maybetime sh make-target-contrib.sh
 
-# contrib/Makefile shouldn't be counted in NCONTRIBS.
-# "find contrib/* -name Makefile" would still find contrib/./Makefile.
-# "find contrib/{sb-*,asdf}/Makefile" could work,
-# but as long as we only have 1 directory level, 'ls' should be adequate.
-NCONTRIBS=`ls -1 contrib/*/Makefile | wc -l`
-NPASSED=`find obj/asdf-cache -name test-passed.test-report -print | wc -l`
+# Confirm that default evaluation strategy is :INTERPRET if sb-fasteval was built
+src/runtime/sbcl --core output/sbcl.core --lose-on-corruption --noinform \
+  --no-sysinit --no-userinit --disable-debugger \
+  --eval '(when (find-package "SB-INTERPRETER") (assert (eq *evaluator-mode* :interpret)))' \
+  --quit
+
+./src/runtime/sbcl --core output/sbcl.core \
+ --lose-on-corruption --noinform $SBCL_MAKE_TARGET_2_OPTIONS --no-sysinit --no-userinit --eval '
+    (progn
+      #-sb-devel
+      (restart-case
+          (let (l1 l2)
+            (sb-vm:map-allocated-objects
+             (lambda (obj type size)
+               (declare (ignore size))
+               (when (and (= type sb-vm:symbol-widetag) (not (symbol-package obj))
+                          (search "!" (string obj)))
+                 (push obj l1))
+               (when (and (= type sb-vm:fdefn-widetag)
+                          (not (symbol-package
+                                (sb-int:fun-name-block-name
+                                 (sb-kernel:fdefn-name obj)))))
+                 (push obj l2)))
+             :all)
+            (when l1 (format t "Found ~D:~%~S~%" (length l1) l1))
+            ;; Assert that a chosen few symbols not named using the ! convention are removed
+            ;; by tree-shaking. This list was made by hand-checking various macros that seemed
+            ;; not to be needed after the build. I would have thought
+            ;; (EVAL-WHEN (:COMPILE-TOPLEVEL)) to be preferable, but revision fb1ba6de5e makes
+            ;; a case for not doing that. Either way is less than fabulous.
+            (sb-int:awhen
+                (mapcan (quote apropos-list)
+                        (quote ("DEFINE-INFO-TYPE" "LVAR-TYPE-USING"
+                                                   "TWO-ARG-+/-"
+                                                   "PPRINT-TAGBODY-GUTS" "WITH-DESCRIPTOR-HANDLERS"
+                                                   "SUBTRACT-BIGNUM-LOOP" "BIGNUM-REPLACE" "WITH-BIGNUM-BUFFERS"
+                                                   "GCD-ASSERT" "BIGNUM-NEGATE-LOOP"
+                                                   "SHIFT-RIGHT-UNALIGNED"
+                                                   "STRING-LESS-GREATER-EQUAL-TESTS")))
+              (format t "~&Leftover from [disabled?] tree-shaker:~%~S~%" sb-int:it))
+            (when l2
+              (format t "Found ~D fdefns named by uninterned symbols:~%~S~%" (length l2) l2)))
+        (abort-build ()
+          :report "Abort building SBCL."
+          (sb-ext:exit :code 1))))' --quit
+
+# contrib/Makefile shouldn't be counted in NCONTRIBS nor should asdf and uiop.
+# The asdf directory produces 2 fasls, so is unlike all our other contribs
+# and would therefore mess up the accounting here if included.
+NCONTRIBS=`ls -1 contrib/sb-*/Makefile | wc -l`
+NPASSED=`ls obj/sbcl-home/contrib/sb-*.fasl | wc -l`
 echo
 echo "The build seems to have finished successfully, including $NPASSED (out of $NCONTRIBS)"
 echo "contributed modules. If you would like to run more extensive tests on"
 echo "the new SBCL, you can try:"
 echo
-echo "  cd tests && sh ./run-tests.sh"
+echo "  cd ./tests && sh ./run-tests.sh"
 echo
 echo "To build documentation:"
 echo
-echo "  cd doc/manual && make"
+echo "  cd ./doc/manual && make"
 echo
 echo "To install SBCL (more information in INSTALL):"
 echo

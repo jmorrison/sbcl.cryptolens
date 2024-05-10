@@ -48,7 +48,7 @@
 (defun call-with-backtrace (cont test-function &key details)
   (flet ((capture-it (condition)
            (let (backtrace)
-             (sb-debug::map-backtrace
+             (sb-debug:map-backtrace
               (lambda (frame)
                 (multiple-value-bind (name args info)
                     (sb-debug::frame-call frame)
@@ -163,7 +163,7 @@
   (verify-backtrace test-function expected-frames :details details
                                                   :error t))
 
-(defvar *p* (namestring *load-truename*))
+(defvar *p* (namestring (if sb-c::*merge-pathnames* *load-truename* *load-pathname*)))
 
 (defvar *undefined-function-frame*
   '("undefined function"))
@@ -222,7 +222,7 @@
                                    (error "foo"))))
            (with-timeout 0.1
              (sb-thread:condition-wait q m)))))
-     `((sb-thread:condition-wait ,q ,m :timeout nil)))))
+     `((sb-thread::%condition-wait ,q ,m t nil nil nil nil nil nil)))))
 
 ;;; Division by zero was a common error on PPC. It depended on the
 ;;; return function either being before INTEGER-/-INTEGER in memory,
@@ -264,7 +264,7 @@
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on (and :sparc :linux))
+                  :fails-on (or :mips (and :sparc :linux)))
   (assert-backtrace #'throw-test '((throw-test))))
 
 (funcall (checked-compile
@@ -345,7 +345,8 @@
           ;; no lambda-list saved
           (defun ,(intern (format nil "BT.~A.3" n)) ,ll
             (declare (optimize (debug 0)))
-            ,@body)))
+            (let (*) ;; disable tail calls enabled by debug-0
+              ,@body))))
      :allow-style-warnings t)))
 
 (defbt 1 (&key key)
@@ -549,7 +550,7 @@
   (gf-dispatch-test/gf 1 1)
   ;; Wrong argument count
   (assert-backtrace (lambda () (gf-dispatch-test/f 42))
-                    '(((sb-pcl::gf-dispatch gf-dispatch-test/gf) 42))))
+                    '((gf-dispatch-test/gf 42))))
 
 (defgeneric gf-default-only-test/gf (x y)
   (:method (x y) (+ x y)))

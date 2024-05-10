@@ -22,8 +22,8 @@
 ;;;
 ;;; In:                 Stream, Eof-Errorp, Eof-Value
 ;;; Bin:                Stream, Eof-Errorp, Eof-Value
-;;; N-Bin:              Stream, Buffer, Start, Numbytes, Eof-Errorp
-;;; Out:                Stream, Character
+;;; N-Bin:              Stream, Buffer, Size-Buffer, Start, Numbytes, Eof-Errorp
+;;; Cout:               Stream, Character
 ;;; Bout:               Stream, Integer
 ;;; Sout:               Stream, String, Start, End
 ;;; Misc:               Stream, Operation, &Optional Arg1, Arg2
@@ -77,18 +77,16 @@
 ;;; speeding up these important operations.
 
 ;;; the size of a stream in-buffer
-;;;
-;;; This constant it is used in a read-time-eval, and some implementations
-;;; draw a sharp distinction between a constant being known only to
-;;; the file-compiler during compilation, and known also to the evaluator.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +ansi-stream-in-buffer-length+ 512))
+(defconstant +ansi-stream-in-buffer-length+ 512)
 
 (deftype ansi-stream-in-buffer ()
   `(simple-array (unsigned-byte 8) (,+ansi-stream-in-buffer-length+)))
 
 (deftype ansi-stream-cin-buffer ()
   `(simple-array character (,+ansi-stream-in-buffer-length+)))
+
+(deftype ansi-stream-csize-buffer ()
+  `(simple-array (unsigned-byte 8) (,+ansi-stream-in-buffer-length+)))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun %stream-opcode (name)
@@ -124,11 +122,16 @@
   ;;
   ;; (If a stream does not have an input buffer, then the IN-BUFFER
   ;; slot must must be NIL, and the IN-INDEX must be
-  ;; +ANSI-STREAM-IN-BUFFER-LENGTH+.)
+  ;; +ANSI-STREAM-IN-BUFFER-LENGTH+.  If a stream has a CIN-BUFFER, it
+  ;; must also have a CSIZE-BUFFER for the implementation of
+  ;; FILE-POSITION.)
   (in-buffer nil :type (or ansi-stream-in-buffer null))
   (cin-buffer nil :type (or ansi-stream-cin-buffer null))
+  (csize-buffer nil :type (or ansi-stream-csize-buffer null))
   (in-index +ansi-stream-in-buffer-length+
             :type (integer 0 #.+ansi-stream-in-buffer-length+))
+
+  ;; FIXME: declare all these function types more rigorously.
 
   ;; buffered input functions
   (in #'ill-in :type function)                  ; READ-CHAR function
@@ -136,10 +139,11 @@
   ;; 'n-bin' might not transfer bytes to the consumer.
   ;; A character FD-STREAM uses this method to transfer octets from the
   ;; source buffer into characters of the destination buffer.
-  (n-bin #'ill-bin :type function)              ; n-byte input function
+  (n-bin #'ill-bin :type                        ; n-byte input function
+   (sfunction (stream (simple-unboxed-array (*)) (or ansi-stream-csize-buffer null) index index t) index))
 
   ;; output functions
-  (out #'ill-out :type function)                ; WRITE-CHAR function
+  (cout #'ill-out :type function)               ; WRITE-CHAR function
   (bout #'ill-bout :type function)              ; byte output function
   (sout #'ill-out :type function)               ; string output function
 
@@ -149,7 +153,7 @@
   ;; Absolute character position, acting also as a generalized boolean
   ;; in lieu of testing FORM-TRACKING-STREAM-P to see if we must
   ;; maintain correctness of the slot in ANSI-STREAM-UNREAD-CHAR.
-  (input-char-pos nil))
+  (input-char-pos nil :type (or null index)))
 
 ;;; SYNONYM-STREAM type is needed by ANSI-STREAM-{INPUT,OUTPUT}-STREAM-P
 ;;; and also needed by OPEN (though not obviously), which is compiled
@@ -159,7 +163,7 @@
                                      (in #'synonym-in)
                                      (bin #'synonym-bin)
                                      (n-bin #'synonym-n-bin)
-                                     (out #'synonym-out)
+                                     (cout #'synonym-out)
                                      (bout #'synonym-bout)
                                      (sout #'synonym-sout)
                                      (misc #'synonym-misc))
@@ -168,6 +172,22 @@
   ;; This is the symbol, the value of which is the stream we are synonym to.
   (symbol nil :type symbol :read-only t))
 (declaim (freeze-type synonym-stream))
+
+(defstruct (broadcast-stream (:include ansi-stream
+                                       (cout #'broadcast-cout)
+                                       (bout #'broadcast-bout)
+                                       (sout #'broadcast-sout)
+                                       (misc #'broadcast-misc))
+                             (:constructor %make-broadcast-stream
+                                           (streams))
+                             (:copier nil)
+                             (:predicate nil))
+  ;; a list of all the streams we broadcast to
+  (streams () :type list :read-only t))
+(declaim (freeze-type broadcast-stream))
+
+(define-load-time-global *null-broadcast-stream* (make-broadcast-stream))
+(declaim (type stream *null-broadcast-stream*))
 
 (defmethod print-object ((x stream) stream)
   (print-unreadable-object (x stream :type t :identity t)))
@@ -237,8 +257,9 @@
                  ;;  the variable var." - so we can read it here with impunity.
                  `(unwind-protect (progn ,@forms) (close ,var))
                  `(progn ,@forms)))) ; don't bother closing
-      `(,bind ((,dummy (%make-instance ,(dd-length (find-defstruct-description
-                                                    'string-input-stream)))))
+      `(,bind ((,dummy (%make-structure-instance
+                        ,(find-defstruct-description 'string-input-stream)
+                        nil)))
               ,(multiple-value-bind (forms decls) (parse-body forms-decls nil)
                  (if index
                      `(multiple-value-bind (,var ,offset) ,ctor
@@ -280,15 +301,15 @@
   ;; end of the stream.
   (index-cache 0 :type index)
   ;; Pseudo-actual element type. We no longer store the as-requested type.
-  ;; (If the value is :DEFAULT, we return CHARACTER on inquiry.)
+  ;; (If the value is *, we return CHARACTER on inquiry.)
   (element-type nil :read-only t
-                    :type (member #+sb-unicode :default
+                    :type (member #+sb-unicode *
                                   #+sb-unicode character
                                   base-char nil)))
 (declaim (freeze-type string-output-stream))
 
 (defmacro %allocate-string-ostream ()
-  `(%make-instance ,(dd-length (find-defstruct-description 'string-output-stream))))
+  `(%make-structure-instance ,(find-defstruct-description 'string-output-stream) nil))
 
 (defmacro with-output-to-string
     ((var &optional string &key (element-type ''character)) &body body)
@@ -297,8 +318,9 @@
         ;; "If string is supplied, element-type is ignored".
         ;; Why do implementors take this to mean "evaluated and ignored?"
         ;; I would have figured it meant expansion-time ignored.
-        `(dx-let ((,dummy (%make-instance ,(dd-length (find-defstruct-description
-                                                       'fill-pointer-output-stream)))))
+        `(dx-let ((,dummy (%make-structure-instance
+                           ,(find-defstruct-description 'fill-pointer-output-stream)
+                           nil)))
            (let ((,var (truly-the fill-pointer-output-stream
                                   (%init-fill-pointer-output-stream
                                    ,dummy ,string ,element-type))))
@@ -362,22 +384,41 @@
 ;;; deciding whether the argument is actually a stream or merely a designator
 ;;; for a stream (T or NIL), and then figuring out which family of stream
 ;;; it belongs to: ANSI, Gray, or simple.
-(defmacro stream-api-dispatch ((streamvar &optional initform) &key native simple gray)
+(defmacro stream-api-dispatch ((streamvar &optional designator) &key native simple gray)
   ;; Most CL: stream APIs use explicit-check, so we should assert that the thing
   ;; is actually a stream.
   ;; If the CL interface bypasses STREAM-API-DISPATCH then it is up to generic layer
   ;; to signal an error, the class of which seems unfortunately subject to debate.
   (aver (and native (or simple gray)))
-  `(let ,(if initform `((,streamvar ,initform)))
-     ;; Dispatch native first, then if sb-simple-streams have been loaded,
-     ;; those, and finally punt to a generic function.
-     (block stream
-       ;; Assume that simple-stream can not inherit funcallable-standard-object.
-       (when (%instancep ,streamvar)
-         (let ((layout (%instance-layout ,streamvar)))
-           (cond ((sb-c::%structure-is-a layout ,(find-layout 'ansi-stream))
-                  (let ((,streamvar (truly-the ansi-stream ,streamvar)))
-                    (return-from stream ,native)))
-                 ((logtest (layout-flags layout) +simple-stream-layout-flag+)
-                  (return-from stream ,simple)))))
-       (let ((,streamvar (the stream ,streamvar))) ,gray))))
+  ;; Dispatch native first, then if sb-simple-streams have been loaded,
+  ;; those, and finally punt to a generic function.
+  `(block stream
+     (tagbody
+      again
+        ;; Assume that simple-stream can not inherit funcallable-standard-object.
+        (when (%instancep ,streamvar)
+          (let ((layout (%instance-layout ,streamvar)))
+            (cond ((sb-c::%structure-is-a layout ,(find-layout 'ansi-stream))
+                   (let ((,streamvar (truly-the ansi-stream ,streamvar)))
+                     (return-from stream ,native)))
+                  ((logtest (layout-flags layout) +simple-stream-layout-flag+)
+                   (return-from stream ,simple)))))
+        (cond ((streamp ,streamvar)
+               (return-from stream ,gray))
+              ,@(case designator
+                  (:input
+                   `(((eq ,streamvar t)
+                       (setf ,streamvar *terminal-io*)
+                      (go again))
+                     ((null ,streamvar)
+                      (setf ,streamvar *standard-input*)
+                      (go again))))
+                   (:output
+                    `(((eq ,streamvar t)
+                       (setf ,streamvar *terminal-io*)
+                       (go again))
+                      ((null ,streamvar)
+                       (setf ,streamvar *standard-output*)
+                       (go again)))))
+              (t
+               (sb-c::%type-check-error/c ,streamvar 'sb-kernel::object-not-stream-error nil))))))

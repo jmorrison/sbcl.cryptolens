@@ -45,17 +45,17 @@
         (when (typep map '(cons (eql sb-c::coverage-map)))
           (return-from %find-coverage-map (values (cdr map) code))))))))
 
-#+darwin-jit
+#+arm64
 (declaim (ftype (sb-int:sfunction (t) (simple-array (unsigned-byte 8) (*))) code-coverage-marks))
 ;;; Coverage marks are in the raw bytes following the jump tables
 ;;; preceding any other unboxed constants. This way we don't have to store
 ;;; a pointer to the coverage marks since their location is implicit.
 (defun code-coverage-marks (code)
-  #-darwin-jit
+  #-arm64
   (let ((insts (sb-kernel:code-instructions code)))
     (sb-sys:sap+ insts (ash (sb-kernel:code-jump-table-words code)
                             sb-vm:word-shift)))
-  #+darwin-jit
+  #+arm64
   (let* ((words (sb-kernel:code-header-words code))
          (last (sb-kernel:code-header-ref code (- words 2))))
     (if (vectorp last)
@@ -91,6 +91,12 @@ image."
                (if ,var
                    (progn ,@body (setq predecessor cell))
                    (rplacd predecessor (cdr cell))))))))
+     ;; Using different values here isn't great, but a 1 bit seemed
+     ;; the natural choice for "marked" which is fine for x86 which can
+     ;; store any immediate byte. But the architectures which can't
+     ;; have either a ZERO-TN or NULL-TN, and can store a byte from
+     ;; that register into the coverage mark. So they expect a 0
+     ;; in the low bit and therefore a 1 in the unmarked state.
      (empty-mark-word ()
        #+(or x86-64 x86) 0
        #-(or x86-64 x86) sb-ext:most-positive-word)
@@ -103,13 +109,13 @@ image."
   (multiple-value-bind (map code) (%find-coverage-map code)
     (when map
       (sb-int:collect ((paths))
-        #-darwin-jit
+        #-arm64
         (sb-sys:with-pinned-objects (code)
           (let ((sap (code-coverage-marks code)))
             (dotimes (i (length map) (paths))
               (when (byte-marked-p (sb-sys:sap-ref-8 sap i))
                 (paths (svref map i))))))
-        #+darwin-jit
+        #+arm64
         (let ((marks (code-coverage-marks code)))
           (dotimes (i (length map) (paths))
             (when (byte-marked-p (aref marks i))
@@ -118,15 +124,19 @@ image."
 (defun reset-coverage (&optional object)
   "Reset all coverage data back to the `Not executed` state."
   (cond (object ; reset only this object
-         (multiple-value-bind (map code) (%find-coverage-map object)
+         (multiple-value-bind (map code)
+             (%find-coverage-map (the sb-kernel:code-component object))
            (when map
-             #-darwin-jit
+             #-arm64
              (sb-sys:with-pinned-objects (code)
-               (let ((sap (code-coverage-marks code)))
-                 (dotimes (i (ceiling (length map) sb-vm:n-word-bytes))
-                   (setf (sb-sys:sap-ref-word sap (ash i sb-vm:n-word-bytes))
-                         (empty-mark-word)))))
-             #+darwin-jit
+               (sb-alien:alien-funcall
+                (sb-alien:extern-alien "memset"
+                                       (function sb-alien:void sb-sys:system-area-pointer
+                                                 sb-alien:int sb-alien:unsigned))
+                (code-coverage-marks code)
+                (logand (empty-mark-word) #xFF)
+                (length map)))
+             #+arm64
              (fill (code-coverage-marks code) #xFF))))
         (t                              ; reset everything
          (do-instrumented-code (code)
@@ -164,31 +174,29 @@ image."
                 (gethash namestring namestring->path-tables) path-lookup-table)
           (dolist (item legacy-coverage-marks)
             (setf (gethash (car item) path-lookup-table) item)))
-        #-darwin-jit
+        #-arm64
         (sb-sys:with-pinned-objects (code)
           (let ((sap (code-coverage-marks code)))
             (dotimes (i (length map))   ; for each recorded mark
               (when (byte-marked-p (sb-sys:sap-ref-8 sap i))
                 (incf n-marks)
                 ;; Set the legacy coverage mark for each path it touches
-                ;; One mark byte for x86[-64] corresponds to a union of source paths.
-                ;; For everybody else, one mark is one path.
-                (dolist (path #+(or x86 x86-64) (svref map i)
-                              #-(or x86 x86-64) (list (svref map i)))
+                (dolist (path (svref map i))
                   (let ((found (gethash path path-lookup-table)))
                     (if found
                         (rplacd found t)
                         #+nil
                         (warn "Missing coverage entry for ~S in ~S"
                               path namestring))))))))
-        #+darwin-jit
+        #+arm64
         (let ((marks (code-coverage-marks code)))
           (dotimes (i (length map))     ; for each recorded mark
             (when (byte-marked-p (aref marks i))
               (incf n-marks)
-              (let ((found (gethash (svref map i) path-lookup-table)))
-                (if found
-                    (rplacd found t))))))))
+              (dolist (path (svref map i))
+                (let ((found (gethash path path-lookup-table)))
+                  (if found
+                      (rplacd found t)))))))))
     (values coverage-records n-marks)))
 
 ) ; end MACROLET
@@ -664,9 +672,10 @@ The source locations are stored in SOURCE-MAP."
         (return-from return
           (sb-impl::read-list stream ignore)))
       (let* ((thelist (list nil))
+             (rt *readtable*)
              (listtail thelist))
-        (do ((firstchar (sb-impl::flush-whitespace stream)
-                        (sb-impl::flush-whitespace stream)))
+        (do ((firstchar (sb-impl::flush-whitespace stream rt)
+                        (sb-impl::flush-whitespace stream rt)))
             ((char= firstchar #\) ) (cdr thelist))
           (when (char= firstchar #\.)
             (let ((nextchar (read-char stream t)))
@@ -676,8 +685,8 @@ The source locations are stored in SOURCE-MAP."
                               (sb-int:simple-reader-error
                                stream
                                "Nothing appears before . in list.")))
-                           ((sb-impl::whitespace[2]p nextchar)
-                            (setq nextchar (sb-impl::flush-whitespace stream))))
+                           ((sb-impl::whitespace[2]p nextchar rt)
+                            (setq nextchar (sb-impl::flush-whitespace stream rt))))
                      (rplacd listtail
                              (sb-impl::read-after-dot
                               stream nextchar (if *read-suppress* 0 -1)))

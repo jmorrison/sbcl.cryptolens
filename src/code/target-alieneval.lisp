@@ -155,8 +155,8 @@ This is SETFable."
                                  (foreign-symbol-sap ,initial-value ,datap) 0 ,alien-type)))
                            ,@body)))
                       (:local
-                       (let* ((var (sb-xc:gensym "VAR"))
-                              (initval (if initial-value (sb-xc:gensym "INITVAL")))
+                       (let* ((var (gensym "VAR"))
+                              (initval (if initial-value (gensym "INITVAL")))
                               (info (make-local-alien-info :type alien-type))
                               (inner-body
                                 `((note-local-alien-type ',info ,var)
@@ -262,9 +262,12 @@ Examples:
                    (error
                     "cannot override the size of zero-dimensional arrays"))
                  (when (constantp size)
-                   (setf alien-type (copy-structure alien-type))
-                   (setf (alien-array-type-dimensions alien-type)
-                         (cons (constant-form-value size) (cdr dims)))))
+                   (setf alien-type
+                         (make-alien-array-type
+                          :dimensions (cons (constant-form-value size) (cdr dims))
+                          :element-type (alien-array-type-element-type alien-type)
+                          :bits (alien-type-bits alien-type)
+                          :alignment (alien-type-alignment alien-type)))))
                 (dims
                  (setf size (car dims)))
                 (t
@@ -314,7 +317,7 @@ Examples:
 ;;; an invocation of INVOKE-WITH-SAVED-FP, which should be inlined.
 #+c-stack-is-control-stack
 (defun invoke-with-saved-fp (fn)
-  (declare #-sb-xc-host (muffle-conditions compiler-note)
+  (declare (muffle-conditions compiler-note)
            (optimize (speed 3)))
   ;; No need to link to the previous value, it can be fetched from the binding stack.
   (let ((*saved-fp* (sb-c::current-fp-fixnum)))
@@ -715,7 +718,7 @@ type specifies the argument and result types."
        (let ((stub (alien-fun-type-stub type)))
          (unless stub
            (setf stub
-                 (let ((fun (sb-xc:gensym "FUN"))
+                 (let ((fun (gensym "FUN"))
                        (parms (make-gensym-list (length args))))
                    (compile nil
                             `(lambda (,fun ,@parms)
@@ -767,8 +770,13 @@ way that the argument is passed.
       passed, with the object being initialized from the supplied argument
       and the return value being determined by accessing the object on
       return."
-  (multiple-value-bind (lisp-name alien-name)
-      (pick-lisp-and-alien-names name)
+  (binding* (((lisp-name alien-name) (pick-lisp-and-alien-names name))
+             ;; The local name is uninterned so that we don't preclude
+             ;;   (defconstant kill 9)
+             ;;   (define-alien-routine "kill" int (pid int) (sig int))
+             ;; which, if we didn't hide the local name, would get:
+             ;;  "Attempt to bind a constant variable with SYMBOL-MACROLET: KILL"
+             (local-name (copy-symbol lisp-name)))
     (collect ((docs) (lisp-args) (lisp-arg-types)
               (lisp-result-types
                (cond ((eql result-type 'void)
@@ -782,38 +790,41 @@ way that the argument is passed.
               (arg-types) (alien-vars)
               (alien-args) (results))
       (dolist (arg args)
-        (if (stringp arg)
-            (docs arg)
-            (destructuring-bind (name type &optional (style :in)) arg
-              (unless (member style '(:in :copy :out :in-out))
-                (error "bogus argument style ~S in ~S" style arg))
-              (when (and (member style '(:out :in-out))
-                         (typep (parse-alien-type type lexenv)
-                                'alien-pointer-type))
-                (error "can't use :OUT or :IN-OUT on pointer-like type:~%  ~S"
-                       type))
-              (let (arg-type)
-                (cond ((eq style :in)
-                       (setq arg-type type)
-                       (alien-args name))
-                      (t
-                       (setq arg-type `(* ,type))
-                       (if (eq style :out)
-                           (alien-vars `(,name ,type))
-                           (alien-vars `(,name ,type ,name)))
-                       (alien-args `(addr ,name))))
-                (arg-types arg-type)
-                (unless (eq style :out)
-                  (lisp-args name)
-                  (lisp-arg-types t
-                                  ;; FIXME: It should be something
-                                  ;; like `(ALIEN ,ARG-TYPE), except
-                                  ;; for we also accept SAPs where
-                                  ;; pointers are required.
-                                  )))
-              (when (or (eq style :out) (eq style :in-out))
-                (results name)
-                (lisp-result-types `(alien ,type))))))
+        (cond ((stringp arg)
+               (docs arg))
+              ((eq arg '&optional)
+               (arg-types arg))
+              (t
+               (destructuring-bind (name type &optional (style :in)) arg
+                 (unless (member style '(:in :copy :out :in-out))
+                   (error "bogus argument style ~S in ~S" style arg))
+                 (when (and (member style '(:out :in-out))
+                            (typep (parse-alien-type type lexenv)
+                                   'alien-pointer-type))
+                   (error "can't use :OUT or :IN-OUT on pointer-like type:~%  ~S"
+                          type))
+                 (let (arg-type)
+                   (cond ((eq style :in)
+                          (setq arg-type type)
+                          (alien-args name))
+                         (t
+                          (setq arg-type `(* ,type))
+                          (if (eq style :out)
+                              (alien-vars `(,name ,type))
+                              (alien-vars `(,name ,type ,name)))
+                          (alien-args `(addr ,name))))
+                   (arg-types arg-type)
+                   (unless (eq style :out)
+                     (lisp-args name)
+                     (lisp-arg-types t
+                                     ;; FIXME: It should be something
+                                     ;; like `(ALIEN ,ARG-TYPE), except
+                                     ;; for we also accept SAPs where
+                                     ;; pointers are required.
+                                     )))
+                 (when (or (eq style :out) (eq style :in-out))
+                   (results name)
+                   (lisp-result-types `(alien ,type)))))))
       `(progn
          ;; The theory behind this automatic DECLAIM is that (1) if
          ;; you're calling C, static typing is what you're doing
@@ -826,13 +837,13 @@ way that the argument is passed.
          (defun ,lisp-name ,(lisp-args)
            ,@(docs)
            (with-alien
-            ((,lisp-name (function ,result-type ,@(arg-types))
+            ((,local-name (function ,result-type ,@(arg-types))
                          :extern ,alien-name)
              ,@(alien-vars))
              ,@(if (eq 'void result-type)
-                   `((alien-funcall ,lisp-name ,@(alien-args))
+                   `((alien-funcall ,local-name ,@(alien-args))
                      (values nil ,@(results)))
-                   `((values (alien-funcall ,lisp-name ,@(alien-args))
+                   `((values (alien-funcall ,local-name ,@(alien-args))
                              ,@(results))))))))))
 
 (defun alien-typep (object type)

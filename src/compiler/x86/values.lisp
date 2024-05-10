@@ -12,7 +12,7 @@
 (in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
-  (:args (ptr :scs (any-reg)))
+  (:args (ptr :scs (any-reg control-stack)))
   (:generator 1
     (move esp-tn ptr)))
 
@@ -56,15 +56,22 @@
 ;;; bogus SC that reflects the costs of the memory-to-memory moves for each
 ;;; operand, but this seems unworthwhile.
 (define-vop (push-values)
-  (:args (vals :more t
-               :scs (descriptor-reg)))
+  (:args (vals :more t :scs (descriptor-reg any-reg immediate constant)))
   (:results (start :from :load) (count))
   (:info nvals)
+  (:temporary (:scs (descriptor-reg)) temp)
+  (:vop-var vop)
   (:generator 20
     (move start esp-tn)                 ; WARN pointing 1 below
-    (do ((val vals (tn-ref-across val)))
-        ((null val))
-      (inst push (encode-value-if-immediate (tn-ref-tn val))))
+    (do ((tn-ref vals (tn-ref-across tn-ref)))
+        ((null tn-ref))
+      (let ((tn (tn-ref-tn tn-ref)))
+        (inst push (sc-case tn
+                     (constant
+                      (load-constant vop tn temp)
+                      temp)
+                     (t
+                      (encode-value-if-immediate tn))))))
     (inst mov count (fixnumize nvals))))
 
 ;;; Push a list of values on the stack, returning Start and Count as used in
@@ -110,25 +117,15 @@
 ;;; defining a new stack frame.
 (define-vop (%more-arg-values)
   (:args (context :scs (descriptor-reg any-reg) :target src)
-         (skip :scs (any-reg immediate))
          (num :scs (any-reg) :target count))
-  (:arg-types * positive-fixnum positive-fixnum)
+  (:arg-types * positive-fixnum)
   (:temporary (:sc any-reg :offset esi-offset :from (:argument 0)) src)
   (:temporary (:sc descriptor-reg :offset eax-offset) temp)
   (:temporary (:sc unsigned-reg :offset ecx-offset) loop-index)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
   (:generator 20
-    (sc-case skip
-      (immediate
-       (if (zerop (tn-value skip))
-           (move src context)
-           (inst lea src (make-ea :dword :base context
-                                  :disp (- (* (tn-value skip)
-                                              n-word-bytes))))))
-      (any-reg
-       (move src context)
-       (inst sub src skip)))
+    (move src context)
     (move count num)
 
     (move loop-index count)

@@ -14,8 +14,6 @@
 
 (in-package "SB-VM")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-
 (defconstant-eqx +float-trap-alist+
     `((:underflow . ,float-underflow-trap-bit)
       (:overflow . ,float-overflow-trap-bit)
@@ -40,13 +38,13 @@
   #'equal)
 
 ;;; Return a mask with all the specified float trap bits set.
-(defun float-trap-mask (names)
-  (reduce #'logior
-          (mapcar (lambda (x)
-                    (or (cdr (assoc x +float-trap-alist+))
-                        (error "unknown float trap kind: ~S" x)))
-                  names)))
-) ; EVAL-WHEN
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun float-trap-mask (names)
+    (reduce #'logior
+            (mapcar (lambda (x)
+                      (or (cdr (assoc x +float-trap-alist+))
+                          (error "unknown float trap kind: ~S" x)))
+                    names))))
 
 ;;; interpreter stubs for floating point modes get/setters for
 ;;; some architectures have been removed, as they are implemented
@@ -159,7 +157,7 @@ sets the floating point modes to their current values (and thus is a no-op)."
 ;;; LEAST-NEGATIVE-SINGLE-FLOAT, so the :UNDERFLOW exceptions are
 ;;; disabled by default. Joe User can explicitly enable them if
 ;;; desired.
-(defvar *saved-floating-point-modes*
+(define-load-time-global *saved-floating-point-modes*
   '(:traps (:overflow #-(or netbsd ppc) :invalid :divide-by-zero)
     :rounding-mode :nearest :current-exceptions nil
     :accrued-exceptions nil :fast-mode nil
@@ -174,13 +172,12 @@ sets the floating point modes to their current values (and thus is a no-op)."
 ;;; Return true if any of the named traps are currently trapped, false
 ;;; otherwise.
 (defmacro current-float-trap (&rest traps)
-  `(not (zerop (logand ,(dpb (float-trap-mask traps) float-traps-byte 0)
-                       (floating-point-modes)))))
+  `(logtest ,(dpb (float-trap-mask traps) float-traps-byte 0)
+            (floating-point-modes)))
 
 ;;; SIGFPE code to floating-point error
 #-win32
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant-eqx +sigfpe-code-error-alist+
+(defconstant-eqx +sigfpe-code-error-alist+
     `((,sb-unix::fpe-intovf . floating-point-overflow)
       (,sb-unix::fpe-intdiv . division-by-zero)
       (,sb-unix::fpe-fltdiv . division-by-zero)
@@ -189,7 +186,7 @@ sets the floating point modes to their current values (and thus is a no-op)."
       (,sb-unix::fpe-fltres . floating-point-inexact)
       (,sb-unix::fpe-fltinv . floating-point-invalid-operation)
       (,sb-unix::fpe-fltsub . floating-point-exception))
-    #'equal))
+  #'equal)
 
 ;;; Signal the appropriate condition when we get a floating-point error.
 #-win32

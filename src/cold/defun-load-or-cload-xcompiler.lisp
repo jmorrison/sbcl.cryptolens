@@ -97,6 +97,12 @@
           (sb-cold::exit-process 1)))))
   (format t "~&; Parallel build: Skipping fasl load~%"))
 
+;;; Read the version file once and once only,
+;;; or not at all if you've otherwise defined this.
+(defvar *target-sbcl-version* (read-from-file "version.lisp-expr"))
+
+#+ccl (declaim (ftype function warn-when-cl-snapshot-diff)) ; silly compiler
+
 ;;; Either load or compile-then-load the cross-compiler into the
 ;;; cross-compilation host Common Lisp.
 (defun load-or-cload-xcompiler (load-or-cload-stem)
@@ -113,6 +119,8 @@
   (if (and (make-host-1-parallelism)
            (eq load-or-cload-stem #'host-cload-stem))
       (progn
+        ;; FIXME: muffler not working in forked children?
+        (setq *fail-on-warnings* nil)
         ;; Multiprocess build uses the in-memory math ops cache but not
         ;; the persistent cache file because we don't need each child
         ;; to be forced to read the file. Moreover, newly inserted values
@@ -135,22 +143,11 @@
       (with-math-journal
        (do-stems-and-flags (stem flags 1)
          (unless (find :not-host flags)
+           ;; Enforce naming convention: target-* files are not for make-host-1
+           (assert (not (search "code/target-" stem)))
            (funcall load-or-cload-stem stem flags)
            (when (member :sb-show sb-xc:*features*)
              (funcall 'warn-when-cl-snapshot-diff *cl-snapshot*))))))
-
-  ;; If the cross-compilation host is SBCL itself, we can use the
-  ;; PURIFY extension to freeze everything in place, reducing the
-  ;; amount of work done on future GCs. In machines with limited
-  ;; memory, this could help, by reducing the amount of memory which
-  ;; needs to be juggled in a full GC. And it can hardly hurt, since
-  ;; (in the ordinary build procedure anyway) essentially everything
-  ;; which is reachable at this point will remain reachable for the
-  ;; entire run.
-  ;;
-  ;; (Except that purifying actually slows down GENCGC). -- JES, 2006-05-30
-  #+(and sbcl (not gencgc))
-  (host-sb-ext:purify)
 
   ;; Let's check that the type system, and various other things, are
   ;; reasonably sane. (It's easy to spend a long time wandering around

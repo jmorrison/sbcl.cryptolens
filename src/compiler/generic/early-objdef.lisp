@@ -20,15 +20,8 @@
 ;;;   * LIST-POINTER-LOWTAG + N-WORD-BYTES = OTHER-POINTER-LOWTAG: NIL
 ;;;     is both a cons and a symbol (at the same address) and depends on this.
 ;;;     See the definition of SYMBOL in objdef.lisp
-;;;   * OTHER-POINTER-LOWTAG > 4: Some code in the SPARC backend,
-;;;     which uses bit 2 of the ALLOC register to indicate that
-;;;     PSEUDO-ATOMIC is on, doesn't strip the low bits of reg_ALLOC
-;;;     before ORing in OTHER-POINTER-LOWTAG within a PSEUDO-ATOMIC
-;;;     section.
 ;;;   * OTHER-IMMEDIATE-0-LOWTAG are spaced 4 apart: various code wants to
-;;;     iterate through these
-;;;   * Allocation code on Alpha wants lowtags for heap-allocated
-;;;     objects to be odd.
+;;;     iterate through these.  (This is not true on PPC64)
 ;;; (These are just the ones we know about as of sbcl-0.7.1.22. There
 ;;; might easily be more, since these values have stayed highly
 ;;; constrained for more than a decade, an inviting target for
@@ -103,36 +96,22 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(defconstant nil-value
-    (+ static-space-start
-       ;; boxed_region precedes NIL
-       ;; 8 is the number of words to reserve at the beginning of static space
-       ;; prior to the words of NIL.
-       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
-       #+(and gencgc (not sb-thread) (not 64-bit)) (ash 8 word-shift)
-       #+64-bit #x100
-       (* 2 n-word-bytes)
-       list-pointer-lowtag))
+#+sb-xc-host
+(defun lowtag-of (x)
+  (etypecase x
+    (symbol sb-vm:other-pointer-lowtag)
+    (structure-object sb-vm:instance-pointer-lowtag)
+    (list sb-vm:list-pointer-lowtag)
+    ((eql 0) 0)))
 
-;;; BOXED-REGION is address in static space at which a 'struct alloc_region'
-;;; is overlaid on a lisp vector with element type WORD.
-#-sb-thread
-(defconstant boxed-region
-  (+ static-space-start
-     (* 2 n-word-bytes))) ; skip the array header
+#-sb-xc-host
+(progn
+(declaim (inline lowtag-of))
+(defun lowtag-of (x) (logand (get-lisp-obj-address x) sb-vm:lowtag-mask)))
 
 (defconstant-eqx fixnum-lowtags
-    #.(let ((fixtags nil))
-        (do-external-symbols (sym "SB-VM")
-          (let* ((name (symbol-name sym))
-                 (len (length name)))
-            (when (and (boundp sym)
-                       (integerp (symbol-value sym))
-                       (> len 7)
-                       (string= name "-LOWTAG" :start1 (- len 7))
-                       (zerop (logand (symbol-value sym) fixnum-tag-mask)))
-              (push sym fixtags))))
-        `',(sort fixtags #'string< :key #'symbol-name))
+    '#.(loop for i from 0 to lowtag-mask
+             when (zerop (logand i fixnum-tag-mask)) collect i)
   #'equal)
 
 ;;; the heap types, stored in 8 bits of the header of an object on the
@@ -205,102 +184,185 @@
           ;; a long, horrible death.  --njf, 2004-08-09
           :start #.(+ (ash 1 n-lowtag-bits) other-immediate-0-lowtag)
           :step 4)
-                                            ; +unicode -unicode
-;;                             Word bits    ;  32 | 64  32 | 64
-                                            ;------------------
-                                            ; [ all numbers are hex ]
-  bignum-widetag                            ;  0A   11  0A   11       \
-  ratio-widetag                             ;  0E   15  0E   15        |
-  single-float-widetag                      ;  12   19  12   19        |
-  double-float-widetag                      ;  16   1D  16   1D        | EQL-hash picks off this
-  complex-widetag                           ;  1A   21  1A   21        | range of widetags
-  complex-single-float-widetag              ;  1E   25  1E   25        |
-  complex-double-float-widetag              ;  22   29  22   29        |
-                                            ;                          |
-  symbol-widetag                            ;  26   2D  26   2D       /
+;;                             Word bits          ;  32 | 64
+                                                  ;---------
+                                                  ; [ all numbers are hex ]
 
-  code-header-widetag                       ;  2A   31  2A   31
+  ;; NOTE: If changing the widetags bracketed by the comment about EQL-hash,
+  ;; check that the definition of stable_eql_hash_p() in gc-common is correct.
+  ;; FIXME: EQL-HASH should treat SAP like a number
+  ;; -- start of numeric widetags --
+  bignum-widetag                                  ;  0A   11       \
+  ratio-widetag                                   ;  0E   15       |
+  single-float-widetag                            ;  12   19       |
+  double-float-widetag                            ;  16   1D       | EQL-hash picks off this
+  complex-rational-widetag                        ;  1A   21       | range of widetags.
+  complex-single-float-widetag                    ;  1E   25       |
+  complex-double-float-widetag                    ;  22   29       |
+  ;; -- end of numeric widetags --                                 |
+  symbol-widetag                                  ;  26   2D       /
+  sap-widetag                                     ;  2A   31
 
-  simple-fun-widetag                        ;  2E   35  2E   35
-  closure-widetag                           ;  32   39  32   39
-  funcallable-instance-widetag              ;  36   3D  36   3D
+  code-header-widetag                             ;  2E   35
+  instance-widetag                                ;  32   39
+  funcallable-instance-widetag                    ;  36   3D
+  simple-fun-widetag                              ;  3A   41
+  closure-widetag                                 ;  3E   45
 
-  ;; x86[-64] does not have objects with this widetag,
-  #-(or x86 x86-64) return-pc-widetag       ;  3A   41  3A   41
-  #+(or x86 x86-64) lra-widetag-notused
+  #-(or x86 x86-64 arm64 riscv) return-pc-widetag ;  42   49
+  #+(or x86 x86-64 arm64 riscv) lra-widetag-notused
 
-  value-cell-widetag                        ;  3E   45  3E   45
-  character-widetag                         ;  42   49  42   49
-  sap-widetag                               ;  46   4D  46   4D
-  #-64-bit unbound-marker-widetag           ;  4A   51  4A   51
+  value-cell-widetag                              ;  46   4D
+  character-widetag                               ;  4A   51
+  #-64-bit unbound-marker-widetag                 ;  4E   55
   #+64-bit unused00-widetag
-  weak-pointer-widetag                      ;  4E   55  4E   55
-  instance-widetag                          ;  52   59  52   59
-  fdefn-widetag                             ;  56   5D  56   5D
+  weak-pointer-widetag                            ;  52   59
+  fdefn-widetag                                   ;  56   5D
 
-  no-tls-value-marker-widetag               ;  5A   61  5A   61
-  #+sb-simd-pack simd-pack-widetag          ;       65       65
-  #-sb-simd-pack unused01-widetag           ;  5E       5E
-  #+sb-simd-pack-256 simd-pack-256-widetag  ;  62   69  62   69
-  #-sb-simd-pack-256 unused03-widetag       ;  62   69  62   69
-  filler-widetag                            ;  66   6D  66   6D
-  unused04-widetag                          ;  6A   71  6A   71
-  unused05-widetag                          ;  6E   75  6E   75
-  unused06-widetag                          ;  72   79  72   79
-  unused07-widetag                          ;  76   7D  76   7D
-  #-64-bit unused08-widetag                 ;  7A       7A
-  #-64-bit unused09-widetag                 ;  7E       7E
+  unused-widetag                                  ;  5A   61
+  #+sb-simd-pack simd-pack-widetag                ;       65
+  #-sb-simd-pack unused01-widetag                 ;  5E
+  #+sb-simd-pack-256 simd-pack-256-widetag        ;       69
+  #-sb-simd-pack-256 unused03-widetag             ;  62
+  filler-widetag                                  ;  66   6D
+  unused04-widetag                                ;  6A   71
+  unused05-widetag                                ;  6E   75
+  unused06-widetag                                ;  72   79
+  unused07-widetag                                ;  76   7D
+  #-64-bit unused08-widetag                       ;  7A
+  #-64-bit unused09-widetag                       ;  7E
 
-  simple-array-widetag                      ;  82   81  82   81
-  simple-vector-widetag                     ;
-  simple-bit-vector-widetag                 ;
-  simple-array-unsigned-byte-2-widetag      ;
-  simple-array-unsigned-byte-4-widetag      ;
-  simple-array-unsigned-byte-7-widetag      ;
-  simple-array-unsigned-byte-8-widetag      ;
-  simple-array-unsigned-byte-15-widetag     ;
-  simple-array-unsigned-byte-16-widetag     ;
+  simple-array-widetag                            ;  82   81
+  ;; NIL element type is not in the contiguous range of widetags
+  ;; corresponding to SIMPLE-UNBOXED-ARRAY
+  simple-array-nil-widetag                        ;  86
 
-  #-64-bit
-  simple-array-unsigned-fixnum-widetag      ;
-  simple-array-unsigned-byte-31-widetag     ;
-  simple-array-unsigned-byte-32-widetag     ;
-  #+64-bit
-  simple-array-unsigned-fixnum-widetag      ;
-  #+64-bit
-  simple-array-unsigned-byte-63-widetag     ;
-  #+64-bit
-  simple-array-unsigned-byte-64-widetag     ;
-  simple-array-signed-byte-8-widetag        ;
-  simple-array-signed-byte-16-widetag       ;
-  #-64-bit
-  simple-array-fixnum-widetag               ;
-  simple-array-signed-byte-32-widetag       ;
-  #+64-bit
-  simple-array-fixnum-widetag               ;
-  #+64-bit
-  simple-array-signed-byte-64-widetag       ;
-  simple-array-single-float-widetag         ;
-  simple-array-double-float-widetag         ;
-  simple-array-complex-single-float-widetag ;
-  simple-array-complex-double-float-widetag ;
+  ;; IF YOU CHANGE THIS ORDER, THEN MANUALLY VERIFY CORRECTNESS OF:
+  ;; - leaf_obj_widetag_p()
+  ;; - readonly_unboxed_obj_p()
+  ;; - conservative_root_p()
+  ;; - anything else I forgot to mention
+  simple-vector-widetag                           ;  8A
+  simple-bit-vector-widetag                       ;  8E
+  simple-array-unsigned-byte-2-widetag            ;  92
+  simple-array-unsigned-byte-4-widetag            ;  96
+  simple-array-unsigned-byte-7-widetag            ;  9A
+  simple-array-unsigned-byte-8-widetag            ;  9E
+  simple-array-unsigned-byte-15-widetag           ;  A2
+  simple-array-unsigned-byte-16-widetag           ;  A6
 
-  ;; Not a string type
-  simple-array-nil-widetag                  ;
+  #-64-bit simple-array-unsigned-fixnum-widetag   ;
+  simple-array-unsigned-byte-31-widetag           ;
+  simple-array-unsigned-byte-32-widetag           ;
+  #+64-bit simple-array-unsigned-fixnum-widetag   ;
+  #+64-bit simple-array-unsigned-byte-63-widetag  ;
+  #+64-bit simple-array-unsigned-byte-64-widetag  ;
+  simple-array-signed-byte-8-widetag              ;
+  simple-array-signed-byte-16-widetag             ;
+  #-64-bit simple-array-fixnum-widetag            ;
+  simple-array-signed-byte-32-widetag             ;
+  #+64-bit simple-array-fixnum-widetag            ;
+  #+64-bit simple-array-signed-byte-64-widetag    ;
+  simple-array-single-float-widetag               ;
+  simple-array-double-float-widetag               ;
+  simple-array-complex-single-float-widetag       ;
+  simple-array-complex-double-float-widetag       ;
 
-  simple-base-string-widetag                ;  D6   E1  D6   E1       \
-  #+sb-unicode                              ;                          |
-  simple-character-string-widetag           ;  DA   E5                 | Strings
-  ;; From here down commence the non-simple array types                |
-  complex-base-string-widetag               ;  DE   E9  DA   E5        |
-  #+sb-unicode                              ;                          |
-  complex-character-string-widetag          ;  E2   ED                /
+  ;; WARNING: If you change the order of anything here,
+  ;; be sure to examine COMPUTE-OBJECT-HEADER to see that it works
+  ;; properly for all non-simple array headers.
+  simple-base-string-widetag                      ;  D6   E1       \
+  #+sb-unicode simple-character-string-widetag    ;  DA   E5       | Strings
+  #-sb-unicode unused-simple-char-string          ;                |
+  ;; From here down commence the non-simple array types            |
+  complex-base-string-widetag                     ;  DE   E9       |
+  #+sb-unicode complex-character-string-widetag   ;  E2   ED       /
+  #-sb-unicode unused-complex-char-string
 
-  complex-bit-vector-widetag                ;  E6   F1  DE   E9
-  complex-vector-widetag                    ;  EA   F5  E2   ED
-  complex-array-widetag                     ;  EE   F9  E6   F1
-  unused-array-widetag                      ;  F2   FD  EA   F5
+  complex-bit-vector-widetag                      ;  E6   F1
+  complex-vector-widetag                          ;  EA   F5
+  complex-array-widetag                           ;  EE   F9
+  unused-array-widetag                            ;  F2   FD
 ))
+
+;;; A filler cons whose first word is all 1s looks like this marker pattern,
+;;; but there's no ambiguity, because no-tls-value can't appear in an object
+;;; on the heap.
+(defconstant no-tls-value-marker most-positive-word)
+
+(defmacro unbound-marker-bits ()
+  ;; By having unbound-marker-bits appear to be a valid pointer into static
+  ;; space, it admits some optimizations that might "dereference" the value
+  ;; before checking the widetag.
+  ;; Architectures other than x86-64 do not take that liberty.
+  #+x86-64 (logior (+ sb-vm:static-space-start #x100) unbound-marker-widetag)
+  #-x86-64 unbound-marker-widetag)
+
+;;; Map each widetag symbol to a string to go in 'tagnames.h'.
+;;; I didn't want to mess with the formatting of the table above.
+(defparameter *widetag-string-alist*
+  `((bignum-widetag "bignum")
+    (ratio-widetag "ratio")
+    (single-float-widetag "sfloat")
+    (double-float-widetag "dfloat")
+    (complex-rational-widetag "cplxnum")
+    (complex-single-float-widetag "cplx-sfloat")
+    (complex-double-float-widetag "cplx-dfloat")
+    (symbol-widetag "symbol")
+    (instance-widetag "instance")
+    (funcallable-instance-widetag "funinstance")
+    (simple-fun-widetag "simplefun")
+    (closure-widetag "closure")
+    (code-header-widetag "codeblob")
+    (return-pc-widetag "LRA")
+    (value-cell-widetag "value-cell")
+    (character-widetag "char")
+    (sap-widetag "sap")
+    (unbound-marker-widetag "unbound-marker")
+    (weak-pointer-widetag "weakptr")
+    (fdefn-widetag "fdefn")
+    (simd-pack-widetag "SIMD-pack")
+    (simd-pack-256-widetag "SIMD-pack256")
+    (filler-widetag "filler")
+    (simple-array-widetag "simple-array")
+    (simple-array-nil-widetag "simple-array-NIL")
+    (simple-vector-widetag "simple-vec")
+    (simple-bit-vector-widetag "simple-bit-vec")
+    (simple-array-fixnum-widetag "fixnum-vec")
+    (simple-array-unsigned-fixnum-widetag "Ufixnum-vec")
+    ;; Autogenerate the arrays. Not all values of N are used, but it's OK
+    ,@(loop for n in '("2" "4" "7" "8" "15" "16" "31" "32" "63" "64")
+            append `((,(symbolicate "SIMPLE-ARRAY-UNSIGNED-BYTE-" n "-WIDETAG")
+                      ,(concatenate 'string "UB" n "-vec"))
+                     (,(symbolicate "SIMPLE-ARRAY-SIGNED-BYTE-" n "-WIDETAG")
+                      ,(concatenate 'string "SB" n "-vec"))))
+    (simple-array-single-float-widetag "sfloat-vec")
+    (simple-array-double-float-widetag "dfloat-vec")
+    (simple-array-complex-single-float-widetag "cplx-sfloat-vec")
+    (simple-array-complex-double-float-widetag "cplx-dfloat-vec")
+    (simple-base-string-widetag "simple-base-str")
+    (simple-character-string-widetag "simple-char-str")
+    ;; I proposed on sbcl-devel some years ago to rename "complex" to "fancy"
+    ;; to avoid confusion with complex numbers. That never gained traction.
+    (complex-base-string-widetag "fancy-base-str")
+    (complex-character-string-widetag "fancy-char-str")
+    (complex-bit-vector-widetag "fancy-bit-vec")
+    (complex-vector-widetag "fancy-vec")
+    (complex-array-widetag "fancy-array")))
+
+(defun widetag-string-name (symbol)
+  ;; Asserting found
+  (the string (second (assoc symbol *widetag-string-alist*))))
+
+;;; Check that INSTANCE and FUNCALLABLE-INSTANCE differ at exactly 1 bit
+;;; and that FUNCALLABLE-INSTANCE is the larger of the two widetags.
+(eval-when (:compile-toplevel)
+  (assert (= (logcount (logand (logxor instance-widetag funcallable-instance-widetag)
+                               lowtag-mask))
+             1))
+  ;; Note: you must adjust FUNINSTANCE_SELECTOR_BIT_NUMBER (= 2) if the widetags change
+  (assert (= funcallable-instance-widetag
+             (logior instance-widetag (ash 1 2)))))
 
 (defconstant-eqx +function-widetags+
     '#.(list funcallable-instance-widetag simple-fun-widetag closure-widetag)
@@ -310,11 +372,44 @@
 
 ;;; Byte index:           3           2           1           0
 ;;;                 +-----------------------------------+-----------+
-;;;                 |  unused   |   rank    |   flags   |  widetag  |
+;;;                 |  extra    |   flags   |    rank   |  widetag  |
 ;;;                 +-----------+-----------+-----------+-----------+
 ;;;                 |<---------- HEADER DATA ---------->|
 
-(defconstant +array-fill-pointer-p+    #x80)
+;;; "extra" contain the following fields:
+;;;  - generation number for immobile space (4 low bits of extra)
+;;;  - VISITED bit (header bit index 30) for weak vectors, not used by Lisp
+;;;  - ALLOC-DYNAMIC-EXTENT (bit index 29), not used by lisp
+;;;  - ALLOC-MIXED-REGION (bit index 28), not used by Lisp
+
+;; When I finish implementing "highly unsafe" dynamic-extent allocation, allowing
+;; uninitialized SIMPLE-VECTORs on the stack, _correct_ Lisp code won't be affected
+;; (it's an error to read before writing an element), nor will conservative GC.
+;; But in order to make printing (Lisp and/or ldb) not crashy, we may need to act
+;; as though *PRINT-ARRAY* were NIL on those.
+;; (I don't know what to do if such a vector insists on being printed readably)
+(defconstant +vector-alloc-dynamic-extent-bit+ (ash 1 29))
+
+;; A vector with ALLOC-MIXED-REGION can never be moved to a purely boxed page,
+;; and vectors not so marked could be. This would allow small simple-vectors
+;; to benefit from the same GC optimization as large ones, wherein we scan
+;; only their marked cards without regard to object base address.
+;; A hash-table vector must not move to a pure boxed page, but we can't indicate
+;; a vector as hashing until after it has been properly initialized.
+;; The table algorithms expects to see certain values in the first and last elements,
+;; and shoving all the initialization into pseudo-atomic would be nontrivial.
+;; So we need a different flag bit that can be set immediately on creation,
+;; just in case GC occurs before a hash table vector is flagged as hashing.
+;; Note: ALLOCATE-VECTOR on 32-bit wants its first argument to be POSITIVE-FIXNUM.
+;; so this is the highest bit index that can be used satisfying that restriction.
+;; Once set, this bit can never be cleared.
+(defconstant +vector-alloc-mixed-region-bit+ (ash 1 28))
+
+;;; Rank and widetag adjacent lets SIMPLE-ARRAY-HEADER-OF-RANK-P be just one comparison.
+(defconstant array-rank-position    8)
+(defconstant array-flags-position  16)
+
+(defconstant array-flags-data-position (- array-flags-position n-widetag-bits))
 
 ;; A vector tagged as +VECTOR-SHAREABLE+ is logically readonly,
 ;; and permitted to be shared with another vector per the CLHS standard
@@ -333,10 +428,8 @@
 ;; nonetheless, opportunities for sharing abound.
 (defconstant +vector-shareable-nonstd+ #x10)
 
-;; Weak vectors that are not hash-table backing vectors use this bit to track
-;; whether we've already recorded the vector for deferred scavenging.
-;; Hash-tables use an entirely different mechanism. Flag bit used only in C.
-(defconstant vector-weak-visited-flag  #x08)
+;; All arrays have a fill-pointer bit, but only vectors can have a 1 here.
+(defconstant +array-fill-pointer-p+    #x80)
 ;; All hash-table backing vectors are marked with this bit.
 ;; Essentially it informs GC that the vector has a high-water mark.
 (defconstant vector-hashing-flag       #x04)
@@ -347,12 +440,13 @@
 ;; Set if vector is weak. Weak hash tables have both this AND the hashing bit.
 (defconstant vector-weak-flag          #x01)
 
-;;; This header bit is set for symbols which were present in the pristine core.
-;;; The backend may emit different code when referencing such symbols.
-;;; For x86-64, symbols with this bit set may be assumed to have been
-;;; allocated in immobile space.
-;;; Note also that sb-fasteval uses 2 bits of the symbol header.
-(defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
+;;; A symbol that is "unlocked" is neither constant, nor global,
+;;; nor a global symbol-macro, nor in a locked package. Such symbols can be
+;;; bound by PROGV without calling ABOUT-TO-MODIFY-SYMBOL-VALUE, except in the
+;;; case where PROGV invokes UNBIND.
+;;; This is a mask tested against GET-HEADER-DATA, so skip over the payload size byte.
+(defconstant +symbol-fast-bindable+ #x100)
+(defconstant +symbol-initial-core+ #x200)
 
 ;;; Bit indices of the status bits in an INSTANCE header
 ;;; that implement lazily computed stable hash codes.
@@ -365,6 +459,13 @@
   ;; low half of a closure header to form the full header word.
   #-sb-thread
   (defglobal function-layout 0))        ; set by genesis
+
+;;; These regions occupy the initial words of static space.
+#-sb-thread
+(progn
+  (defconstant mixed-region-offset 0)
+  (defconstant cons-region-offset (* 3 n-word-bytes))
+  (defconstant boxed-region-offset (* 6 n-word-bytes)))
 
 #|
 ;; Run this in the SB-VM package once for each target feature combo.

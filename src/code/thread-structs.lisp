@@ -11,6 +11,12 @@
 
 (in-package "SB-THREAD")
 
+;;; An AVL tree of threads keyed by 'struct thread'. NIL is the empty tree.
+(sb-ext:define-load-time-global *all-threads* ())
+;;; Next TLS index to use. This is shifted by n-fixnum-tag-bits because it holds
+;;; a word-aligned raw integer, not a fixnum (but it looks like a fixnum)
+(sb-ext:define-load-time-global sb-vm::*free-tls-index* 0)
+
 ;;; It's possible to make futex/non-futex switchable at runtime by ensuring that
 ;;; these synchronization primitive structs contain all the slots for the union
 ;;; of any kind of backing object.  Some of the #+sb-futex/#-sb-futex cases in
@@ -21,10 +27,6 @@
 ;;; compete for a mutex, the pthread code seems to do a better job at reducing
 ;;; cycles spent in the OS.
 
-;;; N.B.: If you alter this definition, then you need to verify that FOP-FUNCALL
-;;; in genesis can properly emulate MAKE-MUTEX for the altered structure,
-;;; or even better, make sure that genesis can emulate any constructor,
-;;; provided that it is sufficiently trivial.
 (sb-xc:defstruct (mutex (:constructor make-mutex (&key name))
                         (:copier nil))
   "Mutex type."
@@ -32,7 +34,12 @@
   ;; If adding slots between STATE and NAME, please see futex_name() in linux_os.c
   ;; which attempts to divine a string from a futex word address.
   (name   nil :type (or null simple-string))
-  (%owner nil :type (or null thread)))
+  ;; The owner is a non-pointer so that GC pages containing mutexes do not get dirtied
+  ;; with mutex ownership change. The natural representation of this is SB-VM:WORD
+  ;; but the "funny fixnum" representation - i.e. N_WORD_BITS bits of significance, but
+  ;; cast as fixnum when read - avoids consing on 32-bit builds, and also not all of them
+  ;; implement RAW-INSTANCE-CAS which would be otherwise needed.
+  (%owner 0 :type fixnum))
 
 (sb-xc:defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
   "Waitqueue type."
@@ -65,11 +72,11 @@ future."
 (sb-ext:define-load-time-global *profiled-threads* :all)
 (declaim (type (or (eql :all) list) *profiled-threads*))
 
-(sb-xc:defstruct (thread (:constructor %make-thread (name %ephemeral-p semaphore))
+(sb-xc:defstruct (thread (:constructor %make-thread (%name %ephemeral-p semaphore))
                          (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
-  (name          nil :type (or null simple-string)) ; C code could read this
+  (%name         nil :type (or null simple-string)) ; C code could read this
   (%ephemeral-p  nil :type boolean :read-only t)
   ;; This is one of a few different views of a lisp thread:
   ;;  1. the memory space (thread->os_addr in C)
@@ -138,6 +145,10 @@ in future versions."
             :type sb-vm:signed-word)
   #-64-bit (internal-real-time)
 
+  (max-stw-pause 0 :type sb-vm:word) ; microseconds
+  (sum-stw-pause 0 :type sb-vm:word) ; "
+  (ct-stw-pauses 0 :type sb-vm:word) ; to compute the avg
+
   ;; On succesful execution of the thread's lambda, a list of values.
   (result 0)
   ;; The completion condition _could_ be manifested as a condition var, but a difficulty
@@ -152,19 +163,11 @@ in future versions."
 
 (sb-xc:defstruct (foreign-thread
                   (:copier nil)
-                  (:include thread (name "callback"))
+                  (:include thread (%name "callback"))
                   (:constructor make-foreign-thread ())
                   (:conc-name "THREAD-"))
   "Type of native threads which are attached to the runtime as Lisp threads
 temporarily.")
-
-#+(and sb-safepoint-strictly (not win32))
-(sb-xc:defstruct (signal-handling-thread
-                  (:copier nil)
-                  (:include foreign-thread)
-                  (:conc-name "THREAD-"))
-  "Asynchronous signal handling thread."
-  (signal-number nil :type integer))
 
 (declaim (sb-ext:freeze-type mutex thread))
 #-sb-xc-host

@@ -31,6 +31,8 @@
   (assert (/= (sxhash #*1010) (sxhash #*0101))))
 
 ;;; This test supposes that no un-accounted-for consing occurs.
+;;; But now that we have to two regions for allocation, it's not necessarily
+;;; the case that any given allocation bumps the mixed-region free pointer.
 (with-test (:name :address-based-hash-counter :skipped-on :interpreter)
   ;; It doesn't particularly matter what ADDRESS-BASED-COUNTER-VAL returns,
   ;; but it's best to verify the assumption that each cons bumps the count
@@ -38,8 +40,10 @@
   ;; hashes.
   (let ((win 0) (n-trials 10) (prev (sb-int:address-based-counter-val)))
     (dotimes (i n-trials)
-      (declare (notinline cons)) ; it's flushable, but don't flush it
-      (cons 1 2)
+      (locally
+          (declare (notinline cons sb-sys:int-sap)) ; it's flushable, but don't flush it
+        #+use-cons-region (sb-sys:int-sap #xf00fa) ; 2 words in mixed-region
+        #-use-cons-region (cons 1 2))
       (let ((ptr (sb-int:address-based-counter-val)))
         (when (= ptr (1+ prev))
           (incf win))
@@ -52,7 +56,7 @@
         (unsafely-set-bit
          (compile nil
                   '(lambda (bv i val)
-                     (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+                     (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                      (setf (bit bv i) val)))))
     (replace bv '(1 0 1 1 1))
     (let ((hash (sxhash bv)))
@@ -187,8 +191,8 @@
     (dotimes (i 10)
       (setf (gethash (cons 'foo (gensym)) tbl) 1))
     (gc)
-    ;; The need-to-rehash bit is set
-    (assert (eql 1 (svref (sb-impl::hash-table-pairs tbl) 1)))
+    ;; Set the need-to-rehash bit
+    (setf (svref (sb-impl::hash-table-pairs tbl) 1) 1)
     (clrhash tbl)
     ;; The need-to-rehash bit is not set
     (assert (eql 0 (svref (sb-impl::hash-table-pairs tbl) 1)))))
@@ -223,7 +227,8 @@
 
 (with-test (:name (hash-table :custom-hashfun-with-standard-test))
   (flet ((kv-flag-bits (ht)
-           (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))))
+           (ash (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))
+                (- sb-vm:array-flags-data-position))))
     ;; verify that EQ hashing on symbols is address-sensitive
     (let ((h (make-hash-table :test 'eq)))
       (setf (gethash 'foo h) 1)
@@ -252,7 +257,9 @@
   (sb-int:named-let chain ((index (sb-impl::hash-table-next-free-kv tbl)))
     (when (plusp index)
       (nconc (list index)
-             (chain (aref (sb-impl::hash-table-next-vector tbl) index))))))
+             (if (< index
+                    (sb-impl::kv-vector-high-water-mark (sb-impl::hash-table-pairs tbl)))
+                 (chain (aref (sb-impl::hash-table-next-vector tbl) index)))))))
 
 (defvar *tbl* (make-hash-table :weakness :key))
 
@@ -261,7 +268,8 @@
 ;;; which has two different freelists - one of cells that REMHASH has made available
 ;;; and one of cells that GC has marked as empty. Since we no longer inhibit GC
 ;;; during table operations, we need to give GC a list of its own to manipulate.
-(with-test (:name (hash-table :gc-smashed-cell-list))
+(with-test (:name (hash-table :gc-smashed-cell-list)
+                  :broken-on :mark-region-gc)
   (flet ((f ()
            (dotimes (i 20000) (setf (gethash i *tbl*) (- i)))
            (setf (gethash (cons 1 2) *tbl*) 'foolz)
@@ -338,12 +346,12 @@
   (test-this-object 'equal (find-class 'class)))
 
 (with-test (:name :remhash-eq-comparable-in-equalp-table)
-  ;; EQUALP tables worked a little better, because more objects have
-  ;; are hashed non-address-sensitively by EQUALP-HASH relative to EQUAL-HASH,
+  ;; EQUALP tables worked a little better, because more objects are
+  ;; hashed non-address-sensitively by EQUALP-HASH relative to EQUAL-HASH,
   ;; and those objects have comparators that descend.
   ;; However, there are still some things hashed by address:
   (test-this-object 'equalp (make-weak-pointer "bleep"))
-  (test-this-object 'equalp (sb-kernel::find-fdefn 'cons))
+  (test-this-object 'equalp (sb-int:find-fdefn '(setf car)))
   (test-this-object 'equalp #'car)
   (test-this-object 'equalp (constantly 5))
   (test-this-object 'equal (sb-sys:int-sap 0)))
@@ -355,23 +363,22 @@
 (with-test (:name :sxhash-on-layout)
   (dolist (x '(pathname cons array))
     (let ((l (sb-kernel:find-layout x)))
-      (assert (= (sxhash l) (sb-kernel::layout-clos-hash l))))))
+      (assert (= (sxhash l) (sb-kernel:layout-clos-hash l))))))
 
 (with-test (:name :equalp-table-fixnum-equal-to-float)
   (let ((table (make-hash-table :test #'equalp)))
     (assert (eql (setf (gethash 3d0 table) 1)
                  (gethash 3   table)))))
 
+;;; Check that hashing a stringlike thing which is possibly NIL uses
+;;; a specialized hasher (after prechecking for NIL via the transform).
 (with-test (:name :transform-sxhash-string-and-bv)
-  (let ((f (compile
-            nil
-            '(lambda (x y)
-               (logxor (ash (sxhash (truly-the (or string null) x)) -3)
-                       (sxhash (truly-the (or bit-vector null) y))))))
-        (fdefn1 (sb-kernel::find-fdefn 'sb-kernel:%sxhash-string))
-        (fdefn2 (sb-kernel::find-fdefn 'sb-kernel:%sxhash-bit-vector)))
-    (every (lambda (x) (member x `(,fdefn1 ,fdefn2)))
-           (ctu:find-code-constants f))))
+  (dolist (case `((bit-vector sb-kernel:%sxhash-bit-vector)
+                  (string sb-kernel:%sxhash-string)
+                  (simple-bit-vector sb-kernel:%sxhash-simple-bit-vector)
+                  (simple-string sb-kernel:%sxhash-simple-string)))
+    (let ((f `(lambda (x) (sxhash (truly-the (or null ,(car case)) x)))))
+      (assert (equal (ctu:ir1-named-calls f) (cdr case))))))
 
 (with-test (:name :sxhash-on-displaced-string
             :fails-on :sbcl)
@@ -397,3 +404,128 @@
     ;; and it's extremely dubious that we're totally silent here.
     ;; Also the same issue exists with bit-vectors.
     (assert-error (sxhash displaced-string))))
+
+(with-test (:name :array-psxhash-non-consing :skipped-on :interpreter
+            :fails-on :ppc64)
+   (let ((a (make-array 1000 :element-type 'double-float
+                        :initial-element (+ 0d0 #+(or arm64 x86-64)
+                                                1d300))))
+     (ctu:assert-no-consing (sb-int:psxhash a))))
+
+(with-test (:name :array-psxhash)
+  (let ((table (make-hash-table :test 'equalp)))
+    (let ((x (vector 1.0d0 1.0d0))
+          (y (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 1.0d0))))
+      (setf (gethash x table) t)
+      (assert (gethash y table)))))
+
+
+#|
+;;; Our SXHASH has kinda bad behavior on 64-bit fixnums.
+;;; I wonder if we should try to hash fixnum better for users.
+;;; Example:
+* (dotimes (i 20)
+    (let ((a (+ sb-vm:dynamic-space-start (* i 32768))))
+      (format t "~4d ~x ~b~%" i a (sxhash a))))
+   0 1000000000 1000010010001101110100101010000110101100010111010111001001010
+   1 1000008000 1000010010001101110100101010000110101100000111110111001001010
+   2 1000010000 1000010010001101110100101010000110101100110110010111001001010
+   3 1000018000 1000010010001101110100101010000110101100100110110111001001010
+   4 1000020000 1000010010001101110100101010000110101101010101010111001001010
+   5 1000028000 1000010010001101110100101010000110101101000101110111001001010
+   6 1000030000 1000010010001101110100101010000110101101110100010111001001010
+   7 1000038000 1000010010001101110100101010000110101101100100110111001001010
+   8 1000040000 1000010010001101110100101010000110101110010011010111001001010
+   9 1000048000 1000010010001101110100101010000110101110000011110111001001010
+  10 1000050000 1000010010001101110100101010000110101110110010010111001001010
+  11 1000058000 1000010010001101110100101010000110101110100010110111001001010
+  12 1000060000 1000010010001101110100101010000110101111010001010111001001010
+  13 1000068000 1000010010001101110100101010000110101111000001110111001001010
+  14 1000070000 1000010010001101110100101010000110101111110000010111001001010
+  15 1000078000 1000010010001101110100101010000110101111100000110111001001010
+  16 1000080000 1000010010001101110100101010000110101000011111010111001001010
+  ...
+|#
+(with-test (:name :fixnum-hash-with-more-entropy)
+  (flet ((try (hasher)
+           (let (hashes)
+             (dotimes (i 20)
+               (let* ((a (+ #+64-bit sb-vm:dynamic-space-start
+                            #-64-bit #xD7C83000
+                            (* i 32768)))
+                      (hash (funcall hasher a)))
+                 ;; (format t "~4d ~x ~v,'0b~%" i a sb-vm:n-word-bits hash)
+                 (push hash hashes)))
+             ;; Try some 4-bit subsequences of the hashes
+             ;; as various positions and make sure that there
+             ;; are none that match for all inputs.
+             ;; For 64-bit machines, SXHASH yields complete overlap
+             ;; of all the test cases at various positions.
+             ;; 32-bit doesn't seem to suffer from this.
+             (dotimes (position (- sb-vm:n-fixnum-bits 4))
+               (let ((field
+                      (mapcar (lambda (x) (ldb (byte 4 position) x))
+                              hashes)))
+                 ;; (print `(,position , (length (delete-duplicates field))))
+                 (when #-64-bit t #+64-bit (not (eq hasher 'sxhash))
+                   (assert (>= (length (remove-duplicates field)) 8))))))))
+    (try 'sxhash)
+    (try 'sb-int:murmur-hash-word/fixnum)))
+
+;;; Ensure that all layout-clos-hash values have a 1 somewhere
+;;; such that LOGANDing any number of nonzero hashes is nonzero.
+(with-test (:name :layout-hashes-constant-1-bit)
+  (let ((combined most-positive-fixnum))
+    (maphash (lambda (classoid layout)
+               (declare (ignore classoid))
+               (let ((hash (sb-kernel:layout-clos-hash layout)))
+                 (setq combined (logand combined hash))))
+             (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't)))
+    (assert (/= 0 combined))))
+
+(defun c-murmur-fmix (word)
+  (declare (type sb-vm:word word))
+  (alien-funcall (extern-alien #+64-bit "murmur3_fmix64"
+                               #-64-bit "murmur3_fmix32"
+                               (function unsigned unsigned))
+                 word))
+(compile 'c-murmur-fmix)
+;;; Assert that the Lisp translation of the C murmur hash matches.
+;;; This is slightly redundant with the :ADDRESS-BASED-SXHASH-GCING test,
+;;; though this one is a strictly a unit test of the hashing function,
+;;; and the other is a test that GC does the right thing.
+;;; So it's not a bad idea to have both.
+(defun murmur-compare (random-state n-iter)
+  (let ((limit (1+ sb-ext:most-positive-word)))
+    (loop repeat (the fixnum n-iter)
+          do
+       (let* ((n (random limit random-state))
+              (lisp-hash (sb-impl::murmur3-fmix-word n))
+              (c-hash (c-murmur-fmix n)))
+         (assert (= lisp-hash c-hash))))))
+(compile 'murmur-compare)
+
+(with-test (:name :mumur-hash-compare)
+  (murmur-compare (make-random-state t) 100000))
+
+(with-test (:name :sap-hash)
+  (assert (/= (sxhash (sb-sys:int-sap #x1000))
+              (sxhash (sb-sys:int-sap 0))))
+  #-interpreter
+  (let ((list-of-saps
+          (loop for i below 1000 collect (sb-sys:int-sap i))))
+    (ctu:assert-no-consing
+        (opaque-identity
+         (let ((foo 0))
+           (dolist (sap list-of-saps foo)
+             (setq foo (logxor foo (sxhash sap)))))))))
+
+(with-test (:name :c-prefuzz-hash-table-hash :skipped-on (:not :64-bit))
+  (dotimes (i 100000)
+    (let* ((h0 (random (1+ most-positive-fixnum)))
+           (h1 (sb-impl::prefuzz-hash h0))
+           (c-h1 (alien-funcall (extern-alien "prefuzz_ht_hash"
+                                              (function unsigned unsigned))
+                                (sb-kernel:get-lisp-obj-address h0))))
+      (unless (= h1 c-h1)
+        (format t "~16x ~x ~x~%" h0 h1 c-h1)))))

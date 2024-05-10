@@ -1,16 +1,5 @@
 (in-package "SB-X86-64-ASM")
 
-(defun get-avx2 (number)
-  (svref (load-time-value
-          (coerce (loop for i from 0 below 16
-                        collect (!make-reg (!make-avx2-id i)))
-                  'vector)
-          t)
-         number))
-
-(defun is-avx2-id-p (reg-id)
-  (= (ldb (byte 3 0) reg-id) 3))
-
 (define-arg-type ymmreg
   :prefilter #'prefilter-reg-r
   :printer #'print-ymmreg)
@@ -228,12 +217,14 @@
                0
                1))
          (xmm-size (r)
-           (cond ((is-avx2-id-p (reg-id r))
+           (cond ((is-ymm-id-p (reg-id r))
                   1)
                  ((xmm-register-p r)
                   0))))
-    (let ((l (cond (l)
-                   (reg
+    (let ((l (cond ((eq l :from-thing)
+                    (xmm-size thing))
+                   (l)
+                   ((xmm-register-p reg)
                     (xmm-size reg))
                    ((xmm-register-p thing)
                     (xmm-size thing))
@@ -528,13 +519,15 @@
   (def vaesdeclast #x66 #xdf #x0f38))
 
 ;;; Two arg instructions
-(macrolet ((def (name prefix opcode &optional (opcode-prefix #x0F))
+(macrolet ((def (name prefix opcode &optional (opcode-prefix #x0F) l)
              `(define-instruction ,name (segment dst src)
                 ,@(avx2-inst-printer-list 'ymm-ymm/mem prefix opcode
                                           :opcode-prefix opcode-prefix)
                 (:emitter
                  (emit-avx2-inst segment src dst ,prefix ,opcode
-                                 :opcode-prefix ,opcode-prefix)))))
+                                 :opcode-prefix ,opcode-prefix
+                                 ,@(and l
+                                       `(:l ,l)))))))
   ;; moves
   (def vmovshdup #xf3 #x16)
   (def vmovsldup #xf3 #x12)
@@ -551,13 +544,13 @@
   ;; conversion
   (def vcvtdq2pd #xf3 #xe6)
   (def vcvtdq2ps nil  #x5b)
-  (def vcvtpd2dq #xf2 #xe6)
-  (def vcvtpd2ps #x66 #x5a)
+  (def vcvtpd2dq #xf2 #xe6 #x0F :from-thing)
+  (def vcvtpd2ps #x66 #x5a #x0F :from-thing)
   (def vcvtps2dq #x66 #x5b)
   (def vcvtps2pd nil  #x5a)
   (def vcvtsd2ss #xf2 #x5a)
   (def vcvtss2sd #xf3 #x5a)
-  (def vcvttpd2dq #x66 #xe6)
+  (def vcvttpd2dq #x66 #xe6 #x0F :from-thing)
   (def vcvttps2dq #xf3 #x5b)
 
   (def vptest #x66 #x17 #x0f38)
@@ -580,6 +573,31 @@
   (def vpmovzxwd #x66 #x33 #x0f38)
   (def vpmovzxwq #x66 #x34 #x0f38)
   (def vpmovzxdq #x66 #x35 #x0f38))
+
+(macrolet ((def (name prefix)
+             `(define-instruction ,name (segment dst src pattern)
+                ,@(avx2-inst-printer-list
+                   'ymm-ymm/mem-imm prefix #x70
+                   :printer '(:name :tab reg ", " reg/mem ", " imm))
+                (:emitter
+                 (emit-avx2-inst segment dst src ,prefix #x70
+                                 :remaining-bytes 1)
+                 (emit-byte segment pattern)))))
+  (def vpshufd  #x66)
+  (def vpshufhw #xf3)
+  (def vpshuflw #xf2))
+
+(macrolet ((def (name prefix)
+             `(define-instruction ,name (segment dst src src2 pattern)
+                ,@(avx2-inst-printer-list
+                   'ymm-ymm/mem-imm prefix #xc6)
+                (:emitter
+                 (emit-avx2-inst segment src2 dst ,prefix #xc6
+                                 :vvvv src
+                                 :remaining-bytes 1)
+                 (emit-byte segment pattern)))))
+  (def vshufpd #x66)
+  (def vshufps nil))
 
 (macrolet
     ((def (name prefix opcode)
@@ -739,14 +757,12 @@
                 (:emitter
                  (cond ((and (xmm-register-p dst)
                              (ea-p src))
-                        (emit-avx2-inst segment dst src ,prefix #x10 :l 0))
+                        (emit-avx2-inst segment src dst ,prefix #x10 :l 0))
                        ((xmm-register-p dst)
-                        (emit-avx2-inst segment dst src2 ,prefix #x10 :vvvv src
-                                                                      :l 0))
+                        (emit-avx2-inst segment src2 dst ,prefix #x10 :vvvv src :l 0))
                        (t
                         (aver (xmm-register-p src))
-                        (emit-avx2-inst segment src dst ,prefix #x11
-                                        :l 0)))))))
+                        (emit-avx2-inst segment dst src ,prefix #x11 :l 0)))))))
   (def vmovsd #xf2)
   (def vmovss #xf3))
 
@@ -983,18 +999,21 @@
                                  :remaining-bytes 1)
                  (emit-byte segment imm)))))
   (def vpermpd #x66 #x01)
-  (def vpermpq #x66 #x00))
+  (def vpermq #x66 #x00))
 
-(define-instruction vpermps (segment dst src src2)
-  (:emitter
-   (emit-avx2-inst segment src2 dst #x66 #x16
-                   :opcode-prefix #x0f38
-                   :vvvv src
-                   :w 0 :l 1))
-  . #.(avx2-inst-printer-list 'ymm-ymm/mem #x66 #x16
-                              :w 0 :l 1
-                              :nds t
-                              :opcode-prefix #x0f38))
+(macrolet ((def (name op)
+             `(define-instruction ,name (segment dst src src2)
+                ,@(avx2-inst-printer-list 'ymm-ymm/mem #x66 op
+                                          :w 0 :l 1
+                                          :nds t
+                                          :opcode-prefix #x0f38)
+                (:emitter
+                 (emit-avx2-inst segment src2 dst #x66 ,op
+                                 :opcode-prefix #x0f38
+                                 :vvvv src
+                                 :w 0 :l 1)))))
+  (def vpermps #x16)
+  (def vpermd #x36))
 
 (macrolet ((def (name op op-imm)
              `(define-instruction ,name (segment dst src src2/imm)
@@ -1096,11 +1115,11 @@
                                  :w ,w
                                  :l ,(ecase sizing
                                        ((xmm/ymm-vmx/y xmm/ymm-vmx)
-                                        `(if (is-avx2-id-p (reg-id dst))
+                                        `(if (is-ymm-id-p (reg-id dst))
                                              1
                                              0))
                                        (xmm-vmx/y
-                                        `(if (eq (sc-name (tn-sc (ea-index vm))) 'avx2-reg)
+                                        `(if (eq (sc-name (tn-sc (ea-index vm))) 'ymm-reg)
                                              1
                                              0)))
                                  :vm t)))))
@@ -1204,3 +1223,21 @@
                               :w 0
                               :opcode-prefix #x0f3a
                               :printer '(:name :tab reg/mem ", " reg ", " imm)))
+
+(define-instruction xsave (segment dst)
+  (:printer ext-reg/mem-no-width ((op '(#xae 4))))
+  (:emitter
+   (aver (not (register-p dst)))
+   (emit-prefixes segment dst nil :do-not-set)
+   (emit-byte segment #x0F)
+   (emit-byte segment #xAE)
+   (emit-ea segment dst 4)))
+
+(define-instruction xrstor (segment dst)
+  (:printer ext-reg/mem-no-width ((op '(#xae 5))))
+  (:emitter
+   (aver (not (register-p dst)))
+   (emit-prefixes segment dst nil :do-not-set)
+   (emit-byte segment #x0F)
+   (emit-byte segment #xAE)
+   (emit-ea segment dst 5)))

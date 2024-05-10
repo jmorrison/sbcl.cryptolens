@@ -13,24 +13,23 @@
 
 
 (defconstant-eqx c-saved-registers
-    '#.`(,lip-offset 8 9 ,@(loop for i from 18 to 27 collect i))
+  `(1 8 9 ,@(loop for i from 18 to 27 collect i))
   #'equal)
 
 (defconstant-eqx c-unsaved-registers
-    '#.`(,lip-offset
-         ,@(loop for i from 5 to 7 collect i)
-         ,@(loop for i from 10 to 17 collect i)
-         ,@(loop for i from 28 to 31 collect i))
+  `(1 ,@(loop for i from 5 to 7 collect i)
+      ,@(loop for i from 10 to 17 collect i)
+      ,@(loop for i from 28 to 31 collect i))
   #'equal)
 
 (defconstant-eqx c-saved-float-registers
-    '#.`(8 9 ,@(loop for i from 18 to 27 collect i))
+  `(8 9 ,@(loop for i from 18 to 27 collect i))
   #'equal)
 
 (defconstant-eqx c-unsaved-float-registers
-    '#.`(,@(loop for i from 0 to 7 collect i)
-         ,@(loop for i from 10 to 17 collect i)
-         ,@(loop for i from 28 to 31 collect i))
+  `(,@(loop for i from 0 to 7 collect i)
+      ,@(loop for i from 10 to 17 collect i)
+      ,@(loop for i from 28 to 31 collect i))
   #'equal)
 
 (defun make-reg-tn (offset &optional (sc 'any-reg))
@@ -170,13 +169,12 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:temporary (:scs (non-descriptor-reg)) addr)
   (:generator 2
     ;; This probably has to be 3 instructions unless we can put some linkage entries
     ;; near enough to NULL-TN. Would only make a difference when compiling to memory
     ;; since compiling to file has to assume worst case.
-    (inst li addr (make-fixup foreign-symbol :foreign-dataref))
-    (loadw res addr)))
+    (inst li res (make-fixup foreign-symbol :foreign-dataref))
+    (loadw res res)))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg) :target cfunc)
@@ -193,7 +191,7 @@
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
       (move cfunc function)
-      (invoke-asm-routine 'call-into-c)
+      (inst jal ra-tn (make-fixup 'call-into-c :assembly-routine))
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
 

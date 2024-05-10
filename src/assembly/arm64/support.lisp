@@ -11,68 +11,64 @@
 
 (in-package "SB-VM")
 
+(defun invoke-asm-routine (name reg &key tail)
+  (cond ((or (not (boundp '*component-being-compiled*))
+             (sb-c::code-immobile-p *component-being-compiled*))
+         (if tail
+             (inst b (make-fixup name :assembly-routine))
+             (inst bl (make-fixup name :assembly-routine))))
+        (t
+         (load-inline-constant reg `(:fixup ,name :assembly-routine))
+         (if tail
+             (inst br reg)
+             (inst blr reg)))))
+
+(defun load-asm-routine (reg name)
+  (if (or (not (boundp '*component-being-compiled*))
+          (sb-c::code-immobile-p *component-being-compiled*))
+      (inst adr reg (make-fixup name :assembly-routine))
+      (load-inline-constant reg `(:fixup ,name :assembly-routine))))
+
+(defun invoke-foreign-routine (name reg &key tail)
+  (cond ((or (not (boundp '*component-being-compiled*))
+             (sb-c::code-immobile-p *component-being-compiled*))
+         (if tail
+             (inst b (make-fixup name :foreign))
+             (inst bl (make-fixup name :foreign))))
+        (t
+         (load-inline-constant reg `(:fixup ,name :foreign))
+         (if tail
+             (inst br reg)
+             (inst blr reg)))))
+
+(defun load-foreign-symbol (reg name &key dataref)
+  (let ((kind (if dataref :foreign-dataref :foreign)))
+    (if (or (not (boundp '*component-being-compiled*))
+            (sb-c::code-immobile-p *component-being-compiled*))
+        (if dataref
+            (inst ldr reg (make-fixup name kind))
+            (inst adr reg (make-fixup name kind)))
+        (progn
+          (load-inline-constant reg `(:fixup ,name ,kind))
+          (when dataref
+            (loadw reg reg))))))
+
 (defun generate-call-sequence (name style vop options)
   (declare (ignore options vop))
   (ecase style
-    ((:none :raw)
-     (values
-      `((progn
-          ,@(if (eq style :none)
-                `((load-inline-constant tmp-tn '(:fixup ,name :assembly-routine))
-                  (inst br tmp-tn))
-                `((load-inline-constant lr-tn '(:fixup ,name :assembly-routine))
-                  (inst blr lr-tn)))))
-      nil))
-    #+(or)
-    (:full-call
-     (let ((temp (make-symbol "TEMP"))
-           (jump (make-symbol "JUMP"))
-           (nfp-save (make-symbol "NFP-SAVE"))
-           (lra (make-symbol "LRA")))
+    ((:none :raw :full-call-no-return)
+     (let ((lr (gensym)))
        (values
-        `((let ((lra-label (gen-label))
-                (cur-nfp (current-nfp-tn ,vop)))
-            (when cur-nfp
-              (store-stack-tn ,nfp-save cur-nfp))
-            (inst compute-lra-from-code ,lra code-tn lra-label ,temp)
-            (note-next-instruction ,vop :call-site)
-            (inst lr ,jump (make-fixup ',name :assembly-routine))
-            (inst mtlr ,jump)
-            (inst blr)
-            (emit-return-pc lra-label)
-            (note-this-location ,vop :single-value-return)
-            (without-scheduling ()
-              (move csp-tn ocfp-tn)
-              (inst nop))
-            (inst compute-code-from-lra code-tn lra-tn
-                  lra-label ,temp)
-            (when cur-nfp
-              (load-stack-tn cur-nfp ,nfp-save))))
-        `((:temporary (:scs (non-descriptor-reg) :from (:eval 0) :to (:eval 1))
-                      ,temp)
-          (:temporary (:sc descriptor-reg :offset lra-offset
-                           :from (:eval 0) :to (:eval 1))
-                      ,lra)
-          (:temporary (:scs (control-stack) :offset nfp-save-offset)
-                      ,nfp-save)
-          (:temporary (:sc any-reg) ,jump)
-          (:save-p :compute-only)))))))
+        `((progn
+            ,lr
+            ,@(if (eq style :none)
+                  `((invoke-asm-routine ',name tmp-tn :tail t))
+                  `((invoke-asm-routine ',name ,lr)))))
+        `((:temporary (:sc non-descriptor-reg :from (:eval 0) :to (:eval 1) :offset lr-offset)
+                      ,lr)))))))
 
 (defun generate-return-sequence (style)
   (ecase style
     (:raw
-     `((inst br lr-tn)))
-    #+(or)
-    (:full-call
-     `((lisp-return (make-random-tn :kind :normal
-                                    :sc (sc-or-lose 'descriptor-reg )
-                                    :offset lra-offset)
-                    (make-random-tn :kind :normal
-                                    :sc (sc-or-lose 'interior-reg )
-                                    :offset lip-offset)
-                    :offset 2)))
-    (:none)))
-
-#-sb-xc-host ; CONTEXT-REGISTER is not defined at xc-time
-(defun return-machine-address (scp)
-  (context-register scp lr-offset))
+     `((inst ret)))
+    ((:none :full-call-no-return))))

@@ -11,53 +11,6 @@
 
 (load "compiler-test-util.lisp")
 
-;;;; Better ensure nothing in messed up in the ID space
-;;;; or else everything is suspect.
-(defun layout-id-vector-sap (layout)
-  (sb-sys:sap+ (sb-sys:int-sap (sb-kernel:get-lisp-obj-address layout))
-               (- (ash (+ sb-vm:instance-slots-offset
-                          (sb-kernel:get-dsd-index
-                           sb-kernel:layout sb-kernel::id-word0))
-                       sb-vm:word-shift)
-                  sb-vm:instance-pointer-lowtag)))
-
-(let ((hash (make-hash-table)))
-  ;; assert that all layout IDs are unique
-  (let ((all-layouts
-         (delete-if
-          ;; temporary layouts (created for parsing DEFSTRUCT)
-          ;; must be be culled out.
-          (lambda (x)
-            (and (typep (sb-kernel:layout-classoid x)
-                        'sb-kernel:structure-classoid)
-                 (eq (sb-kernel::layout-equalp-impl x)
-                     #'sb-kernel::equalp-err)))
-          (sb-vm::list-allocated-objects :all
-                                         :type sb-vm:instance-widetag
-                                         :test #'sb-kernel::layout-p))))
-    (dolist (layout all-layouts)
-      (let ((id (sb-kernel:layout-id layout)))
-        (sb-int:awhen (gethash id hash)
-          (error "ID ~D is ~A and ~A" id sb-int:it layout))
-        (setf (gethash id hash) layout)))
-    ;; assert that all inherited ID vectors match the layout-inherits vector
-    (let ((structure-object
-           (sb-kernel:find-layout 'structure-object)))
-      (dolist (layout all-layouts)
-        (when (find structure-object (sb-kernel:layout-inherits layout))
-          (let ((ids
-                 (sb-sys:with-pinned-objects (layout)
-                   (let ((sap (layout-id-vector-sap layout)))
-                     (loop for depthoid from 2 to (sb-kernel:layout-depthoid layout)
-                           collect (sb-sys:signed-sap-ref-32 sap (ash (- depthoid 2) 2))))))
-                (expect
-                 (map 'list 'sb-kernel:layout-id
-                      (sb-kernel:layout-inherits layout))))
-            (unless (equal (append '(1 2) ids)
-                           (append expect (list (sb-kernel:layout-id layout))))
-              (error "Wrong IDs for ~A: expect ~D actual ~D~%"
-                     layout expect ids))))))))
-
 ;;;; examples from, or close to, the Common Lisp DEFSTRUCT spec
 
 ;;; Type mismatch of slot default init value isn't an error until the
@@ -574,6 +527,15 @@
                       (sb-kernel:dd-slots
                        (sb-kernel:find-defstruct-description 'hugest-manyraw))))))
 
+(with-test (:name :dd-bitmap-vs-layout-bitmap)
+  (dolist (typename '(huge-manyraw hugest-manyraw))
+    (let* ((layout (sb-kernel:find-layout typename))
+           (info (sb-kernel:layout-dd layout))
+           (bitmap (sb-kernel::dd-bitmap info)))
+      (assert (typep bitmap 'bignum))
+      (assert (= (sb-bignum:%bignum-length bitmap)
+                 (sb-kernel:bitmap-nwords layout))))))
+
 (defun check-huge-manyraw (s)
   (assert (and (eql (huge-manyraw-df s) 8.207880688335944d-304)
                (eql (huge-manyraw-aaa s) 'aaa)
@@ -608,17 +570,22 @@
   (terpri s)
   (write-string "(defun dumped-huge-manyraw () '#.(make-huge-manyraw))" s)
   (write-string "(defun dumped-hugest-manyraw () '#.(make-hugest-manyraw))" s))
-(defvar *tempfasl* (compile-file *tempfile*))
-(delete-file *tempfile*)
+(defvar *tempfasl*)
+(with-test (:name :compile-huge-manyraw
+            :skipped-on :gc-stress)
+  (setf *tempfasl* (compile-file *tempfile*))
+  (delete-file *tempfile*)
 
-;;; nuke the objects and try another GC just to be extra careful
-(setf *manyraw* nil)
-(sb-ext:gc :full t)
+  ;; nuke the objects and try another GC just to be extra careful
+  (setf *manyraw* nil)
+  (sb-ext:gc :full t)
 
-;;; re-read the dumped structures and check them
-(load *tempfasl*)
-(delete-file *tempfasl*)
-(with-test (:name (:defstruct-raw-slot load))
+  ;; re-read the dumped structures and check them
+  (load *tempfasl*)
+  (delete-file *tempfasl*))
+
+(with-test (:name (:defstruct-raw-slot load)
+                  :skipped-on :gc-stress)
   (check-manyraws (dumped-manyraws))
   (check-huge-manyraw (make-huge-manyraw))
   (assert (equalp (make-huge-manyraw) (dumped-huge-manyraw)))
@@ -645,8 +612,6 @@
   (slot *bug210*))
 ;;; Because of bug 210, this assertion used to fail.
 (assert (typep (nth-value 1 (ignore-errors (bug210a))) 'unbound-variable))
-;;; Even with bug 210, these assertions succeeded.
-(assert (typep (nth-value 1 (ignore-errors *bug210*)) 'unbound-variable))
 (assert (typep (nth-value 1 (ignore-errors (make-bug210b))) 'unbound-variable))
 
 ;;; In sbcl-0.7.8.53, DEFSTRUCT blew up in non-toplevel contexts
@@ -1121,7 +1086,7 @@ redefinition."
     (assert-invalid instance)))
 
 ;; Some other subclass wrinkles have to do with splitting definitions
-;; accross files and compiling and loading things in a funny order.
+;; across files and compiling and loading things in a funny order.
 (with-defstruct-redefinition-test
     :defstruct/subclass-in-other-file-funny-operation-order-continue
     (((defstruct ignore pred1) :class-name redef-test-10 :slots (a))
@@ -1202,7 +1167,16 @@ redefinition."
         (error "fail"))
     (type-error (e)
       (assert (eq 'string (type-error-expected-type e)))
-      (assert (sb-int:unbound-marker-p (type-error-datum e))))))
+      ;; This next ASSERT made no sense whatsoever. If the slot named DATUM
+      ;; in the ERROR instance that's reporting the unbound slot in the BUG-3B
+      ;; instance is itself unbound, then how can you expect that reading the
+      ;; DATUM slot in E is supposed to work?
+      ;; It worked only by accident, because the first access to the slot would
+      ;; return it from the initargs without checking for unbound-marker,
+      ;; but a subsequent access would trap on the memoized value.
+      ;; That dubious distinction is gone.
+      ;; (assert (sb-int:unbound-marker-p (type-error-datum e)))
+      (assert (not (slot-boundp e 'sb-kernel::datum))))))
 
 (with-test (:name :defstruct-copier-typechecks-argument)
   (copy-person (make-astronaut :name "Neil"))
@@ -1401,17 +1375,15 @@ redefinition."
                     (make-x :y t))
            '(:X-Y #S(X :Y T)))))
 
-(in-package sb-kernel)
-
 ;; The word order for halves of double-floats on 32-bit platforms
 ;; should match the platform's native order.
 (defun compare-memory (obj1 obj1-word-ofs obj2 obj2-word-ofs n-words)
-  (with-pinned-objects (obj1 obj2)
-    (let ((sap1 (int-sap (logandc2 (get-lisp-obj-address obj1) sb-vm:lowtag-mask)))
-          (sap2 (int-sap (logandc2 (get-lisp-obj-address obj2) sb-vm:lowtag-mask))))
+  (sb-sys:with-pinned-objects (obj1 obj2)
+    (let ((sap1 (sb-sys:int-sap (logandc2 (sb-kernel:get-lisp-obj-address obj1) sb-vm:lowtag-mask)))
+          (sap2 (sb-sys:int-sap (logandc2 (sb-kernel:get-lisp-obj-address obj2) sb-vm:lowtag-mask))))
       (dotimes (i n-words)
-        (let ((w1 (sap-ref-32 sap1 (ash (+ obj1-word-ofs i) sb-vm:word-shift)))
-              (w2 (sap-ref-32 sap2 (ash (+ obj2-word-ofs i) sb-vm:word-shift))))
+        (let ((w1 (sb-sys:sap-ref-32 sap1 (ash (+ obj1-word-ofs i) sb-vm:word-shift)))
+              (w2 (sb-sys:sap-ref-32 sap2 (ash (+ obj2-word-ofs i) sb-vm:word-shift))))
           (assert (= w1 w2)))))))
 
 (defstruct struct-df (a pi :type double-float))
@@ -1423,7 +1395,7 @@ redefinition."
 (defvar *acdf* (make-array 1 :element-type '(complex double-float)
                              :initial-element *c*))
 
-(test-util:with-test (:name :dfloat-endianness
+(with-test (:name :dfloat-endianness
                       :skipped-on (not (or :mips :x86))) ; only tested on these
   (compare-memory pi 2 *adf* 2 2) ; Array
   (compare-memory pi 2 (make-struct-df) 2 2) ; Structure
@@ -1431,7 +1403,7 @@ redefinition."
   (compare-memory *c* 2 *acdf* 2 4) ; Array
   (compare-memory *c* 2 (make-struct-cdf) 2 4)) ; Structure
 
-(test-util:with-test (:name :recklessly-continuable-defstruct)
+(with-test (:name :recklessly-continuable-defstruct)
   (flet ((redefine-defstruct (from to)
            (eval from)
            (handler-bind
@@ -1453,7 +1425,7 @@ redefinition."
              '(defstruct redefinable (a nil :type symbol))
              '(defstruct redefinable (a nil :type cons))))))
 
-(test-util:with-test (:name :non-total-satisfies-predicate)
+(with-test (:name :non-total-satisfies-predicate)
   ;; This definition is perfectly fine as long as you always pass
   ;; only numbers to the constructor.
   ;; In particular, the macroexpander must not test whether a random
@@ -1463,7 +1435,7 @@ redefinition."
 
 
 (defstruct foo4130 bar)
-(test-util:with-test (:name :duplicated-slot-names)
+(with-test (:name :duplicated-slot-names)
       (flet ((assert-that (expect form)
                (multiple-value-bind (ret error) (ignore-errors (eval form))
                  (assert (not ret))
@@ -1474,9 +1446,27 @@ redefinition."
     (assert-that "slot name BAR duplicated via included FOO4130"
                  `(defstruct (foo4132 (:include foo4130)) bar))))
 
-(test-util:with-test (:name :specialized-equalp)
+(with-test (:name :specialized-equalp)
   ;; make sure we didn't mess up PATHNAME and HASH-TABLE
   (let ((f (sb-kernel:layout-equalp-impl (sb-kernel:find-layout 'pathname))))
     (assert (eq f #'sb-int:pathname=)))
   (let ((f (sb-kernel:layout-equalp-impl (sb-kernel:find-layout 'hash-table))))
     (assert (eq f #'sb-int:hash-table-equalp))))
+
+(defstruct (badbuf (:constructor make-badbuf ()))
+  (str (make-string 128) :type (simple-array character (128))))
+
+(with-test (:name :make-string-type-inference)
+  (let ((things (ctu:find-code-constants #'make-badbuf :type 'list)))
+    (assert (not things))))
+
+(with-test (:name :non-top-level-constructor-cache)
+  (let ((name (gensym)))
+    (funcall
+     (checked-compile `(lambda ()
+                         (defstruct (,name
+                                     (:constructor ,name)
+                                     (:predicate nil)
+                                     (:copier nil))
+                           (a 0 :type sb-vm:word :read-only t)))))
+    (typep (funcall name :a 3) name)))

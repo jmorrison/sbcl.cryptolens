@@ -79,6 +79,8 @@
                   (and (or (not (tn-sc arg-tn))
                            (eq (tn-kind arg-tn) :constant))
                        (or
+                        (subsetp (primitive-type-scs (tn-primitive-type tn))
+                                 (primitive-type-scs (tn-primitive-type arg-tn)))
                         (let ((reads (tn-reads tn)))
                           ;; For moves to another moves the SC does
                           ;; not matter, the intermediate SC will
@@ -90,11 +92,7 @@
                                ;; Except for fixnums which may benifit from improved representation selection
                                ;; if there is a way to go through an any-reg "adapter"
                                (not (memq sb-vm:any-reg-sc-number (primitive-type-scs (tn-primitive-type tn))))
-                               (not (memq sb-vm:any-reg-sc-number (primitive-type-scs (tn-primitive-type arg-tn))))))
-                        (subsetp (primitive-type-scs
-                                  (tn-primitive-type tn))
-                                 (primitive-type-scs
-                                  (tn-primitive-type arg-tn))))
+                               (not (memq sb-vm:any-reg-sc-number (primitive-type-scs (tn-primitive-type arg-tn)))))))
                        (let ((leaf (tn-leaf tn)))
                          (or (not leaf)
                              (and
@@ -103,11 +101,10 @@
                               (or
                                (not (cl:symbol-package (leaf-debug-name leaf)))
                                (policy (vop-node vop)
-                                       (or (= speed 3) (< debug 2))))
+                                   (= preserve-single-use-debug-variables 0)))
                               ;; arguments of local functions have hidden write
                               (not (and (lambda-var-p leaf)
-                                        (memq (functional-kind (lambda-var-home leaf))
-                                                   '(nil :optional)))))))
+                                        (functional-kind-eq (lambda-var-home leaf) nil optional))))))
                        arg-tn)))))))
 
 (defun reads-within-block-p (tn block)

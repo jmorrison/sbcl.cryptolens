@@ -12,19 +12,61 @@
 
 (in-package "SB-C")
 
+;;; An entry point is reachable if:
+;;;   - Its home lambda is of KIND :TOPLEVEL.
+;;;   - Its home lambda is LAMBDA-HAS-EXTERNAL-REFERENCES-P true (from
+;;;     COMPILE or possibly other causes).
+;;;   - Its home lambda is either referenced from a reachable block in
+;;;     the same component or referenced from a different component.
+(defun entry-point-reached-p (ep)
+  (declare (type cblock ep))
+  (let ((start-node (block-start-node ep)))
+    (if (bind-p start-node)
+        (let ((fun (bind-lambda start-node)))
+          (or (functional-kind-eq fun toplevel)
+              (lambda-has-external-references-p fun)
+              (let ((component (block-component ep)))
+                (some (lambda (ref)
+                        ;; The REF could have been deleted, in which
+                        ;; case we don't count that as an external
+                        ;; reference from another component.
+                        (and (not (node-to-be-deleted-p ref))
+                             (or (block-flag (node-block ref))
+                                 (not (eq (node-component ref) component)))))
+                      (leaf-refs fun)))
+              (and (functional-kind-eq fun optional)
+                   (flet ((reachable-p (fun)
+                            (some (lambda (ref)
+                                    (and (not (node-to-be-deleted-p ref))
+                                         (block-flag (node-block ref))))
+                                  (leaf-refs fun))))
+                     (let ((optional-dispatch (lambda-optional-dispatch fun)))
+                       (or (reachable-p optional-dispatch)
+                           (reachable-p
+                            (optional-dispatch-main-entry optional-dispatch))))))))
+        (let ((cleanup (block-start-cleanup ep)))
+          (aver cleanup)
+          (block-flag (node-block (cleanup-mess-up cleanup)))))))
+
+(defun number-blocks (component)
+  (let ((num 0))
+    (declare (fixnum num))
+    (do-blocks-backwards (block component :both)
+      (setf (block-number block) (incf num)))))
+
 ;;; Find the DFO for a component, deleting any unreached blocks and
 ;;; merging any other components we reach. We repeatedly iterate over
 ;;; the entry points, since new ones may show up during the walk.
-(declaim (ftype (function (component) (values)) find-dfo))
-(defun find-dfo (component)
+(defun find-dfo (component &optional clean-only)
   (clear-flags component)
   (setf (component-reanalyze component) nil)
   (let ((head (component-head component)))
     (do ()
         ((dolist (ep (block-succ head) t)
            (unless (or (block-flag ep)
-                       (block-to-be-deleted-p ep))
-             (find-dfo-aux ep head component)
+                       (block-to-be-deleted-p ep)
+                       (not (entry-point-reached-p ep)))
+             (find-dfo-aux ep head component clean-only)
              (return nil))))))
   (let ((num 0))
     (declare (fixnum num))
@@ -82,30 +124,24 @@
   (values))
 
 ;;; Do a depth-first walk from BLOCK, inserting ourself in the DFO
-;;; after HEAD. If we somehow find ourselves in another component,
-;;; then we join that component to our component.
-(declaim (ftype (function (cblock cblock component) (values)) find-dfo-aux))
-(defun find-dfo-aux (block head component)
-  (unless (eq (block-component block) component)
-    (join-components component (block-component block)))
+;;; after HEAD.
+(defun find-dfo-aux (block head component &optional mark-only)
   (unless (or (block-flag block) (block-delete-p block))
     (setf (block-flag block) t)
     (dolist (succ (block-succ block))
-      (find-dfo-aux succ head component))
-    (when (component-nlx-info-generated-p component)
-      ;; FIXME: We also need (and do) this walk before physenv
-      ;; analysis, but at that time we are probably not very
-      ;; interested in the actual DF order.
-      ;;
-      ;; TODO: It is probable that one of successors have the same (or
-      ;; similar) set of NLXes; try to shorten the walk (but think
-      ;; about a loop, the only exit from which is non-local).
-      (map-block-nlxes (lambda (nlx-info)
-                         (let ((nle (nlx-info-target nlx-info)))
-                         (find-dfo-aux nle head component)))
-                       block))
-    (remove-from-dfo block)
-    (add-to-dfo block head))
+      (find-dfo-aux succ head component mark-only))
+    (unless mark-only
+      ;; Order local functions after a call to it for constraint propagation
+      (let ((last (block-last block))
+            fun)
+        (when (and (combination-p last)
+                   (eq (combination-kind last) :local)
+                   (functional-kind-eq (setf fun (combination-lambda last))
+                                       nil assignment optional cleanup))
+          (find-dfo-aux (lambda-block fun) head component)))
+
+      (remove-from-dfo block)
+      (add-to-dfo block head)))
   (values))
 
 ;;; This function is called on each block by FIND-INITIAL-DFO-AUX
@@ -128,7 +164,7 @@
 (defun scavenge-home-dependency-graph (block component)
   (declare (type cblock block) (type component component))
   (let ((home-lambda (block-home-lambda block)))
-    (if (eq (functional-kind home-lambda) :deleted)
+    (if (functional-kind-eq home-lambda deleted)
         component
         (let ((home-component (lambda-component home-lambda)))
           (cond ((eq (component-kind home-component) :initial)
@@ -190,20 +226,20 @@
       (let* ((home (node-home-lambda ref))
              (home-kind (functional-kind home))
              (home-externally-visible-p
-               (or (eq home-kind :toplevel)
+               (or (eql home-kind (functional-kind-attributes toplevel))
                    (functional-has-external-references-p home))))
         (unless (or (and home-externally-visible-p
-                         (eq (functional-kind fun) :external))
-                    (eq home-kind :deleted))
+                         (functional-kind-eq fun external))
+                    (eql home-kind (functional-kind-attributes deleted)))
           (res home))))
     (res)))
 
 ;;; If CLAMBDA is already in COMPONENT, just return that
 ;;; component. Otherwise, move the code for CLAMBDA and all lambdas it
-;;; physically depends on (either because of calls or because of
-;;; closure relationships) into COMPONENT, or possibly into another
-;;; COMPONENT that we find to be related. Return whatever COMPONENT we
-;;; actually merged into.
+;;; depends on (either because of calls or because of closure
+;;; relationships) into COMPONENT, or possibly into another COMPONENT
+;;; that we find to be related. Return whatever COMPONENT we actually
+;;; merged into.
 ;;;
 ;;; (Note: The analogous CMU CL code only scavenged call-based
 ;;; dependencies, not closure dependencies. That seems to've been by
@@ -236,7 +272,7 @@
 ;;; already be one.
 (defun dfo-scavenge-dependency-graph (clambda component)
   (declare (type clambda clambda) (type component component))
-  (aver (not (eql (lambda-kind clambda) :deleted)))
+  (aver (not (functional-kind-eq clambda deleted)))
   (let* ((bind-block (node-block (lambda-bind clambda)))
          (old-lambda-component (block-component bind-block))
          (return (lambda-return clambda)))
@@ -266,8 +302,8 @@
                          (dfo-scavenge-dependency-graph (lambda-home clambda)
                                                         res)))
                  (scavenge-possibly-deleted-lambda (clambda)
-                   (unless (or (eql (lambda-kind clambda) :deleted)
-                               (eql (lambda-kind (lambda-home clambda)) :deleted))
+                   (unless (or (functional-kind-eq clambda deleted)
+                               (functional-kind-eq (lambda-home clambda) deleted))
                      (scavenge-lambda clambda)))
                  ;; Scavenge call relationship.
                  (scavenge-call (called-lambda)
@@ -277,8 +313,8 @@
                  ;; CLAMBDA, then the home lambda should be in the
                  ;; same component as CLAMBDA. (sbcl-0.6.13, and CMU
                  ;; CL, didn't do this, leading to the occasional
-                 ;; failure when physenv analysis, which is local to
-                 ;; each component, would bogusly conclude that a
+                 ;; failure when environment analysis, which is local
+                 ;; to each component, would bogusly conclude that a
                  ;; closed-over variable was unused and thus delete
                  ;; it. See e.g. cmucl-imp 2001-11-29.)
                  (scavenge-closure-var (var)
@@ -297,7 +333,7 @@
               (clambda (scavenge-call cc))
               (lambda-var (scavenge-closure-var cc))
               (entry (scavenge-entry cc))))
-          (when (eq (lambda-kind clambda) :external)
+          (when (functional-kind-eq clambda external)
             (mapc #'scavenge-call (find-reference-funs clambda))))
         ;; Voila.
         res)))))
@@ -306,7 +342,7 @@
 ;;; its ENTRIES.
 (defun has-xep-or-nlx (clambda)
   (declare (type clambda clambda))
-  (or (eq (functional-kind clambda) :external)
+  (or (functional-kind-eq clambda external)
       (let ((entries (lambda-entries clambda)))
         (and entries
              (find-if #'entry-exits entries)))))
@@ -315,9 +351,8 @@
 ;;; resulting components. Components with a :TOPLEVEL lambda, but no
 ;;; normal XEPs or potential non-local exits are marked as :TOPLEVEL.
 ;;; If there is a :TOPLEVEL lambda, and also a normal XEP, then we
-;;; treat the component as normal, but also return such components in
-;;; a list as the third value. Components with no entry of any sort
-;;; are deleted.
+;;; treat the component as normal. Components with no entry of any
+;;; sort are deleted.
 (defun separate-toplevelish-components (components)
   (declare (list components))
   (collect ((non-top)
@@ -326,7 +361,7 @@
       (unless (eq (block-next (component-head component))
                   (component-tail component))
         (let* ((funs (component-lambdas component))
-               (has-top (find :toplevel funs :key #'functional-kind))
+               (has-top (find (functional-kind-attributes toplevel) funs :key #'functional-kind))
                (has-external-references
                  (some #'functional-has-external-references-p funs)))
           (cond (;; The FUNCTIONAL-HAS-EXTERNAL-REFERENCES-P concept
@@ -356,62 +391,47 @@
                  (delete-component component))))))
     (values (non-top) (top))))
 
-;;; Given a list of top level lambdas, return
-;;;   (VALUES NONTOP-COMPONENTS TOP-COMPONENTS):
-;;;   NONTOP-COMPONENTS = non-top-level-ish COMPONENTs;
-;;;   TOP-COMPONENTS = top-level-ish COMPONENTs;
+;;; Given a list of top level lambdas, return two lists of components
+;;; representing the actual component division. The first value is the
+;;; non-top-level components, and the second is the top-level ones.
 ;;;
 ;;; We assign the DFO for each component, and delete any unreachable
 ;;; blocks. We assume that the FLAGS have already been cleared.
-(defun find-initial-dfo (toplevel-lambdas)
-  (declare (list toplevel-lambdas))
+;;;
+;;; We iterate over the lambdas in each initial component, trying
+;;; to put each function in its own component, but joining it to
+;;; an existing component if we find that there are references
+;;; between them. Any code that is left in an initial component
+;;; must be unreachable, so we can delete it. Stray links to the
+;;; initial component tail (due to NIL function terminated blocks)
+;;; are moved to the appropriate new component tail.
+(defun find-initial-dfo (top-level-lambdas)
+  (declare (list top-level-lambdas))
   (collect ((components))
-    ;; We iterate over the lambdas in each initial component, trying
-    ;; to put each function in its own component, but joining it to
-    ;; an existing component if we find that there are references
-    ;; between them. Any code that is left in an initial component
-    ;; must be unreachable, so we can delete it. Stray links to the
-    ;; initial component tail (due to NIL function terminated blocks)
-    ;; are moved to the appropriate new component tail.
-    (dolist (toplevel-lambda toplevel-lambdas)
-      (let* ((old-component (lambda-component toplevel-lambda))
-             (old-component-lambdas (component-lambdas old-component))
-             (new-component nil))
-        (aver (member toplevel-lambda old-component-lambdas))
-        (dolist (component-lambda old-component-lambdas)
-          (aver (member (functional-kind component-lambda)
-                        '(:optional :external :toplevel nil :escape
-                                    :cleanup)))
-          (unless new-component
-            (setf new-component (make-empty-component))
-            (setf (component-name new-component)
-                  ;; This isn't necessarily an ideal name for the
-                  ;; component, since it might end up with multiple
-                  ;; lambdas in it, not just this one, but it does
-                  ;; seem a better name than just "<unknown>".
-                  (leaf-debug-name component-lambda)))
-          (let ((res (dfo-scavenge-dependency-graph component-lambda
-                                                    new-component)))
-            (when (eq res new-component)
-              (aver (not (position new-component (components))))
-              (components new-component)
-              (setq new-component nil))))
-        (when (eq (component-kind old-component) :initial)
-          (aver (null (component-lambdas old-component)))
-          (let ((tail (component-tail old-component)))
+    (let ((new (make-empty-component)))
+      (dolist (initial-component (mapcar #'lambda-component top-level-lambdas))
+        (unless (eq (component-kind initial-component) :deleted)
+          (dolist (component-lambda (component-lambdas initial-component))
+            (aver (functional-kind-eq component-lambda
+                                      optional external toplevel nil escape cleanup))
+            (let ((res (dfo-scavenge-dependency-graph component-lambda
+                                                      new)))
+              (when (eq res new)
+                (aver (not (member new (components))))
+                (components new)
+                (setq new (make-empty-component)))))
+          (aver (eq (component-kind initial-component) :initial))
+          (aver (null (component-lambdas initial-component)))
+          (let ((tail (component-tail initial-component)))
             (dolist (pred (block-pred tail))
               (let ((pred-component (block-component pred)))
-                (unless (eq pred-component old-component)
+                (unless (eq pred-component initial-component)
                   (unlink-blocks pred tail)
                   (link-blocks pred (component-tail pred-component))))))
-          (delete-component old-component))))
+          (delete-component initial-component))))
 
     ;; When we are done, we assign DFNs.
-    (dolist (component (components))
-      (let ((num 0))
-        (declare (fixnum num))
-        (do-blocks-backwards (block component :both)
-          (setf (block-number block) (incf num)))))
+    (mapc #'number-blocks (components))
 
     ;; Pull out top-level-ish code.
     (separate-toplevelish-components (components))))
@@ -421,10 +441,10 @@
   (declare (type clambda result-lambda lambda))
 
   ;; Delete the lambda, and combine the LETs and entries.
-  (setf (functional-kind lambda) :deleted)
+  (setf (functional-kind lambda) (functional-kind-attributes deleted))
   (dolist (let (lambda-lets lambda))
     (setf (lambda-home let) result-lambda)
-    (setf (lambda-physenv let) (lambda-physenv result-lambda))
+    (setf (lambda-environment let) (lambda-environment result-lambda))
     (push let (lambda-lets result-lambda)))
   (setf (lambda-entries result-lambda)
         (nconc (lambda-entries result-lambda)

@@ -7,13 +7,17 @@
     `(progn
       (export ',name :sb-posix)
       (defclass ,name ,superclasses
+         ;; KLUDGE: Splice out some slot options (they're
+         ;; for the conversion functions, not for DEFCLASS).
         ,(loop for slotd in slots
-               ;; KLUDGE: Splice out :ARRAY-LENGTH options (they're
-               ;; for the conversion functions, not for DEFCLASS).
-               for array-length-option = (member :array-length slotd)
-               collect (append (ldiff slotd array-length-option)
-                               (cddr array-length-option)))
+               collect
+               (let ((slotd (copy-list slotd)))
+                 (dolist (keyword '(:array-length :from-alien) slotd)
+                   (remf (cdr slotd) keyword))))
         ,@options)
+      ;; TODO (maybe): there's no reason to define to-alien routines
+      ;; struct stat, passwd, or group: OS interfaces only ever write
+      ;; into them, never read from them.
       (declaim (inline ,to-alien ,to-protocol))
       (declaim (inline ,to-protocol ,to-alien))
       (defun ,to-protocol (alien &optional instance)
@@ -26,6 +30,7 @@
                 ;;
                 ;; FIXME: baroque construction of intricate fragility
                 for array-length = (getf (cdr slotd) :array-length)
+                for from-alien = (getf (cdr slotd) :from-alien)
                 if array-length
                   collect `(progn
                              (let ((array (make-array ,array-length)))
@@ -37,8 +42,14 @@
                                         (sb-alien:slot alien ',(car slotd))
                                         i)))))
                 else
-                  collect `(setf (slot-value instance ',(car slotd))
-                                 (sb-alien:slot alien ',(car slotd))))
+                  collect (if from-alien
+                              ;; FROM-ALIEN is for any ad-hoc conversions that
+                              ;; SB-ALIEN doesn't automatically handle, such as
+                              ;; char** to list of strings.
+                              `(setf (slot-value instance ',(car slotd))
+                                     (,from-alien (sb-alien:slot alien ',(car slotd))))
+                              `(setf (slot-value instance ',(car slotd))
+                                     (sb-alien:slot alien ',(car slotd)))))
         instance)
       (defun ,to-alien (instance &optional alien)
         (declare (type (or null (sb-alien:alien (* ,alien-type))) alien)
@@ -55,6 +66,8 @@
                                         (sb-alien:slot alien ',(car slotd))
                                         i)
                                        (aref array i)))))
+                ;; N.B., nothing turns out to need a :TO-ALIEN
+                ;; counterpart of :FROM-ALIEN so far.
                 else
                   collect `(setf (sb-alien:slot alien ',(car slotd))
                                  (slot-value instance ',(car slotd)))))
@@ -147,17 +160,25 @@
 (define-call* "write" ssize-t minusp
   (fd file-descriptor) (buf (* t)) (count size-t))
 
-;;; FIXME: to detect errors in readdir errno needs to be set to 0 and
-;;; then checked, like it's done in sb-unix:readdir.
+(declaim (inline null-alien-and-errno-plusp))
+(defun null-alien-and-errno-plusp (alien)
+  (and (null-alien alien) (plusp (get-errno))))
+
+;; Slight wart: READDIR returns a null alien at the end of the
+;; directory; most other SB-POSIX interfaces (e.g., GETENV, GETPWNAM,
+;; GETGRGID, etc) return NIL instead of a null pointer for a non-error
+;; return. This might be the only detail in SB-POSIX that makes a user
+;; reach for SB-ALIEN, but it'd be an incompatible change to do
+;; anything about it.
 #+inode64
 (define-call ("readdir" :c-name "readdir$INODE64" :options :largefile)
   (* dirent)
-  not
+  null-alien-and-errno-plusp
   (dir (* t)))
 #-inode64
 (define-call (#-netbsd "readdir" #+netbsd "_readdir" :options :largefile)
   (* dirent)
-  not
+  null-alien-and-errno-plusp
   (dir (* t)))
 (define-call "closedir" int minusp (dir (* t)))
 ;; need to do this here because we can't do it in the DEFPACKAGE
@@ -232,9 +253,10 @@
   (define-call-internally ioctl-without-arg "ioctl" int minusp
                           (fd file-descriptor) (cmd unsigned-long))
   (define-call-internally ioctl-with-int-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd unsigned-long) (arg int))
+                          (fd file-descriptor) (cmd unsigned-long) &optional (arg int))
   (define-call-internally ioctl-with-pointer-arg "ioctl" int minusp
                           (fd file-descriptor) (cmd unsigned-long)
+                          &optional
                           (arg alien-pointer-to-anything-or-nil))
   (define-entry-point "ioctl" (fd cmd &optional (arg nil argp))
     (if argp
@@ -360,7 +382,7 @@ not supported."
                  ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
                  ;; Do that now so that the forked process has only the main thread
                  ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
-                 (sb-thread::join-pthread-joinables #'identity)
+                 (sb-thread::%dispose-thread-structs)
                  ;; Threads are added to ALL-THREADS before they have an OS thread,
                  ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
                  ;; So we need to go lower-level to sense whether any exist.
@@ -368,7 +390,9 @@ not supported."
       (sb-impl::finalizer-thread-start)
       (error "Cannot fork with multiple threads running."))
     (let ((pid (posix-fork)))
-      #+darwin (when (= pid 0) (darwin-reinit))
+      (when (= pid 0) ; child
+        #+darwin (darwin-reinit)
+        #+mark-region-gc (alien-funcall (extern-alien "thread_pool_init" (function void))))
       #+sb-thread (sb-impl::finalizer-thread-start)
       pid))
   (export 'fork :sb-posix)
@@ -443,14 +467,12 @@ not supported."
  (declaim (inline wait))
  (defun wait (&optional statusptr)
    (declare (type (or null (simple-array (signed-byte 32) (1))) statusptr))
-   (let* ((ptr (or statusptr (make-array 1 :element-type '(signed-byte 32))))
-          (pid (sb-sys:with-pinned-objects (ptr)
-                 (alien-funcall
-                  (extern-alien "wait" (function pid-t (* int)))
-                  (sb-sys:vector-sap ptr)))))
-     (if (minusp pid)
-         (syscall-error 'wait)
-         (values pid (aref ptr 0))))))
+   (with-alien ((wait (function pid-t (* int)) :extern "wait")
+                (status int))
+     (let ((pid (alien-funcall wait (addr status))))
+       (when (minusp pid) (syscall-error 'wait))
+       (when statusptr (setf (aref statusptr 0) status))
+       (values pid status)))))
 
 #-win32
 (progn
@@ -460,15 +482,12 @@ not supported."
    (declare (type (sb-alien:alien pid-t) pid)
             (type (sb-alien:alien int) options)
             (type (or null (simple-array (signed-byte 32) (1))) statusptr))
-   (let* ((ptr (or statusptr (make-array 1 :element-type '(signed-byte 32))))
-          (pid (sb-sys:with-pinned-objects (ptr)
-                 (alien-funcall
-                  (extern-alien "waitpid" (function pid-t
-                                                    pid-t (* int) int))
-                  pid (sb-sys:vector-sap ptr) options))))
-     (if (minusp pid)
-         (syscall-error 'waitpid)
-         (values pid (aref ptr 0)))))
+   (with-alien ((waitpid (function pid-t pid-t (* int) int) :extern "waitpid")
+                (status int))
+     (let ((pid (alien-funcall waitpid pid (addr status) options)))
+       (when (minusp pid) (syscall-error 'waitpid))
+       (when statusptr (setf (aref statusptr 0) status))
+       (values pid status))))
  ;; waitpid macros
  (define-call "wifexited" boolean never-fails (status int))
  (define-call "wexitstatus" int never-fails (status int))
@@ -548,32 +567,146 @@ not supported."
 ;;; group database
 #-(or android win32)
 (define-protocol-class group alien-group ()
-  ((name :initarg :name :accessor group-name)
-   (passwd :initarg :passwd :accessor group-passwd)
-   (gid :initarg :gid :accessor group-gid)))
+  ((name :initarg :name :accessor group-name
+         :documentation "The name of the group.")
+   ;; Note: SUSv4 doesn't require this member
+   (passwd :initarg :passwd :accessor group-passwd
+           :documentation "The group's encrypted password.")
+   (gid :initarg :gid :accessor group-gid
+        :documentation "Numerical group ID.")
+   (mem :initarg :mem :accessor group-mem
+        ;; N.B., omitting any :TO-ALIEN because no alien interface
+        ;; reads from a filled-in struct group.
+        :from-alien sb-int:c-strings->string-list
+        :documentation "A list of strings naming members of the group."))
+  (:documentation
+   "Instances of this class represent entries in the system's group database."))
 
-(defmacro define-obj-call (name arg type conv)
-  #-(or win32 android)
+;; None of the standardized interfaces to the user or group database
+;; is thread-safe or reentrant, at least with respect to getpwent or
+;; getgrent. The following two macros are for users to wrap around all
+;; getpw* or getgr* calls if they want to do things safely. (Note that
+;; on #-sb-thread, this still protects against reentrancy, but doesn't
+;; grab a lock.)
+#-(or android win32)
+(macrolet ((define-database-protection-form (dbname)
+  (let* ((macro-name (intern (format nil "WITH-~A-DATABASE" dbname) :sb-posix))
+         (lock-var (intern (format nil "*~A-DATABASE-LOCK*" dbname) :sb-posix))
+         (lock-name (format nil "~A database lock" dbname))
+         (special-var (intern (format nil "*WITH-~A-DATABASE*" dbname) :sb-posix))
+         (reentrancy-error-message
+          (format nil "~@(~A~) database access is not reentrant." dbname))
+         (assertion (intern (format nil "ASSERT-~A" macro-name) :sb-posix)))
+    #-sb-thread (declare (ignore lock-var lock-name))
+    `(progn
+       #+sb-thread
+       (sb-ext:defglobal ,lock-var
+        (sb-thread:make-mutex :name ,lock-name))
+       (defvar ,special-var nil)
+       (defmacro ,macro-name (&body body)
+         `(progn
+            (when ,',special-var
+              (error ,',reentrancy-error-message))
+            #+sb-thread
+            (sb-thread:with-mutex (,',lock-var)
+             (let ((,',special-var t))
+               ,@body))
+            #-sb-thread
+            (let ((,',special-var t))
+              ,@body)))
+       (defmacro ,assertion (function)
+         `(unless ,',special-var
+            (error "~A may only be called during ~A."
+                    ',function ',',macro-name)))))))
+(define-database-protection-form passwd)
+(define-database-protection-form group))
+
+#-(or win32 android)
+(macrolet ((define-obj-call (name result-type conv with-macro assertion
+                             &optional arg arg-type)
   ;; FIXME: this isn't the documented way of doing this, surely?
   (let ((lisp-name (intern (string-upcase name) :sb-posix)))
     `(progn
-      (export ',lisp-name :sb-posix)
+      ;; Don't export GET/SET/END/??ENT bindings; the iteration
+      ;; macros are less error-prone.
+      ,@(when arg `((export ',lisp-name :sb-posix)))
       (declaim (inline ,lisp-name))
-      (defun ,lisp-name (,arg)
-        (let ((r (alien-funcall (extern-alien ,name ,type) ,arg)))
+      (defun ,lisp-name (,@(when arg `(,arg)))
+        ,@(unless arg
+            `((,assertion ',lisp-name)))
+        (set-errno 0)
+        (let ((r (,@(if arg `(,with-macro) '(progn))
+                    (alien-funcall
+                     (extern-alien
+                      ,name (function ,result-type ,@(when arg-type `(,arg-type))))
+                   ,@(when arg `(,arg))))))
           (if (null-alien r)
-              nil
+              (when (plusp (get-errno))
+                (syscall-error ',lisp-name))
               (,conv r)))))))
+  (define-enumerator-call (name assertion)
+      (let ((lisp-name (intern (string-upcase name) :sb-posix)))
+        `(progn
+           (declaim (inline ,lisp-name))
+           (defun ,lisp-name ()
+             (,assertion ',lisp-name)
+             (alien-funcall (extern-alien ,name (function void))))))))
 
-(define-obj-call "getpwnam" login-name (function (* alien-passwd) (c-string :not-null t))
-                 alien-to-passwd)
-(define-obj-call "getpwuid" uid (function (* alien-passwd) uid-t)
-                 alien-to-passwd)
-(define-obj-call "getgrnam" login-name (function (* alien-group) (c-string :not-null t))
-                 alien-to-group)
-(define-obj-call "getgrgid" gid (function (* alien-group) gid-t)
-                 alien-to-group)
+;; passwd database
+(define-obj-call "getpwnam" (* alien-passwd) alien-to-passwd
+                 with-passwd-database assert-with-passwd-database
+                 login-name (c-string :not-null t))
+(define-obj-call "getpwuid" (* alien-passwd) alien-to-passwd
+                 with-passwd-database assert-with-passwd-database
+                 uid uid-t)
+(define-obj-call "getpwent" (* alien-passwd) alien-to-passwd
+                 with-passwd-database assert-with-passwd-database)
+;; Including these here for thematic grouping.
+(define-enumerator-call "setpwent" assert-with-passwd-database)
+(define-enumerator-call "endpwent" assert-with-passwd-database)
 
+;; Same thing, but for the group database.
+(define-obj-call "getgrnam" (* alien-group) alien-to-group
+                 with-group-database assert-with-group-database
+                 group-name (c-string :not-null t))
+(define-obj-call "getgrgid" (* alien-group) alien-to-group
+                 with-group-database assert-with-group-database
+                 gid gid-t)
+(define-obj-call "getgrent" (* alien-group) alien-to-group
+                 with-group-database assert-with-group-database)
+(define-enumerator-call "setgrent" assert-with-group-database)
+(define-enumerator-call "endgrent" assert-with-group-database)
+) ; end MACROLET
+
+#-(or android win32)
+(macrolet ((define-database-iterator (dbname with set get end)
+  (let* ((name (intern (format nil "DO-~AS" dbname) :sb-posix))
+         (docstring
+          (let ((*print-right-margin* 70))
+            (format
+             nil
+             "~@<Evaluate BODY with ~A bound to successive entries from ~
+              the ~:*~(~A~) database, and return RESULT. ~
+              An implicit block named NIL surrounds the form; ~
+              an implicit TAGBODY surrounds BODY. ~
+              It is unspecified whether ~:*~A is assigned, rebound, or ~
+              destructively modified upon each iteration. ~
+              It is an error to use any operator that accesses the ~
+              ~0@*~A database during the dynamic extent of ~A.~:@>"
+             dbname name))))
+    `(progn
+       (export ',name :sb-posix)
+       (defmacro ,name ((,dbname &optional result) &body body)
+         ,docstring
+         `(,',with
+           (,',set)
+           (do ((,,dbname (,',get) (,',get)))
+               ((null ,,dbname) (,',end) ,result)
+             ,@body)))))))
+  (define-database-iterator passwd with-passwd-database
+                            setpwent getpwent endpwent)
+  (define-database-iterator group with-group-database
+                            setgrent getgrent endgrent))
 
 #-win32
 (define-protocol-class timeval alien-timeval ()
@@ -665,16 +798,13 @@ not supported."
  (declaim (inline pipe))
  (defun pipe (&optional filedes2)
    (declare (type (or null (simple-array (signed-byte 32) (2))) filedes2))
-   (unless filedes2
-     (setq filedes2 (make-array 2 :element-type '(signed-byte 32))))
-   (let ((r (sb-sys:with-pinned-objects (filedes2)
-              (alien-funcall
-               ;; FIXME: (* INT)?  (ARRAY INT 2) would be better
-               (extern-alien "pipe" (function int (* int)))
-               (sb-sys:vector-sap filedes2)))))
-     (when (minusp r)
-       (syscall-error 'pipe)))
-   (values (aref filedes2 0) (aref filedes2 1))))
+   (multiple-value-bind (fd0 fd1)
+       (with-alien ((pipe (function int (array int 2)) :extern "pipe")
+                    (fds (array int 2)))
+         (let ((r (alien-funcall pipe fds)))
+           (if (minusp r) (syscall-error 'pipe) (values (deref fds 0) (deref fds 1)))))
+     (when filedes2 (setf (aref filedes2 0) fd0 (aref filedes2 1) fd1))
+     (values fd0 fd1))))
 
 #-win32
 (define-protocol-class termios alien-termios ()
@@ -834,12 +964,16 @@ not supported."
 ;;; environment
 
 (defun getenv (name)
+  ;; SUSv4 doesn't define any errors for getenv, but some systems do.
+  (set-errno 0)
   (let ((r (alien-funcall
             (extern-alien "getenv" (function (* char) (c-string :not-null t)))
             name)))
     (declare (type (alien (* char)) r))
-    (unless (null-alien r)
-      (cast r c-string))))
+    (if (null-alien r)
+        (when (plusp (get-errno))
+          (syscall-error 'getenv))
+        (cast r c-string))))
 #-win32
 (progn
   (define-call "setenv" int minusp

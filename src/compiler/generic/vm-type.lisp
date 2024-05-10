@@ -27,10 +27,13 @@
 (sb-xc:deftype float-exponent ()
   #-long-float 'double-float-exponent
   #+long-float 'long-float-exponent)
-(sb-xc:deftype float-digits ()
+(sb-xc:deftype %float-digits ()
   #-long-float `(integer 0 ,sb-vm:double-float-digits)
   #+long-float `(integer 0 ,sb-vm:long-float-digits))
-(sb-xc:deftype float-radix () '(integer 2 2))
+
+;;; Better keep this type around just in case we want to port to a machine
+;;; that uses decimal or base 16.
+(sb-xc:deftype %float-radix () '(integer 2 2))
 (sb-xc:deftype float-int-exponent ()
   #-long-float 'double-float-int-exponent
   #+long-float 'long-float-int-exponent)
@@ -42,15 +45,16 @@
 (sb-xc:deftype byte-specifier () 'cons)
 
 ;;; PATHNAME pieces, as returned by the PATHNAME-xxx functions
-(sb-xc:deftype pathname-host () '(or sb-impl::host null))
-(sb-xc:deftype pathname-device ()
+;;; CLHS conformance mandates that these type names not be CL: symbols.
+(sb-xc:deftype sb-impl::%pathname-host () '(or sb-impl::host null))
+(sb-xc:deftype sb-impl::%pathname-device ()
   '(or simple-string (member nil :unspecific :unc)))
-(sb-xc:deftype pathname-directory () 'list)
-(sb-xc:deftype pathname-name ()
+(sb-xc:deftype sb-impl::%pathname-directory () 'list)
+(sb-xc:deftype sb-impl::%pathname-name ()
   '(or simple-string sb-impl::pattern (member nil :unspecific :wild)))
-(sb-xc:deftype pathname-type ()
+(sb-xc:deftype sb-impl::%pathname-type ()
   '(or simple-string sb-impl::pattern (member nil :unspecific :wild)))
-(sb-xc:deftype pathname-version ()
+(sb-xc:deftype sb-impl::%pathname-version ()
   '(or integer (member nil :newest :wild :unspecific)))
 
 (sb-xc:deftype internal-time () `(unsigned-byte ,internal-time-bits))
@@ -63,22 +67,31 @@
 (sb-xc:deftype bignum-index () `(mod ,maximum-bignum-length))
 (sb-xc:deftype bignum-length () `(mod ,(1+ maximum-bignum-length)))
 
+(sb-xc:deftype half-bignum-element-type () `(unsigned-byte ,(/ sb-vm:n-word-bits 2)))
+(sb-xc:deftype half-bignum-index () `(mod ,(* maximum-bignum-length 2)))
+(sb-xc:deftype half-bignum-length () `(mod ,(1+ (* maximum-bignum-length 2))))
+
 ;;; an index into an integer
 (sb-xc:deftype bit-index ()
-  `(integer 0 ,(* (1- (ash 1 (- sb-vm:n-word-bits sb-vm:n-widetag-bits)))
-                  sb-vm:n-word-bits)))
+  `(integer 0 ,(- (* (1+ maximum-bignum-length) sb-vm:n-word-bits) 1)))
 
 
 ;;;; hooks into the type system
 
+;;; Typically the use for UNBOXED-ARRAY is with foreign APIs where we want to
+;;; require that the array being passed has byte nature, and is not SIMPLE-VECTOR.
+;;; But (VECTOR NIL) contains no data, so surely there is no reason for
+;;; passing it to foreign code.
 (sb-xc:deftype unboxed-array (&optional dims)
   (cons 'or (mapcar (lambda (type) `(array ,type ,dims))
-                    '#.(delete t (map 'list 'sb-vm:saetp-specifier
-                                      sb-vm:*specialized-array-element-type-properties*)))))
+                    '#.(delete-if (lambda (x) (member x '(nil t)))
+                                  (map 'list 'sb-vm:saetp-specifier
+                                       sb-vm:*specialized-array-element-type-properties*)))))
 (sb-xc:deftype simple-unboxed-array (&optional dims)
   (cons 'or (mapcar (lambda (type) `(simple-array ,type ,dims))
-                    '#.(delete t (map 'list 'sb-vm:saetp-specifier
-                                      sb-vm:*specialized-array-element-type-properties*)))))
+                    '#.(delete-if (lambda (x) (member x '(nil t)))
+                                  (map 'list 'sb-vm:saetp-specifier
+                                       sb-vm:*specialized-array-element-type-properties*)))))
 
 (sb-xc:deftype complex-vector (&optional element-type length)
   `(and (vector ,element-type ,length) (not simple-array)))
@@ -93,18 +106,20 @@
 
 (declaim (ftype (sfunction (ctype) ctype) %upgraded-array-element-type))
 (defun %upgraded-array-element-type (eltype)
-  (if (or (eq eltype *wild-type*)
+  (cond ((eq eltype *universal-type*) eltype) ; don't waste time iterating
+        ((or (eq eltype *wild-type*)
           ;; This is slightly dubious, but not as dubious as
           ;; assuming that the upgraded-element-type should be
           ;; equal to T, given the way that the AREF
           ;; DERIVE-TYPE optimizer works.  -- CSR, 2002-08-19
-          (contains-unknown-type-p eltype))
-      *wild-type*
-      (dovector (stype
-                 (literal-ctype-vector *parsed-specialized-array-element-types*)
-                 *universal-type*)
-       (when (csubtypep eltype stype)
-         (return stype)))))
+             (contains-unknown-type-p eltype))
+         *wild-type*)
+        (t
+         (dovector (saetp sb-vm:*specialized-array-element-type-properties*
+                          *universal-type*)
+           (let ((stype (sb-vm:saetp-ctype saetp)))
+             (when (csubtypep eltype stype)
+               (return stype)))))))
 
 (defun upgraded-array-element-type (spec &optional environment)
   "Return the element type that will actually be used to implement an array
@@ -286,7 +301,7 @@
                ((type= type (specifier-type '(complex double-float)))
                 sb-vm:complex-double-float-widetag)
                ((type= type (specifier-type '(complex rational)))
-                sb-vm:complex-widetag)))
+                sb-vm:complex-rational-widetag)))
         #+sb-simd-pack
         ((simd-pack-type-p type)
          (cond ((type= type (specifier-type 'simd-pack))
@@ -363,15 +378,6 @@
 ;; nonzero TLS index due to compiling a dynamic binding of it.
 (defun sb-vm::symbol-always-has-tls-index-p (symbol)
   (not (null (info :variable :wired-tls symbol))))
-
-;;; Return T if SYMBOL will always have a value in its TLS cell that is
-;;; not EQ to NO-TLS-VALUE-MARKER-WIDETAG. As an optimization, set and ref
-;;; are permitted (but not required) to avoid checking for it.
-;;; This will be true of all C interface symbols, 'struct thread' slots,
-;;; and any variable defined by DEFINE-THREAD-LOCAL.
-(defun sb-vm::symbol-always-has-tls-value-p (symbol)
-  (typep (info :variable :wired-tls symbol)
-         '(or (eql :always-thread-local) fixnum)))
 
 #+(or x86 x86-64)
 (defun sb-vm::displacement-bounds (lowtag element-size data-offset)

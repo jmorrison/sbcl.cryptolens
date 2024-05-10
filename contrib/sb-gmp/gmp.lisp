@@ -3,7 +3,8 @@
   ;; we need a few very internal symbols
   (:import-from "SB-BIGNUM"
                 "%BIGNUM-0-OR-PLUSP" "%NORMALIZE-BIGNUM"
-                "NEGATE-BIGNUM-IN-PLACE")
+                "NEGATE-BIGNUM-IN-PLACE"
+                "NEGATE-BIGNUM-NOT-FULLY-NORMALIZED")
   (:export
    ;; bignum integer operations
    #:mpz-add
@@ -82,7 +83,7 @@
 (defun %load-gmp ()
   (or (some #'try-load-shared-object
             #-(or win32 darwin) '("libgmp.so" "libgmp.so.10" "libgmp.so.3")
-            #+darwin '("libgmp.dylib" "libgmp.10.dylib" "libgmp.3.dylib")
+            #+darwin '("libgmp.dylib" "libgmp.10.dylib" "libgmp.3.dylib" #+arm64 "/opt/homebrew/lib/libgmp.dylib")
             #+win32 '("libgmp.dll" "libgmp-10.dll" "libgmp-3.dll"))
       (warn "GMP not loaded.")))
 
@@ -335,13 +336,19 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 ;;; Utility macros for GMP mpz variable and result declaration and
 ;;; incarnation of associated SBCL bignums
 
+(declaim (inline allocate-bignum))
+(defun allocate-bignum (size)
+  (let ((bignum (%allocate-bignum size)))
+    (dotimes (i size bignum)
+      (setf (%bignum-ref bignum i) 0))))
+
 (defmacro with-mpz-results (pairs &body body)
   (loop for (gres size) in pairs
         for res = (gensym "RESULT")
         collect `(when (> ,size sb-kernel:maximum-bignum-length)
                    (error "Size of result exceeds maxim bignum length")) into checks
         collect `(,gres (struct gmpint)) into declares
-        collect `(,res (%allocate-bignum ,size))
+        collect `(,res (allocate-bignum ,size))
           into resinits
         collect `(setf (slot ,gres 'mp_alloc) (%bignum-length ,res)
                        (slot ,gres 'mp_size) 0
@@ -371,7 +378,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
         collect `(,ga (struct gmpint)) into declares
         collect `(,barg (bassert ,a)) into gmpinits
         collect `(,plusp (%bignum-0-or-plusp ,barg (%bignum-length ,barg))) into gmpinits
-        collect `(,arg (if ,plusp ,barg (negate-bignum ,barg nil))) into gmpinits
+        collect `(,arg (if ,plusp ,barg (negate-bignum-not-fully-normalized ,barg))) into gmpinits
         collect `(,length (%bignum-length ,arg)) into gmpinits
         collect arg into vars
         collect `(setf (slot ,ga 'mp_alloc) ,length
@@ -400,7 +407,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
           into resinits
         collect `(when (> ,size (1- sb-kernel:maximum-bignum-length))
                    (error "Size of result exceeds maxim bignum length")) into checks
-        collect `(,res (%allocate-bignum (1+ ,size)))
+        collect `(,res (allocate-bignum (1+ ,size)))
           into resallocs
         collect `(setf ,res (if (minusp (slot ,gres 'mp_size)) ; check for negative result
                                 (- (gmp-z-to-bignum (slot ,gres 'mp_d) ,res ,size))
@@ -421,6 +428,16 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
                            ,@copylimbs)
                          ,@clears
                          (values ,@results)))))))
+
+(defun mpz->bignum (z)
+  "Convert a GMP MPZ Z into a Lisp BIGNUM."
+  (let* ((size (abs (sb-alien:slot z 'mp_size)))
+         (neg? (minusp (sb-alien:slot z 'mp_size)))
+         (bigint (allocate-bignum (1+ size))))
+    (sb-sys:with-pinned-objects (bigint)
+      (* (if neg? -1 1)
+         (gmp-z-to-bignum (slot z 'mp_d) bigint size)))))
+
 
 ;;; function definition and foreign function relationships
 (defmacro defgmpfun (name args &body body)
@@ -745,7 +762,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
             (ad (bassert (denominator ,var)))
             (asign (not (%bignum-0-or-plusp an (%bignum-length an)))))
        (when asign
-           (setf an (negate-bignum an nil)))
+           (setf an (negate-bignum-not-fully-normalized an)))
        (let* ((anlen (%lsize asign an))
               (adlen (%lsize NIL ad)))
            (with-alien ((,mpqvar (struct gmprat)))
@@ -760,6 +777,19 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
                      (bignum-data-sap ad))
                ,@body))))))
 
+(defun mpq->rational (q)
+  "Convert a GMP MPQ into a Lisp RATIONAL."
+  (sb-kernel:build-ratio (mpz->bignum (slot q 'mp_num))
+                         (mpz->bignum (slot q 'mp_den))))
+
+(declaim (inline __gmpq_init))
+(define-alien-routine __gmpq_init void
+  (x (* (struct gmprat))))
+
+(declaim (inline __gmpq_clear))
+(define-alien-routine __gmpq_clear void
+  (x (* (struct gmprat))))
+
 (defmacro defmpqfun (name gmpfun)
   `(progn
      (declaim (sb-ext:maybe-inline ,name))
@@ -771,8 +801,8 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
                            (blength (denominator b)))
                       3)))
          (with-alien ((r (struct gmprat)))
-           (let ((num (%allocate-bignum size))
-                 (den (%allocate-bignum size)))
+           (let ((num (allocate-bignum size))
+                 (den (allocate-bignum size)))
              (sb-sys:with-pinned-objects (num den)
                (setf (slot (slot r 'mp_num) 'mp_size) 0
                      (slot (slot r 'mp_num) 'mp_alloc) size
@@ -787,9 +817,9 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
                       (bd (bassert (denominator b)))
                       (bsign (not (%bignum-0-or-plusp bn (%bignum-length bn)))))
                  (when asign
-                   (setf an (negate-bignum an nil)))
+                   (setf an (negate-bignum-not-fully-normalized an)))
                  (when bsign
-                   (setf bn (negate-bignum bn nil)))
+                   (setf bn (negate-bignum-not-fully-normalized bn)))
                  (let* ((anlen (%lsize asign an))
                         (adlen (%lsize NIL ad))
                         (bnlen (%lsize bsign bn))
@@ -828,13 +858,9 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 
 ;;;; SBCL interface and integration installation
 (macrolet ((def (name original)
-             (let ((special (intern (format nil "*~A-FUNCTION*" name))))
-               `(progn
-                  (declaim (type function ,special)
-                           (inline ,name))
-                  (defvar ,special (symbol-function ',original))
-                  (defun ,name (&rest args)
-                    (apply (load-time-value ,special t) args))))))
+             `(progn
+                (declaim (ftype function ,name))
+                (setf (fdefinition ',name) (fdefinition ',original)))))
   (def orig-mul multiply-bignums)
   (def orig-truncate bignum-truncate)
   (def orig-gcd bignum-gcd)
@@ -870,7 +896,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (mpz-tdiv a b)))
 
 (defun gmp-lcm (a b)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (type integer a b)
            (inline mpz-lcm))
   (if (or (and (typep a 'fixnum)
@@ -890,7 +916,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 
 ;;; rationals
 (defun gmp-two-arg-+ (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-add))
   (if (and (or (typep x 'ratio)
                (typep y 'ratio))
@@ -901,7 +927,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-+ x y)))
 
 (defun gmp-two-arg-- (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-sub))
   (if (and (or (typep x 'ratio)
                (typep y 'ratio))
@@ -912,7 +938,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-- x y)))
 
 (defun gmp-two-arg-* (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-mul))
   (if (and (or (typep x 'ratio)
                (typep y 'ratio))
@@ -923,7 +949,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-* x y)))
 
 (defun gmp-two-arg-/ (x y)
-  (declare (optimize (speed 3) (space 3))
+  (declare (optimize (speed 3) (space 3) (sb-c:verify-arg-count 0))
            (inline mpq-div))
   (if (and (rationalp x)
            (rationalp y)
@@ -933,7 +959,8 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
       (orig-two-arg-/ x y)))
 
 (defun gmp-intexp (base power)
-  (declare (inline mpz-mul-2exp mpz-pow))
+  (declare (inline mpz-mul-2exp mpz-pow)
+           (optimize (sb-c:verify-arg-count 0)))
   (cond
     ((or (and (integerp base)
               (< (abs power) 1000)
@@ -944,7 +971,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
     (t
      (check-type power (integer #.(1+ most-negative-fixnum) #.most-positive-fixnum))
      (cond ((minusp power)
-            (/ (the integer (gmp-intexp base (- power)))))
+            (/ (gmp-intexp base (- power))))
            ((eql base 2)
             (mpz-mul-2exp 1 power))
            ((typep base 'ratio)
@@ -974,8 +1001,7 @@ pre-allocated bignum. The allocated bignum-length must be (1+ COUNT)."
 (defun uninstall-gmp-funs ()
   (sb-ext:without-package-locks
       (macrolet ((def (destination source)
-                   `(setf (fdefinition ',destination)
-                          ,(intern (format nil "*~A-FUNCTION*" source)))))
+                   `(setf (fdefinition ',destination) (fdefinition ',source))))
         (def multiply-bignums orig-mul)
         (def bignum-truncate orig-truncate)
         (def bignum-gcd orig-gcd)

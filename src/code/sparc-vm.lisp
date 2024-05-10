@@ -15,6 +15,9 @@
   "Returns a string describing the type of the local machine."
   "SPARC")
 
+(defun return-machine-address (scp)
+  (+ (context-register scp lip-offset) 8))
+
 
 ;;;; "Sigcontext" access functions, cut & pasted from alpha-vm.lisp.
 ;;;;
@@ -30,13 +33,15 @@
   (* long)
   (context (* os-context-t))
   (index int))
-#+nil
 (defun context-float-register (context index format)
   (declare (type (alien (* os-context-t)) context))
+  (error "context-float-register not working yet? ~S" (list context index format))
+  #+nil
   (coerce (deref (context-float-register-addr context index)) format))
-#+nil
 (defun %set-context-float-register (context index format new)
   (declare (type (alien (* os-context-t)) context))
+  (error "%set-context-float-register not working yet? ~S" (list context index format new))
+  #+nil
   (setf (deref (context-float-register-addr context index))
         (coerce new format)))
 
@@ -63,3 +68,11 @@
          (trap-number (sap-ref-8 pc 3)))
     (declare (type system-area-pointer pc))
     (sb-kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
+
+;; the sparc backend isn't important enough to deserve a fastrem-32 vop
+(defun fastrem-32 (dividend c divisor)
+  (declare (word dividend c divisor) (optimize (safety 0)))
+  (multiple-value-bind (hi lo)
+      (sb-bignum:%multiply (logand (* dividend c) most-positive-word) divisor)
+    (declare (ignore lo))
+    hi))

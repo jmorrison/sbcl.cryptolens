@@ -11,8 +11,10 @@
 
 (in-package "SB-GRAY")
 
+;;; See minor rant in call-next-method about this EVAL-WHEN.
+(eval-when (:compile-toplevel :load-toplevel :execute)
 (defclass stream-function (standard-generic-function) ()
-  (:metaclass sb-mop:funcallable-standard-class))
+  (:metaclass sb-mop:funcallable-standard-class)))
 (defmacro !def-stream-generic (name ll &rest rest)
   `(progn (fmakunbound ',name)
           (defgeneric ,name ,ll (:generic-function-class stream-function) ,@rest)
@@ -150,11 +152,12 @@
     ;; Writing to a string-output-stream adds negligible overhead
     ;; versus the method dispatch for each input character.
     (values (with-output-to-string (s)
-              (loop (let ((ch (stream-read-char stream)))
-                      (case ch
-                        (#\newline (return))
-                        (:eof (return (setq eof t)))
-                        (t (funcall (ansi-stream-out s) s ch))))))
+              (let ((ouch (ansi-stream-cout s)))
+                (loop (let ((ch (stream-read-char stream)))
+                        (case ch
+                          (#\newline (return))
+                          (:eof (return (setq eof t)))
+                          (t (funcall ouch s ch)))))))
             eof)))
 
 (defgeneric stream-clear-input (stream)
@@ -373,6 +376,10 @@
   (:documentation
    "Used by FILE-POSITION. Returns or changes the current position within STREAM."))
 (sb-pcl::!install-cross-compiled-methods 'stream-file-position)
+
+(defmethod stream-file-position ((stream fundamental-stream) &optional position-spec)
+  (declare (ignore stream position-spec))
+  nil)
 
 ;;; This is not in the Gray stream proposal, so it is left here
 ;;; as example code.

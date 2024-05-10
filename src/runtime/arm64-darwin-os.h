@@ -14,14 +14,10 @@ typedef register_t os_context_register_t;
 
 #include "arch-os-generic.inc"
 
-/* #if __DARWIN_UNIX03 */
-/* #define CONTEXT_ADDR_FROM_STEM(stem) (os_context_register_t*)&context->uc_mcontext->__ss.__##stem */
-/* #else */
-/* #define CONTEXT_ADDR_FROM_STEM(stem) &context->uc_mcontext->ss.stem */
-/* #endif /\* __DARWIN_UNIX03 *\/ */
-
 #define RESTORE_FP_CONTROL_FROM_CONTEXT
 void os_restore_fp_control(os_context_t *context);
 void set_thread_stack(void *);
+
+#define OS_CONTEXT_PC(context) context->uc_mcontext->__ss.__pc
 
 #endif /* _ARM64_DARWIN_OS_H */

@@ -182,7 +182,7 @@
 
 ;;; CLOSING a non-new streams should not delete them, and superseded
 ;;; files should be restored.
-(with-test (:name :test-file-for-close-should-not-delete :fails-on :win32)
+(with-test (:name :test-file-for-close-should-not-delete)
   (let ((test (scratch-file-name)))
     (macrolet ((test-mode (mode)
                           `(progn
@@ -369,7 +369,7 @@
 ;;; or slow paths are being taken for each element type.  See the
 ;;; READ-SEQUENCE tests above for more information.
 ;;;
-;;; (trace sb-impl::output-unsigned-byte-full-buffered sb-impl::output-signed-byte-full-buffered sb-impl::output-raw-bytes)
+;;; (trace sb-impl::output-unsigned-byte-full-buffered sb-impl::output-signed-byte-full-buffered)
 
 (with-test (:name (write-sequence type-error))
   (let ((pathname (scratch-file-name))
@@ -700,7 +700,8 @@
 #-win32
 (with-test (:name :overeager-character-buffering :skipped-on :win32)
   (let ((use-threads #+sb-thread t)
-        (proc nil))
+        (proc nil)
+        (sem (sb-thread:make-semaphore)))
     (sb-int:dovector (entry sb-impl::*external-formats*)
       (unless entry (return))
       (with-scratch-file (fifo)
@@ -721,6 +722,7 @@
                               (with-open-file (f fifo :direction :output
                                                       :if-exists :overwrite
                                                       :external-format format)
+                                (sb-thread:wait-on-semaphore sem)
                                 (write-line "foobar" f)
                                 (finish-output f)
                                 (sleep most-positive-fixnum))))))
@@ -737,6 +739,8 @@
               ;; Whether we're using threads or processes, the writer isn't
               ;; injecting any more input, but isn't indicating EOF either.
               (with-open-file (f fifo :direction :input :external-format format)
+                #+sb-thread
+                (sb-thread:signal-semaphore sem)
                 (assert (equal "foobar" (read-line f)))))
           (when proc
             (cond (use-threads (sb-thread:terminate-thread proc))
@@ -814,7 +818,10 @@
                       (n-bin #'mock-fd-stream-n-bin-fun)
                       (cin-buffer
                        (make-array sb-impl::+ansi-stream-in-buffer-length+
-                                   :element-type 'character))))
+                                   :element-type 'character))
+                      (csize-buffer
+                       (make-array sb-impl::+ansi-stream-in-buffer-length+
+                                   :element-type '(unsigned-byte 8)))))
   buffer-chain)
 
 (defun make-mock-fd-stream (buffer-chain)
@@ -822,13 +829,14 @@
   (%make-mock-fd-stream
    (mapcar (lambda (x) (substitute #\Newline #\| x)) buffer-chain)))
 
-(defun mock-fd-stream-n-bin-fun (stream char-buf start count eof-err-p)
+(defun mock-fd-stream-n-bin-fun (stream char-buf size-buf start count eof-err-p)
   (cond ((mock-fd-stream-buffer-chain stream)
          (let* ((chars (pop (mock-fd-stream-buffer-chain stream)))
                 (n-chars (length chars)))
            ;; make sure the mock object is being used as expected.
            (assert (>= count (length chars)))
            (replace char-buf chars :start1 start)
+           (fill size-buf 1 :start start :end (+ start n-chars))
            n-chars))
         (t
          (sb-impl::eof-or-lose stream eof-err-p 0))))

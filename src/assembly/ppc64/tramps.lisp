@@ -129,7 +129,7 @@
     ;; We're back.
     (inst mtctr r3) ; stash the result in a reg that won't be clobbered
     ;; Reload a pointer to this asm routine
-    (inst addi lip null-tn (make-fixup 'alloc-tramp :asm-routine-nil-offset))
+    (inst addi lip null-tn (make-fixup 'alloc-tramp :assembly-routine*))
     ;; Restore the return address from the caller's frame.
     ;; 'sp' hasn't been restored yet, so add our frame size.
     (inst ld r0 machine-sp (+ 32 16))
@@ -154,7 +154,6 @@
 ;;; While we can (and do) hack arch_write_linkage_table_entry
 ;;; to unwrap the descriptor, it would be nice not to have to do that.
 #|
-#+sb-assembling
 (define-assembly-routine (call-into-c (:return-style :none))
     ((:temp reg_zero   signed-reg  0)
      (:temp reg_nsp    signed reg  1)

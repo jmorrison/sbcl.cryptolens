@@ -31,19 +31,20 @@
 ;;; create an arbitrary EA given a stack TN. So, instead do:
 ;;; * mem-to-reg: dword load, shift
 ;;; * mem-to-mem: dword load to temp, shift temp, store as a qword
-(defun untagify-char (dst src shift)
+(defun untagify-char (dst src shift temp)
   (if (and (location= src dst) (stack-tn-p dst)) ; shift right in memory
       (inst shr :dword dst shift)
-      (let ((reg (if (stack-tn-p dst) temp-reg-tn dst)))
-        (32bit-move reg src)
+      (let ((reg (if (stack-tn-p dst) temp dst)))
+        (move reg src :dword)
         (inst shr :dword reg shift)
         (when (stack-tn-p dst) ; store as qword to ensure upper bytes are 0
-          (inst mov dst temp-reg-tn)))))
+          (inst mov dst temp)))))
 (define-vop (move-to-character)
   (:args (x :scs (any-reg descriptor-reg control-stack) :target y :load-if nil))
   (:results (y :scs (character-reg character-stack) :load-if nil))
+  (:temporary (:sc unsigned-reg) temp)
   (:note "character untagging")
-  (:generator 1 (untagify-char y x n-widetag-bits)))
+  (:generator 1 (untagify-char y x n-widetag-bits temp)))
 (define-move-vop move-to-character :move
   (any-reg)
   (character-reg))
@@ -57,9 +58,10 @@
 (define-vop (tagged-char-code) ; valid only if N-FIXNUM-TAG-BITS = 1
   (:args (x :scs (any-reg descriptor-reg control-stack) :target y :load-if nil))
   (:results (y :scs (any-reg descriptor-reg control-stack) :load-if nil))
+  (:temporary (:sc unsigned-reg) temp)
   (:note "character untagging")
   (:generator 1
-    (untagify-char y x (- n-widetag-bits n-fixnum-tag-bits))
+    (untagify-char y x (- n-widetag-bits n-fixnum-tag-bits) temp)
     (when (> n-fixnum-tag-bits 1) (inst and :dword y fixnum-tag-mask))))
 
 ;;; Move an untagged char to a tagged representation.
@@ -68,8 +70,7 @@
   (:results (y :scs (any-reg descriptor-reg)))
   (:note "character tagging")
   (:generator 1
-    (unless (location= x y)
-      (inst mov :dword y x))
+    (move y x :dword)
     (inst shl :dword y n-widetag-bits)
     (inst or :dword y character-widetag)))
 (define-move-vop move-from-character :move
@@ -77,21 +78,20 @@
   (any-reg descriptor-reg))
 
 ;;; Move untagged character values.
-(defun move-raw-char-code (dst src) ; move SRC to DST
+(defun move-raw-char-code (dst src temp) ; move SRC to DST
   (unless (location= src dst)
     ;; Aways store as :qword to stack (storing the upper 32 zero bits) so that
     ;; loading as either :dword or :qword is ok.
     ;; We can see immediate constants here which become untagged integers.
     (inst mov (if (stack-tn-p dst) :qword :dword) dst
-          (cond ((stack-tn-p src)
-                 (inst mov :qword temp-reg-tn src)
-                 temp-reg-tn)
+          (cond ((stack-tn-p src) (inst mov :qword temp src) temp)
                 ((encode-value-if-immediate src nil))))))
 (define-vop (character-move)
   (:args (x :target y :scs (character-reg character-stack) :load-if nil))
   (:results (y :scs (character-reg character-stack) :load-if nil))
+  (:temporary (:sc unsigned-reg) temp)
   (:note "character move")
-  (:generator 0 (move-raw-char-code y x)))
+  (:generator 0 (move-raw-char-code y x temp)))
 (define-move-vop character-move :move
   (character-reg) (character-reg character-stack))
 
@@ -128,7 +128,8 @@
   (:arg-types character)
   (:results (res :scs (unsigned-reg unsigned-stack) :load-if nil))
   (:result-types positive-fixnum)
-  (:generator 1 (move-raw-char-code res ch)))
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 1 (move-raw-char-code res ch temp)))
 
 (define-vop (code-char)
   (:translate code-char)
@@ -137,7 +138,8 @@
   (:arg-types positive-fixnum)
   (:results (res :scs (character-reg character-stack) :load-if nil))
   (:result-types character)
-  (:generator 1 (move-raw-char-code res code)))
+  (:temporary (:sc unsigned-reg) temp)
+  (:generator 1 (move-raw-char-code res code temp)))
 
 ;;; comparison of CHARACTERs
 (define-vop (character-compare)
@@ -171,7 +173,7 @@
   (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
-    (inst cmp :dword x (sb-xc:char-code y))))
+    (inst cmp :dword x (char-code y))))
 
 (define-vop (fast-char=/character/c character-compare/c)
   (:translate char=)
@@ -224,5 +226,5 @@
 ;;; with just the TAGGED-CHAR-CODE vop.
 (defoptimizer (sb-c::vop-optimize move-to-character) (vop)
   (when (and (sb-c:next-vop-is vop 'char-code)
-             (sb-c:next-vop-is (sb-c:vop-next vop) 'move-from-word/fixnum))
+             (sb-c:next-vop-is (sb-c::next-vop vop) 'move-from-word/fixnum))
     (sb-c:replace-vops 3 vop 'tagged-char-code)))

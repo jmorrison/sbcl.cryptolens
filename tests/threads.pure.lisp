@@ -13,6 +13,12 @@
 
 (use-package '("SB-EXT" "SB-THREAD"))
 
+(with-test (:name :dont-print-array
+            :skipped-on (not :sb-thread))
+  (let ((thr (sb-thread:make-thread (lambda () (make-array 100)))))
+    (sb-thread:join-thread thr)
+    (assert (search "#<(SIMPLE-VECTOR" (write-to-string thr)))))
+
 (with-test (:name atomic-update
             :skipped-on (not :sb-thread))
   (let ((x (cons :count 0))
@@ -112,7 +118,7 @@
     (mapc #'join-thread threads)
     (assert (not oops))))
 
-(with-test (:name :semaphore-multiple-waiters :skipped-on (not :sb-thread))
+(with-test (:name :semaphore-multiple-waiters :skipped-on (or (not :sb-thread) :gc-stress))
   (let ((semaphore (make-semaphore :name "test sem")))
     (labels ((make-readers (n i)
                (values
@@ -120,9 +126,10 @@
                       collect
                       (make-thread
                        (lambda ()
-                         (let ((sem semaphore))
-                           (dotimes (s i)
-                             (wait-on-semaphore sem))))
+                         (sb-ext:with-timeout 10
+                           (let ((sem semaphore))
+                             (dotimes (s i)
+                               (wait-on-semaphore sem)))))
                        :name "reader"))
                 (* n i)))
              (make-writers (n readers i)
@@ -134,9 +141,10 @@
                                  collect
                                  (make-thread
                                   (lambda ()
-                                    (let ((sem semaphore))
-                                      (dotimes (s k)
-                                        (signal-semaphore sem))))
+                                    (sb-ext:with-timeout 10
+                                      (let ((sem semaphore))
+                                        (dotimes (s k)
+                                          (signal-semaphore sem)))))
                                   :name "writer"))))
                       (assert (zerop rem))
                       writers)
@@ -153,17 +161,14 @@
                    (values)))))
       (assert
        (eq :ok
-           (handler-case
-               (sb-ext:with-timeout 10
-                 (test 1 1 100)
-                 (test 2 2 10000)
-                 (test 4 2 10000)
-                 (test 4 2 10000)
-                 (test 10 10 10000)
-                 (test 10 1 10000)
-                 :ok)
-             (sb-ext:timeout ()
-               :timeout)))))))
+           (sb-ext:with-timeout 20
+             (test 1 1 100)
+             (test 2 2 10000)
+             (test 4 2 10000)
+             (test 4 2 10000)
+             (test 10 10 10000)
+             (test 10 1 10000)
+             :ok))))))
 
 ;;;; Printing waitqueues
 
@@ -336,14 +341,15 @@
                     (error "oops"))
                 (sb-sys:deadline-timeout () :deadline)))))
 
-(with-test (:name (:condition-wait :timeout :one-thread))
+(with-test (:name (:condition-wait :timeout :one-thread)
+                  :skipped-on :gc-stress)
   (let ((mutex (make-mutex))
         (waitqueue (make-waitqueue)))
     (assert (not (with-mutex (mutex)
                    (condition-wait waitqueue mutex :timeout 0.01))))))
 
 (with-test (:name (:condition-wait :timeout :many-threads)
-            :skipped-on (not :sb-thread))
+            :skipped-on (or (not :sb-thread) :gc-stress))
   (let* ((mutex (make-mutex))
          (waitqueue (make-waitqueue))
          (sem (make-semaphore))
@@ -506,8 +512,15 @@
   (let ((thr
          (make-thread
           (lambda ()
-            (with-open-file (stream (format nil "/proc/self/task/~d/comm"
-                                            (thread-os-tid *current-thread*)))
-              (read-line stream)))
+            (let ((all-names
+                   (loop for filename in (directory "/proc/self/task/*/comm")
+                         collect (with-open-file (stream filename) (read-line stream)))))
+              (setf (thread-name *current-thread*) "newname")
+              (with-open-file (stream (format nil "/proc/self/task/~d/comm"
+                                              (thread-os-tid *current-thread*)))
+                (list (read-line stream) all-names))))
           :name "testme")))
-    (assert (string= (join-thread thr) "testme"))))
+    (let ((results (join-thread thr)))
+      (assert (string= (first results) "newname"))
+      (assert (find "finalizer" (second results) :test 'string=))
+      (assert (find "testme" (second results) :test 'string=)))))

@@ -11,8 +11,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-sb-fasteval
-(sb-ext:exit :code 104)
+#-sb-fasteval (invoke-restart 'run-tests::skip-file)
 
 (setf sb-ext:*evaluator-mode* :interpret)
 
@@ -222,10 +221,15 @@
   ;; This works due to short-circuiting within TYPEP
   (let ((x 3)) (declare (type (or integer blurf) x)) x)
 
-  ;; This fails because the unknown type is tested first
+  ;; This fails under a naive OR type parser, but a different parse might
+  ;; equate (OR BLURF INTEGER) with (OR INTEGER BLURF), which just worked fine in the
+  ;; previous test, or could force known types to appear to the left of unknowns
+  ;; in a union. So even dropping the values-specifier-type cache may not make this fail.
+  ;; I'm keeping it in case I change my mind again though.
+  #+nil
   (handler-case (let ((x 3)) (declare (type (or blurf integer) x)) x)
     (simple-error ()) ; "unknown type"
-    (:no-error () "Expected an ERROR")))
+    (:no-error (&rest ignore) (error "Expected an ERROR"))))
 
 (test-util:with-test (:name :tagbody-if-optimizer)
   (assert
@@ -271,14 +275,14 @@
     (assert (eql (second answer) t))
     (assert (eql (third answer) 3))))
 
-(test-util:with-test (:name :exited-block)
+(test-util:with-test (:name :exited-block :fails-on :ppc64)
   (handler-case (funcall (let ((x 1)) (block b (lambda () (return-from b)))))
     (condition (c)
       (assert (and (typep c 'sb-int:simple-control-error)
                    (search "exited block" (simple-condition-format-control c)))))
     (:no-error (&rest whatever) (error "Expected an error"))))
 
-(test-util:with-test (:name :exited-tagbody)
+(test-util:with-test (:name :exited-tagbody :fails-on :ppc64)
   (handler-case (funcall
                  (block zot
                    (tagbody

@@ -127,9 +127,9 @@
     (declare (dynamic-extent args))
     ;; Construct the concatenation of the required arguments in
     ;; ORIG-ARGS and CNM-ARGS in ARGS.
-    (loop repeat nreq
-          for rest1 on args
+    (loop for rest1 on args
           for arg in orig-args
+          repeat nreq
           do (setf (car rest1) arg)
           finally (loop for rest2 on (rest rest1)
                         for arg in cnm-args
@@ -139,19 +139,25 @@
 (defun %cnm-checker-lambda-list (nreq)
   (append (map-into (make-list (* 2 nreq)) #'gensym) '(&rest rest)))
 
+;;; CALL-NEXT-METHOD argument checker implementation
+
+;;; The eval-when is due to a deficiency in compile-time handling of DEFCLASS which
+;;; doesn't make the new class accessible to the optimizer for MAKE-INSTANCE with a
+;;; quoted symbol as the argument. But we explicitly call pass ERROR = T in
+;;; (SB-PCL::FIND-CLASS-FROM-CELL STREAM-FUNCTION NIL T) dynamically within a
+;;; CLASS-NOT-FOUND handler. What the fsck? How about don't pass ERRORP = T ?
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defclass cnm-args-checker (standard-generic-function)
+  ((%generic-function :initarg :generic-function
+                      :reader cnm-args-checker-generic-function))
+  (:metaclass funcallable-standard-class)))
+
 (defun %make-cnm-checker (generic-function)
   (let ((nreq (generic-function-nreq generic-function)))
     (make-instance 'cnm-args-checker
                    :name nil
                    :lambda-list (%cnm-checker-lambda-list nreq)
                    :generic-function generic-function)))
-
-;;; CALL-NEXT-METHOD argument checker implementation
-
-(defclass cnm-args-checker (standard-generic-function)
-  ((%generic-function :initarg :generic-function
-                      :reader cnm-args-checker-generic-function))
-  (:metaclass funcallable-standard-class))
 
 (defmethod no-applicable-method ((generic-function cnm-args-checker)
                                  &rest args)
@@ -182,7 +188,7 @@
                               (optimize (speed 3) (debug 0) (safety 0)))
                      ',result)
                   nil))
-         (function (compile nil lambda))
+         (function (pcl-compile lambda :safe))
          (specializers (append (method-specializers (first orig-methods))
                                (method-specializers (first cnm-methods))))
          (method (make-instance 'standard-method

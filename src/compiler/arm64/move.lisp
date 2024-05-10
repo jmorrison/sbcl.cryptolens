@@ -11,46 +11,148 @@
 
 (in-package "SB-VM")
 
-(defun load-immediate-word (y val)
-  (cond ((typep val '(unsigned-byte 16))
-         (inst movz y val))
-        ((typep val '(and (signed-byte 16) (integer * -1)))
-         (inst movn y (lognot val)))
-        ((typep (ldb (byte 64 0) (lognot val)) '(unsigned-byte 16))
-         (inst movn y (ldb (byte 64 0) (lognot val))))
-        ((encode-logical-immediate val)
-         (inst orr y zr-tn val))
-        ((loop for i below 64 by 16
-               for part = (ldb (byte 16 i) val)
-               for zeroed = (dpb 0 (byte 16 i) val)
-               thereis (cond ((encode-logical-immediate zeroed)
-                              (inst orr y zr-tn zeroed)
-                              (inst movk y part i)
-                              t))))
-        ((minusp val)
-         (loop with first = t
-               for i below 64 by 16
-               for part = (ldb (byte 16 i) val)
-               unless (= part #xFFFF)
-               do
-               (if (shiftf first nil)
-                   (inst movn y (ldb (byte 16 0) (lognot part)) i)
-                   (inst movk y part i))))
-        (t
-         (loop with first = t
-               for i below 64 by 16
-               for part = (ldb (byte 16 i) val)
-               when (plusp part)
-               do
-               (if (shiftf first nil)
-                   (inst movz y part i)
-                   (inst movk y part i)))))
-  y)
+(defun load-immediate-word (y val &optional single-instruction
+                                            ignore-tag)
+  (let (single-mov
+        ffff-count
+        zero-count
+        (val (ldb (byte 64 0) val)))
+    (flet ((single-mov ()
+             (loop for i below 64 by 16
+                   for part = (ldb (byte 16 i) val)
+                   count (/= part #xFFFF) into ffff
+                   count (plusp part) into zero
+                   finally
+                   (setf ffff-count ffff
+                         zero-count zero
+                         single-mov (or (= ffff 1)
+                                        (= zero 1))))
+             single-mov))
+      (cond ((typep val '(unsigned-byte 16))
+             (inst movz y val)
+             y)
+            ((typep (ldb (byte 64 0) (lognot val)) '(unsigned-byte 16))
+             (inst movn y (ldb (byte 64 0) (lognot val)))
+             y)
+            ((encode-logical-immediate val)
+             (inst orr y zr-tn val)
+             y)
+            ((and (typep val '(unsigned-byte 32))
+                  (cond ((encode-logical-immediate val 32)
+                         (inst orr (32-bit-reg y) zr-tn val)
+                         t)
+                        ((zerop (ldb (byte 16 0) (lognot val)))
+                         (inst movn (32-bit-reg y) (ldb (byte 16 16) (lognot val)) 16)
+                         t)
+                        ((zerop (ldb (byte 16 16) (lognot val)))
+                         (inst movn (32-bit-reg y) (ldb (byte 16 0) (lognot val)))
+                         t)))
+
+             y)
+            ((and ignore-tag
+                  (not (logtest fixnum-tag-mask val))
+                  ;; Contiguous bits are more likely to be better
+                  (logbitp n-fixnum-tag-bits val))
+             (load-immediate-word y (logior val fixnum-tag-mask)
+                                  single-instruction))
+            ((and
+              (not (single-mov))
+              (not single-instruction)
+              (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
+                (flet ((try (i part fill)
+                         (let ((filled (dpb fill (byte 16 i) val)))
+                           (cond ((and (encode-logical-immediate filled)
+                                       (not (and descriptorp
+                                                 (logtest filled fixnum-tag-mask))))
+                                  (inst orr y zr-tn filled)
+                                  (inst movk y part i)
+                                  t)))))
+                  (loop for i below 64 by 16
+                        for part = (ldb (byte 16 i) val)
+                        thereis (or (try i part #xFFFF)
+                                    (try i part 0)
+                                    (try i part
+                                         (ldb (byte 16 (mod (+ i 16) 64))
+                                              val)))))))
+             y)
+            ((and (not single-mov)
+                  (not single-instruction)
+                  (let ((a (ldb (byte 16 0) val))
+                        (b (ldb (byte 16 16) val))
+                        (c (ldb (byte 16 32) val))
+                        (d (ldb (byte 16 48) val)))
+                    (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
+                      (flet ((try (part val1 hole1 val2 hole2)
+                               (let* ((whole (dpb part (byte 16 16) part))
+                                      (whole (dpb whole (byte 32 32) whole)))
+                                 (when (and (encode-logical-immediate whole)
+                                            (not (and descriptorp
+                                                      (logtest whole fixnum-tag-mask))))
+                                   (inst orr y zr-tn whole)
+                                   (inst movk y val1 hole1)
+                                   (inst movk y val2 hole2)
+                                   t))))
+                        (cond ((= a b)
+                               (try a c 32 d 48))
+                              ((= a c)
+                               (try a b 16 d 48))
+                              ((= a d)
+                               (try a b 16 c 32))
+                              ((= b c)
+                               (try b a 0 d 48))
+                              ((= b d)
+                               (try b a 0 c 32))
+                              ((= c d)
+                               (try c a 0 b 16)))))))
+             y)
+            ((and (not single-mov)
+                  (not single-instruction)
+                  (= (ldb (byte 32 0) val)
+                     (ldb (byte 32 32) val))
+                  (let ((a (ldb (byte 16 0) val))
+                        (b (ldb (byte 16 16) val)))
+                    (when (and (/= a #xFFFF 0)
+                               (/= b #xFFFF 0))
+                      (inst movz y a)
+                      (inst movk y b 16)
+                      (inst orr y y (lsl y 32)))))
+             y)
+            ((and (< ffff-count zero-count)
+                  (or single-mov
+                      (not single-instruction)))
+             (loop with first = t
+                   for i below 64 by 16
+                   for part = (ldb (byte 16 i) val)
+                   unless (= part #xFFFF)
+                   do
+                   (if (shiftf first nil)
+                       (inst movn y (ldb (byte 16 0) (lognot part)) i)
+                       (inst movk y part i)))
+             y)
+            ((or single-mov
+                 (not single-instruction))
+             (loop with first = t
+                   for i below 64 by 16
+                   for part = (ldb (byte 16 i) val)
+                   when (plusp part)
+                   do
+                   (if (shiftf first nil)
+                       (inst movz y part i)
+                       (inst movk y part i)))
+             y)))))
 
 (defun add-sub-immediate (x &optional (temp tmp-tn))
   (cond ((not (integerp x))
          x)
         ((add-sub-immediate-p x)
+         x)
+        (t
+         (load-immediate-word temp x))))
+
+(defun ccmp-immediate (x &optional (temp tmp-tn))
+  (cond ((not (integerp x))
+         x)
+        ((typep x '(unsigned-byte 5))
          x)
         (t
          (load-immediate-word temp x))))
@@ -66,10 +168,19 @@
        (load-immediate-word y (fixnumize val)))
       (character
        (let* ((codepoint (char-code val))
-              (encoded-character (dpb codepoint (byte 24 8) character-widetag)))
-         (load-immediate-word y encoded-character)))
+              (tagged (dpb codepoint (byte 24 8) character-widetag)))
+         (load-immediate-word y tagged)))
+      (single-float
+       (let* ((bits (single-float-bits val))
+              (tagged (dpb bits (byte 32 32) single-float-widetag)))
+         (load-immediate-word y tagged)))
       (symbol
-       (load-symbol y val)))))
+       (load-symbol y val))
+      (structure-object
+       (if (eq val sb-lockless:+tail+)
+           (inst add y null-tn (- lockfree-list-tail-value-offset
+                                  nil-value-offset))
+           (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
   ((immediate)
@@ -90,13 +201,7 @@
 
 (define-move-fun (load-constant 5) (vop x y)
   ((constant) (descriptor-reg))
-  (let ((offset (- (tn-byte-offset x) other-pointer-lowtag)))
-    (cond
-      ((ldr-str-offset-encodable offset)
-       (inst ldr y (@ code-tn offset)))
-      (t
-       (load-immediate-word tmp-tn offset)
-       (inst ldr y (@ code-tn tmp-tn))))))
+  (inst load-constant y (tn-byte-offset x)))
 
 (define-move-fun (load-stack 5) (vop x y)
   ((control-stack) (any-reg descriptor-reg))
@@ -124,22 +229,19 @@
 ;;;; The Move VOP:
 (define-vop (move)
   (:args (x :target y
-            :scs (any-reg descriptor-reg)
-            :load-if (not (or (location= x y)
-                              (and (sc-is x immediate)
-                                   (eql (tn-value x) 0))))))
+            :scs (any-reg descriptor-reg zero)
+            :load-if (not (location= x y))))
   (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
   (:generator 0
-    (let ((x (if (and (sc-is x immediate)
-                      (eql (tn-value x) 0))
-                 zr-tn
-                 x)))
-      (cond ((location= x y))
-            ((sc-is y control-stack)
-             (store-stack-tn y x))
-            (t
-             (move y x))))))
+    (cond ((location= x y))
+          ((sc-is y control-stack)
+           (store-stack-tn y x))
+          ((and (sc-is x any-reg)
+                (eql (tn-offset x) zr-offset))
+           (inst mov y 0))
+          (t
+           (move y x)))))
 
 (define-move-vop move :move
   (any-reg descriptor-reg)
@@ -149,14 +251,17 @@
 ;;; frame for argument or known value passing.
 (define-vop (move-arg)
   (:args (x :target y
-            :scs (any-reg descriptor-reg))
+            :scs (any-reg descriptor-reg zero))
          (fp :scs (any-reg)
              :load-if (not (sc-is y any-reg descriptor-reg))))
   (:results (y))
   (:generator 0
     (sc-case y
       ((any-reg descriptor-reg)
-       (move y x))
+       (if (and (sc-is x any-reg)
+                (eql (tn-offset x) zr-offset))
+           (inst mov y 0)
+           (move y x)))
       (control-stack
        (store-stack-offset x fp y)))))
 ;;;
@@ -175,11 +280,11 @@
                (and (tn-p tn)
                     (sc-is tn control-stack)))
              (source (vop)
-               (tn-ref-tn (sb-c::vop-args  vop)))
+               (tn-ref-tn (vop-args  vop)))
              (dest (vop)
-               (tn-ref-tn (sb-c::vop-results vop)))
+               (tn-ref-tn (vop-results vop)))
              (load-tn (vop)
-               (tn-ref-load-tn (sb-c::vop-args vop)))
+               (tn-ref-load-tn (vop-args vop)))
              (suitable-offsets-p (tn1 tn2)
                (and (= (abs (- (tn-offset tn1)
                                (tn-offset tn2)))
@@ -191,10 +296,13 @@
              (load-arg (x load-tn)
                (sc-case x
                  ((constant immediate control-stack)
-                  (let ((load-tn (if (and used-load-tn
-                                          (location= used-load-tn load-tn))
-                                     tmp-tn
-                                     load-tn)))
+                  (let ((load-tn (cond ((not (and used-load-tn
+                                                  (location= used-load-tn load-tn)))
+                                        load-tn)
+                                       ((sb-c::tn-reads load-tn)
+                                        (return-from load-arg))
+                                       (t
+                                        tmp-tn))))
                     (setf used-load-tn load-tn)
                     (sc-case x
                       (constant
@@ -287,8 +395,8 @@
                            '(load-stack store-stack)))
                 (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))))
         (move-arg
-         (let ((fp1 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop1))))
-               (fp2 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop2))))
+         (let ((fp1 (tn-ref-tn (tn-ref-across (vop-args vop1))))
+               (fp2 (tn-ref-tn (tn-ref-across (vop-args vop2))))
                (dest1 (dest vop1))
                (dest2 (dest vop2)))
            (when (eq fp1 fp2)
@@ -297,7 +405,7 @@
                         (stack-p dest2))
                    fp1
                    cfp-tn)
-               (tn-ref-load-tn (tn-ref-across (sb-c::vop-args vop1)))))))))))
+               (tn-ref-load-tn (tn-ref-across (vop-args vop1)))))))))))
 
 
 ;;;; ILLEGAL-MOVE
@@ -351,18 +459,18 @@
 ;;; ARG is a fixnum or bignum; figure out which and load if necessary.
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg)))
+  (:result-refs results)
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "integer to untagged word coercion")
   (:generator 4
     #.(assert (= fixnum-tag-mask 1))
-    (inst tbnz x 0 BIGNUM)
-    (sc-case y
-      (signed-reg
-       (inst asr y x n-fixnum-tag-bits))
-      (unsigned-reg
-       (inst lsr y x n-fixnum-tag-bits)))
-    (inst b DONE)
-    BIGNUM
+    (when (types-equal-or-intersect (tn-ref-type results) (specifier-type 'fixnum))
+      (sc-case y
+        (signed-reg
+         (inst asr y x n-fixnum-tag-bits))
+        (unsigned-reg
+         (inst lsr y x n-fixnum-tag-bits)))
+      (inst tbz x 0 DONE))
     (loadw y x bignum-digits-offset other-pointer-lowtag)
     DONE))
 
@@ -385,18 +493,19 @@
 ;;; RESULT may be a bignum, so we have to check.  Use a worst-case
 ;;; cost to make sure people know they may be number consing.
 (define-vop (move-from-signed)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg) :to :result))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
-  (:temporary (:sc non-descriptor-reg) pa-flag)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:note "signed word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst adds y x x)
     (inst b :vc DONE)
-    (with-fixed-allocation (y pa-flag bignum-widetag (1+ bignum-digits-offset) :lip lip)
-      (storew x y bignum-digits-offset other-pointer-lowtag))
+    (with-fixed-allocation (y lr bignum-widetag (1+ bignum-digits-offset)
+                            :store-type-code nil)
+      ;; TMP-TN has the untagged address coming from ALLOCATION
+      ;; that way STP can be used on an aligned address.
+      ;; LR has the widetag computed by WITH-FIXED-ALLOCATION
+      (storew-pair lr 0 x bignum-digits-offset tmp-tn))
     DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
@@ -424,14 +533,11 @@
 ;;; result.  Use a worst-case cost to make sure people know they may
 ;;; be number consing.
 (define-vop (move-from-unsigned)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg) :to :save))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
-  (:temporary (:sc non-descriptor-reg) pa-flag)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc non-descriptor-reg :offset lr-offset) lr)
   (:note "unsigned word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst tst x (ash (1- (ash 1 (- n-word-bits
                                    n-positive-fixnum-bits)))
                      n-positive-fixnum-bits))
@@ -439,18 +545,18 @@
     (inst b :eq DONE)
 
     (with-fixed-allocation
-        (y pa-flag bignum-widetag (+ 2 bignum-digits-offset) :lip lip)
+        (y lr bignum-widetag (+ 2 bignum-digits-offset)
+         :store-type-code nil)
       ;; WITH-FIXED-ALLOCATION, when using a supplied type-code,
-      ;; leaves PA-FLAG containing the computed header value.  In our
+      ;; leaves LR containing the computed header value.  In our
       ;; case, configured for a 2-word bignum.  If the sign bit in the
       ;; value we're boxing is CLEAR, we need to shrink the bignum by
       ;; one word, hence the following:
-      (inst tst x x)
-      (inst b :mi STORE)
-      (inst sub pa-flag pa-flag #x100)
-      (storew pa-flag y 0 other-pointer-lowtag)
+      (inst tbnz x (1- n-word-bits) STORE)
+      (load-immediate-word lr (bignum-header-for-length 1))
       STORE
-      (storew x y bignum-digits-offset other-pointer-lowtag))
+      ;; See the comment in move-from-signed
+      (storew-pair lr 0 x bignum-digits-offset tmp-tn))
     DONE))
 (define-move-vop move-from-unsigned :move
   (unsigned-reg) (descriptor-reg))
@@ -491,3 +597,13 @@
 ;;; descriptor passing location.
 (define-move-vop move-arg :move-arg
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
+
+(define-vop (move-conditional-result)
+  (:results (res :scs (descriptor-reg)))
+  (:info true)
+  (:generator 1
+    (move res null-tn)
+    (inst b done)
+    (emit-label true)
+    (load-symbol res t)
+    done))

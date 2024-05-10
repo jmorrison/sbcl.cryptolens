@@ -135,37 +135,25 @@
 ;;;
 ;;; We make no attempt to be fully general; our table doesn't need to be
 ;;; able to express features which we don't happen to use.
-(export '(genesis
-          package-data
-          make-package-data
-          package-data-name
-          package-data-export
-          package-data-reexport
-          package-data-import-from
-          package-data-use))
+(export '(genesis))
 (defstruct package-data
   ;; a string designator for the package name
   (name (error "missing PACKAGE-DATA-NAME datum"))
   ;; a doc string
-  (doc (error "missing PACKAGE-DOC datum"))
+  (documentation (error "missing PACKAGE-DOCUMENATION datum"))
+  ;; a list of nicknames
+  nicknames
   ;; a list of string designators for shadowing symbols
   shadow
-  ;; a tree containing names for exported symbols which'll be set up at package
-  ;; creation time, and NILs, which are ignored. (This is a tree in order to
-  ;; allow constructs like '("ENOSPC" #+LINUX ("EDQUOT" "EISNAM" "ENAVAIL"
-  ;; "EREMOTEIO")) to be used in initialization. NIL entries in the tree are
-  ;; ignored for the same reason of notational convenience.)
+  ;; a list of string designators for exported symbols which'll be set
+  ;; up at package creation time.
   export
-  ;; a list of string designators for exported symbols which don't necessarily
-  ;; originate in this package (so their EXPORT operations should be handled
-  ;; after USE operations have been done, so that duplicates aren't created)
-  reexport
   ;; a list of sublists describing imports. Each sublist has the format as an
   ;; IMPORT-FROM list in DEFPACKAGE: the first element is the name of the
   ;; package to import from, and the remaining elements are the names of
   ;; symbols to import.
   import-from
-  ;; a tree of string designators for package names of other packages
+  ;; a list of string designators for package names of other packages
   ;; which this package uses
   use)
 
@@ -177,7 +165,7 @@
 (defparameter *shadows*
   '("FLOAT" "SHORT-FLOAT" "SINGLE-FLOAT" "DOUBLE-FLOAT" "LONG-FLOAT"
     "REAL" "COMPLEX" "NUMBER"
-    ;; "RATIONAL" is here for the same reason are the preceding:
+    ;; "RATIONAL" is here for the same reason as the preceding:
     ;; we don't want to mess up all tests of the form (IF (EQ X 'RATIONAL) ...)
     ;; or worry about the package of the symbol we're testing (since identity matters).
     ;; But we also need to logically shadow #'RATIONAL which would not be legal
@@ -190,8 +178,12 @@
     ;; RATIONALP isn't here because its behavior is unchanged.
     "FLOATP" "REALP" "COMPLEXP" "NUMBERP"
     "COERCE" "EXP" "EXPT" "LOG" "SIGNUM" "IMAGPART" "REALPART"
-    "ZEROP" "ABS" "SIGNUM" "FLOAT-SIGN"
+    "ZEROP" "ABS" "SIGNUM"
     "CEILING" "FLOOR" "ROUND" "TRUNCATE" "MOD" "REM"
+    ;; Float decoding:
+    "DECODE-FLOAT" "INTEGER-DECODE-FLOAT" "FLOAT-SIGN"
+    "FLOAT-DIGITS" "FLOAT-PRECISION" "FLOAT-RADIX"
+    "SCALE-FLOAT"
     ;; We always want irrational functions to use target floats.
     "ACOS" "ACOSH" "ASIN" "ASINH" "ATAN" "ATANH"  "CIS" "CONJUGATE"
     "COS" "COSH"  "FCEILING" "FFLOOR" "FROUND" "FTRUNCATE"
@@ -272,6 +264,8 @@
 
     ;; The cross-compiler itself shouldn't really need to use the host
     ;; versions of these in target code except in exceptional cases.
+    "CHAR-CODE"
+    "CODE-CHAR"
     "COMPILE-FILE"
     "COMPILE-FILE-PATHNAME"
     "*COMPILE-FILE-PATHNAME*"
@@ -281,21 +275,21 @@
     "COMPILER-MACRO-FUNCTION"
     "CONSTANTP"
     "GET-SETF-EXPANSION"
-    "*GENSYM-COUNTER*"
+    "GENSYM"
     "LISP-IMPLEMENTATION-TYPE" "LISP-IMPLEMENTATION-VERSION"
     "MACRO-FUNCTION"
     "MACROEXPAND" "MACROEXPAND-1" "*MACROEXPAND-HOOK*"
+    "MAKE-LOAD-FORM"
     "MAKE-LOAD-FORM-SAVING-SLOTS"
+    "PROCLAIM"
     "SPECIAL-OPERATOR-P"
     "SUBTYPEP"
     "UPGRADED-ARRAY-ELEMENT-TYPE"
     "UPGRADED-COMPLEX-PART-TYPE"
     "WITH-COMPILATION-UNIT"
 
-    ;; For debugging purposes, we want to be able to intercept inline
-    ;; and block compilation declamations in the host.
-    "DECLAIM"
-    ))
+    ;; Add eval-when to it
+    "DEFCONSTANT"))
 
 ;;; A symbol in the "dual personality" list refers to the symbol in CL unless
 ;;; package-prefixed with SB-XC:.  The main reason for not putting these
@@ -331,10 +325,7 @@
 ;;; see by default, so that using them by accident fails.
 (defparameter *undefineds*
   '("SYMBOL-PACKAGE"
-    ;; Float decoding: don't want to see these used either.
-    "DECODE-FLOAT" "INTEGER-DECODE-FLOAT"
-    "FLOAT-DIGITS" "FLOAT-PRECISION" "FLOAT-RADIX"
-    "SCALE-FLOAT"))
+    "PACKAGE-NAME"))
 
 ;; The running-in-the-host-Lisp Python cross-compiler defines its
 ;; own versions of a number of functions which should not overwrite
@@ -345,25 +336,20 @@
 ;; compilation of the target.
 ;;
 (let ((package-name "SB-XC"))
-  (dolist (name (append (append *undefineds* *dual-personality-math-symbols*)))
+  (dolist (name (append *undefineds* *dual-personality-math-symbols*))
+    ;; FIXME: this triggers some pathological behavior in our implementation
+    ;; of EXPORT. For each symbol, we're adding it to the internals, then
+    ;; removing that to add to the externals, each time shrinking the hashset
+    ;; of internals back to nothing. Is there way to not do that?
     (export (intern name package-name) package-name))
   (dolist (name '("*READ-DEFAULT-FLOAT-FORMAT*"
                   "ARRAY-ELEMENT-TYPE"
-                  "CHAR-CODE"
-                  "CODE-CHAR"
                   "DEFMACRO" "DEFSTRUCT" "DEFTYPE"
-                  "GENSYM"
                   "MAKE-ARRAY"
-                  "MAKE-LOAD-FORM"
-                  "PROCLAIM"
                   "SIMPLE-VECTOR"
-                  "TYPE-OF" "TYPEP"
-
-                  "DEFCLASS"
-                  "DEFGENERIC"
-                  "DEFMETHOD"
+                  "TYPEP"
                   ))
-      (export (intern name package-name) package-name)))
+    (export (intern name package-name) package-name)))
 
 (defun count-symbols (pkg)
   (let ((n 0))
@@ -382,7 +368,7 @@
            (import x cl-model-package)
            (export x cl-model-package)))
     (reexport (list nil))
-    (dolist (string (read-from-file "common-lisp-exports.lisp-expr"))
+    (dolist (string (read-from-file "^common-lisp-exports.lisp-expr"))
       (unless (string= string "NIL") ; already done
         (cond ((member string *undefineds* :test #'string=)
                (new-external string cl-model-package))
@@ -405,94 +391,78 @@
   (assert (equal *package-symbol-counts* (compute-cl-package-symbol-counts))))
 
 (defun create-target-packages (package-data-list)
-  (labels ((flatten (tree)
-             (let ((result (mapcan (lambda (x) (if (listp x) (flatten x) (list x)))
-                                   tree)))
-               (when (< (length (remove-duplicates result :test 'equal))
-                        (length result))
-                 (error "Duplicates in package-data-list: ~a~%"
-                        (mapcon (lambda (x)
-                                  (when (member (car x) (cdr x) :test 'equal)
-                                    (list (car x))))
-                                result)))
-               result)))
+  (hide-host-packages)
 
-    (hide-host-packages)
+  ;; Build all packages that we need, and initialize them as far as we
+  ;; can without referring to any other packages.
+  (dolist (package-data package-data-list)
+    (let ((package (make-package (package-data-name package-data)
+                                 :use nil
+                                 :nicknames (package-data-nicknames package-data))))
+      (dolist (string (package-data-shadow package-data))
+        (shadow string package))
+      (setf (documentation package t) (package-data-documentation package-data))))
+  ;; Now that all packages exist, we can set up package-package
+  ;; references.
+  (dolist (package-data package-data-list)
+    (use-package (substitute "XC-STRICT-CL" "CL"
+                             (package-data-use package-data)
+                             :test 'string=)
+                 (package-data-name package-data))
+    ;; Note: Unlike plain-old DEFPACKAGE, this IMPORT-FROM does
+    ;; potentially intern NAME into the FROM-PACKAGE to make forward
+    ;; references work.
+    (dolist (sublist (package-data-import-from package-data))
+      (let* ((from-package (first sublist))
+             (from-package (if (string= from-package "CL")
+                               "XC-STRICT-CL"
+                               from-package)))
+        (import (mapcar (lambda (name) (intern name from-package))
+                        (rest sublist))
+                (package-data-name package-data))))
+    (dolist (string (package-data-export package-data))
+      (export (intern string (package-data-name package-data))
+              (package-data-name package-data))))
 
-    ;; Build all packages that we need, and initialize them as far as we
-    ;; can without referring to any other packages.
-    (dolist (package-data package-data-list)
-      (let* ((name (package-data-name package-data))
-             (package (make-package name :use nil)))
-        ;; Walk the tree of shadowing names
-        (dolist (string (flatten (package-data-shadow package-data)))
-          (shadow string package))
-        ;; Walk the tree of exported names, exporting each name.
-        (dolist (string (flatten (package-data-export package-data)))
-          (export (intern string package) package))))
-
-    ;; Now that all packages exist, we can set up package-package
-    ;; references.
-    (dolist (package-data package-data-list)
-      (use-package (substitute "XC-STRICT-CL" "CL"
-                               (package-data-use package-data)
-                               :test 'string=)
-                   (package-data-name package-data))
-      (dolist (sublist (package-data-import-from package-data))
-        (let ((from-package (first sublist)))
-          (import (mapcar (lambda (name) (intern name from-package))
-                          (rest sublist))
-                  (package-data-name package-data)))))
-
-    (unhide-host-format-funs)
-
-    ;; Now that all package-package references exist, we can handle
-    ;; REEXPORT operations. (We have to wait until now because they
-    ;; interact with USE operations.)  This code handles dependencies
-    ;; properly, but is somewhat ugly.
-    (let (done)
-      (labels
-          ((reexport (package-data)
-             (let ((package (find-package (package-data-name package-data))))
-               (cond
-                 ((member package done))
-                 ((null (package-data-reexport package-data))
-                  (push package done))
-                 (t
-                  (mapcar #'reexport
-                          (remove-if-not
-                           (lambda (x)
-                             (member x (package-data-use package-data)
-                                     :test #'string=))
-                           package-data-list
-                           :key #'package-data-name))
-                  (dolist (symbol-name
-                           (flatten (package-data-reexport package-data)))
-                    (multiple-value-bind (symbol status)
-                        (find-symbol symbol-name package)
-                      (unless status
-                        (error "No symbol named ~S is accessible in ~S."
-                               symbol-name package))
-                      (when (eq (symbol-package symbol) package)
-                        (error
-                         "~S is not inherited/imported, but native to ~S."
-                         symbol-name package))
-                      (export symbol package)))
-                  (push package done))))))
-        (dolist (x package-data-list)
-          (reexport x))
-        (assert (= (length done) (length package-data-list)))))))
+  (unhide-host-format-funs))
 
 (export '*undefined-fun-allowlist*)
 (defvar *undefined-fun-allowlist* (make-hash-table :test 'equal))
-(let ((list
-       (with-open-file (data (prepend-genfile-path "package-data-list.lisp-expr"))
-         ;; There's no need to use the precautionary READ-FROM-FILE function
-         ;; with package-data-list because it is not a customization file.
-         (create-target-packages (let ((*readtable* *xc-readtable*)) (read data)))
-         (let ((*readtable* *xc-readtable*)) (read data)))))
-  (dolist (name (apply #'append list))
-    (setf (gethash name *undefined-fun-allowlist*) t)))
+
+(defparameter *package-data-list* '())
+
+;;; Like DEFPACKAGE, but does some special stuff to make forward
+;;; references work.
+(defmacro defpackage* (name &rest options)
+  (let ((flattened-options '()))
+    (dolist (option options)
+      (destructuring-bind (kind . args) option
+        (ecase kind
+          ((:use :export :shadow :nicknames)
+           (let ((existing-option (assoc kind flattened-options)))
+             (if existing-option
+                 (setf (second (second existing-option))
+                       (append (second (second existing-option)) args))
+                 (push (list kind (list 'quote args)) flattened-options))))
+          ((:import-from)
+           (let ((existing-option (assoc kind flattened-options)))
+             (if existing-option
+                 (push args (second (second existing-option)))
+                 (push (list kind (list 'quote (list args))) flattened-options))))
+          ((:documentation)
+           (push option flattened-options)))))
+    `(push (make-package-data :name ',name ,@(mapcan #'identity flattened-options))
+           *package-data-list*)))
+
+(let ((*readtable* *xc-readtable*))
+  (load (find-bootstrap-file "^exports.lisp"))
+  (create-target-packages *package-data-list*))
+
+(defun read-undefined-fun-allowlist ()
+  (with-open-file (data (find-bootstrap-file "^undefined-fun-allowlist.lisp-expr"))
+    (let ((*readtable* *xc-readtable*))
+      (dolist (name (apply #'append (read data)))
+        (setf (gethash name *undefined-fun-allowlist*) t)))))
 
 (defvar *asm-package-use-list*
   '("SB-ASSEM" "SB-DISASSEM"
@@ -517,19 +487,11 @@
 ;; so that they can co-exist.
 (make-assembler-package (backend-asm-package-name))
 
-(defun package-list-for-genesis ()
-  (append (let ((*readtable* *xc-readtable*))
-            (read-from-file "package-data-list.lisp-expr" nil))
-          (let ((asm-package (backend-asm-package-name)))
-            (list (make-package-data :name asm-package
-                                     :use (list* "CL" *asm-package-use-list*)
-                                     :doc nil)))))
-
 ;;; Not all things shown by this are actually unused. Some get removed
 ;;; by the tree-shaker as intended.
 #+nil
 (defun show-unused-exports (&aux nonexistent uninteresting)
-  (dolist (entry (with-open-file (f "package-data-list.lisp-expr") (read f)))
+  (dolist (entry *package-data-list*)
     (let ((pkg (find-package (package-data-name entry))))
       (dolist (string (mapcan (lambda (x) (if (stringp x) (list x) x))
                               (package-data-export entry)))
@@ -538,7 +500,7 @@
             (cond ((not s)
                    (push (cons pkg string) nonexistent))
                   ((and (not (boundp s))
-                        (not (sb-kernel:symbol-info s))
+                        (not (sb-kernel:symbol-%info s))
                         (not (gethash s sb-c::*backend-parsed-vops*)))
                    (push s uninteresting))))))))
   (format t "~&Nonexistent:~%")

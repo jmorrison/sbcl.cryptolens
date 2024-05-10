@@ -14,26 +14,6 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (export '(sb-ext::search-roots) 'sb-ext))
 
-(define-alien-variable  "gc_object_watcher" unsigned)
-(define-alien-variable  "gc_traceroot_criterion" int)
-
-#+sb-thread
-(defun find-symbol-from-tls-index (index)
-  (unless (zerop index)
-    ;; Search interned symbols first since that's probably enough
-    (do-all-symbols (symbol)
-      (when (= (sb-kernel:symbol-tls-index symbol) index)
-        (return-from find-symbol-from-tls-index symbol)))
-    ;; A specially bound uninterned symbol? how awesome
-    (sb-vm:map-allocated-objects
-     (lambda (obj type size)
-       (declare (ignore size))
-       (when (and (= type sb-vm:symbol-widetag)
-                  (= (sb-kernel:symbol-tls-index obj) index))
-         (return-from find-symbol-from-tls-index obj)))
-     :all))
-  0)
-
 ;;; Convert each path to (TARGET . NODES)
 ;;; where the first node in NODES is one of:
 ;;;
@@ -89,7 +69,7 @@
                        (symbol
                         (unless (eql root-kind 1)
                           #+sb-thread
-                          (find-symbol-from-tls-index (ash extra sb-vm:n-fixnum-tag-bits))
+                          (sb-vm::symbol-from-tls-index (ash extra sb-vm:n-fixnum-tag-bits))
                           #-sb-thread
                           extra)))
                   (awhen (and thread (sb-thread:thread-name thread))
@@ -137,7 +117,15 @@
                         pathname sb-impl::host hash-table)
                     (format stream "~S~%" obj))
                    (t
-                    (format stream "a ~(~a~)" (type-of obj))
+                    ;; We want to distinguish between SB-PCL::CACHE and every other type
+                    ;; that anyone invents named CACHE (of which there are many!) but not be
+                    ;; so pedantic as to print as COMMON-LISP:CONS
+                    (let ((type (type-of obj)))
+                      (if (and (symbolp type) (eq (symbol-package type) *cl-package*))
+                          ;; Putting (FORMAT stream (IF "s1" "s2") type) here failed the post-build
+                          ;; assertion about strings containing SB- packages. (FIXME)
+                          (format stream "a ~(~a~)" type)
+                          (format stream "a ~/sb-ext:print-symbol-with-prefix/" type)))
                     (when (consp obj)
                       (write-string " = " stream)
                       (write obj :stream stream :level 1 :length 3 :pretty nil))
@@ -164,30 +152,16 @@
 (declaim (ftype (function ((or list sb-ext:weak-pointer)
                            &key
                            (:criterion (member :oldest :pseudo-static :static))
-                           (:gc t)
                            (:ignore list)
                            (:print (or boolean (eql :verbose)))))
                 search-roots))
-(defun search-roots (weak-pointers &key (criterion :oldest) (gc nil)
-                                        (ignore nil) (print t))
+(defun search-roots (weak-pointers &key (criterion :oldest)
+                                        (ignore '(* ** *** / // ///))
+                                        (print t))
   "Find roots keeping the targets of WEAK-POINTERS alive.
 
 WEAK-POINTERS must be a single SB-EXT:WEAK-POINTER or a list of those,
 pointing to objects for which roots should be searched.
-
-GC controls whether the search is performed in the context of a
-garbage collection, that is with all Lisp threads stopped. Possible
-values are:
-
-  T
-    This is the more accurate of the object liveness proof generators,
-    as there is no chance for other code to execute in between the
-    garbage collection and production of the chain of referencing
-    objects.
-
-  NIL
-    This works well enough, but might be adversely affected by actions
-    of concurrent threads.
 
 CRITERION determines just how rooty (how deep) a root must be in order
 to be considered. Possible values are:
@@ -252,27 +226,26 @@ printed. Possible values are
 Experimental: subject to change without prior notice."
   (let* ((input (ensure-list weak-pointers))
          (output (make-array (length input)))
-         (param (vector input
-                        (if ignore (coerce ignore 'simple-vector) 0)
-                        (cons :result output)))
-         (criterion-value (ecase criterion
-                            (:oldest 0)
-                            (:pseudo-static 1)
-                            (:static 2))))
-    (cond (gc
-           (setf gc-traceroot-criterion criterion-value)
-           (sb-sys:with-pinned-objects (param)
-             (setf gc-object-watcher (sb-kernel:get-lisp-obj-address param)))
-           (gc :full t)
-           (setf gc-object-watcher 0))
-          (t
-           (sb-sys:without-gcing
-             (sb-vm::close-current-gc-region)
-             (alien-funcall
-              (extern-alien "prove_liveness" (function int unsigned int))
-              (sb-kernel:get-lisp-obj-address param)
-              criterion-value))))
-    (case (car (elt param 2))
+         (ignore (if ignore (coerce ignore 'simple-vector) 0))
+         (criterion (ecase criterion
+                      (:oldest 0)
+                      (:pseudo-static 1)
+                      (:static 2)))
+         result)
+    (with-alien ((gc-pathfind (function int unsigned unsigned unsigned int)
+                              :extern))
+      (without-gcing
+          (when (sb-kernel::try-acquire-gc-lock
+                 (sb-kernel::gc-stop-the-world)
+                 (setq result
+                       (alien-funcall gc-pathfind
+                                      (get-lisp-obj-address input)
+                                      (get-lisp-obj-address output)
+                                      (get-lisp-obj-address ignore)
+                                      criterion)))
+            (sb-kernel::gc-start-the-world))))
+    (case result
+      ((nil) (error "Could not stop all threads"))
       (-1 (error "Input is not a proper list of weak pointers.")))
     (let ((paths (preprocess-traceroot-results input output)))
       (cond (print

@@ -45,13 +45,6 @@
   (print-unreadable-object (inst stream :type t :identity t)
     (format stream "~A(~A)" (inst-name inst) (inst-format-name inst))))
 
-(declaim (ftype function read-suffix))
-(defun read-signed-suffix (length dstate)
-  (declare (type (member 8 16 32 64) length)
-           (type disassem-state dstate)
-           (optimize (speed 3) (safety 0)))
-  (sign-extend (read-suffix length dstate) length))
-
 ;;;; combining instructions where one specializes another
 
 ;;; Return non-NIL if the instruction SPECIAL is a more specific
@@ -150,25 +143,37 @@
 
 ;;;; searching for an instruction in instruction space
 
+#-x86-64
+(defun pre-decode (chunk dstate)
+  (declare (ignore dstate))
+  (values chunk 0))
+
 ;;; Return the instruction object within INST-SPACE corresponding to the
 ;;; bit-pattern CHUNK, or NIL if there isn't one.
-(defun find-inst (chunk inst-space)
+(defun find-inst (chunk inst-space &optional dstate)
   (declare (type dchunk chunk)
            (type (or null inst-space instruction) inst-space))
-  (etypecase inst-space
-    (null nil)
-    (instruction
-     (if (inst-matches-p inst-space chunk)
-         (choose-inst-specialization inst-space chunk)
-         nil))
-    (inst-space
-     (let* ((mask (ispace-valid-mask inst-space))
-            (id (dchunk-and mask chunk)))
-       (declare (type dchunk id mask))
-       (dolist (choice (ispace-choices inst-space))
-         (declare (type inst-space-choice choice))
-         (when (dchunk= id (ischoice-common-id choice))
-           (return (find-inst chunk (ischoice-subspace choice)))))))))
+  (binding* (((new-chunk length-adjustment)
+              (if dstate (pre-decode chunk dstate) (values chunk 0)))
+             (inst
+              (named-let recurse ((chunk new-chunk) (inst-space inst-space))
+                (etypecase inst-space
+                  (null nil)
+                  (instruction
+                   (if (inst-matches-p inst-space chunk)
+                       (choose-inst-specialization inst-space chunk)
+                       nil))
+                  (inst-space
+                   (let* ((mask (ispace-valid-mask inst-space))
+                          (id (dchunk-and mask chunk)))
+                     (declare (type dchunk id mask))
+                     (dolist (choice (ispace-choices inst-space))
+                       (declare (type inst-space-choice choice))
+                       (when (dchunk= id (ischoice-common-id choice))
+                         (return (recurse chunk (ischoice-subspace choice)))))))))))
+    (if inst
+        (values inst (+ (inst-length inst) length-adjustment) new-chunk)
+        (values nil 0 chunk))))
 
 ;;;; building the instruction space
 
@@ -313,16 +318,6 @@
               (seg-virtual-location seg)
               (seg-code seg)))))
 
-;;;; function ops
-
-;;; the offset of FUNCTION from the start of its code-component's
-;;; instruction area
-(defun fun-insts-offset (simple-fun) ; FUNCTION *must* be pinned
-  (declare (type simple-fun simple-fun))
-  (- (get-lisp-obj-address simple-fun)
-     sb-vm:fun-pointer-lowtag
-     (sap-int (code-instructions (fun-code-header simple-fun)))))
-
 ;;;; operations on code-components (which hold the instructions for
 ;;;; one or more functions)
 
@@ -360,7 +355,7 @@
            (type alignment size))
   (zerop (logand (1- size) address)))
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64 riscv)
 (progn
 (defconstant lra-size (words-to-bytes 1))
 (defun lra-hook (chunk stream dstate)
@@ -378,33 +373,25 @@
                                       (+ (dstate-cur-offs dstate)
                                          (1- lra-size))))
                 sb-vm:return-pc-widetag))
-    (unless (null stream)
+    (when stream
       (note "possible LRA header" dstate)))
   nil))
 
 ;;; Print the fun-header (entry-point) pseudo-instruction at the
-;;; current location in DSTATE to STREAM.
+;;; current location in DSTATE to STREAM and skip 2 words.
 (defun fun-header-hook (fun-index stream dstate)
   (declare (type (or null stream) stream)
            (type disassem-state dstate))
-  (unless (null stream)
-    (let* ((seg (dstate-segment dstate))
-           (code (seg-code seg))
-           (woffs (+ sb-vm:code-constants-offset (* fun-index sb-vm:code-slots-per-simple-fun)))
-           (name (code-header-ref code (+ woffs sb-vm:simple-fun-name-slot)))
-           (args (code-header-ref code (+ woffs sb-vm:simple-fun-arglist-slot)))
-           (info (code-header-ref code (+ woffs sb-vm:simple-fun-info-slot)))
-           (type (typecase info
-                   ((cons t simple-vector) (car info))
-                   ((not simple-vector) info))))
+  (when stream
+    (let* ((fun (%code-entry-point (seg-code (dstate-segment dstate)) fun-index))
+           (name (%simple-fun-name fun))
+           (args (%simple-fun-arglist fun)))
       ;; if the function's name conveys its args, don't show ARGS too
-      (format stream ".~A ~S~:[~:A~;~]" 'entry name
+      (format stream ".~A ~S~:[~:A~;~]"
+              'entry name
               (and (typep name '(cons (eql lambda) (cons list)))
                    (equal args (second name)))
-              args)
-      (note (lambda (stream)
-              (format stream "~:S" type)) ; use format to print NIL as ()
-            dstate)))
+              args)))
   (incf (dstate-next-offs dstate)
         (words-to-bytes sb-vm:simple-fun-insts-offset)))
 
@@ -437,6 +424,7 @@
            (type segment segment))
   (setf (dstate-segment dstate) segment)
   (setf (dstate-inst-properties dstate) 0)
+  (setf (dstate-known-register-contents dstate) nil)
   (setf (dstate-cur-offs-hooks dstate)
         (stable-sort (nreverse (copy-list (seg-hooks segment)))
                      (lambda (oh1 oh2)
@@ -492,7 +480,7 @@
 
 (defun handle-bogus-instruction (stream dstate prefix-len)
   (let ((alignment (dstate-alignment dstate)))
-    (unless (null stream)
+    (when stream
       (multiple-value-bind (words bytes)
           (truncate alignment sb-vm:n-word-bytes)
         (when (> words 0)
@@ -562,12 +550,13 @@
   (setf (dstate-filtered-arg-pool-in-use dstate) nil)
   (loop
    ;; There is no point to using GET-DCHUNK. How many bytes remain is unknown.
-   (let* ((chunk (logand (sap-ref-word (dstate-segment-sap dstate)
-                                       (dstate-cur-offs dstate))
-                         dchunk-one))
-          (inst (find-inst chunk *disassem-inst-space*)))
+   (multiple-value-bind (inst len chunk)
+       (find-inst (logand (sap-ref-word (dstate-segment-sap dstate)
+                                        (dstate-cur-offs dstate))
+                          dchunk-one)
+                  *disassem-inst-space* dstate)
      (aver inst)
-     (let ((offs (+ (dstate-cur-offs dstate) (inst-length inst))))
+     (let ((offs (+ (dstate-cur-offs dstate) len)))
        (setf (dstate-next-offs dstate) offs)
        (funcall (inst-prefilter inst) dstate chunk)
        ;; Grab the revised NEXT-OFFS
@@ -610,24 +599,11 @@
         (prefix-len 0) ; sum of lengths of any prefix instruction(s)
         (prefix-print-names nil)) ; reverse list of prefixes seen
 
-   ;; To minimize the extent of disabled GC, the obligatory disabling for
-   ;; cheneygc occurs inside the per-instruction loop rather than around it.
-   ;; Otherwise, operating on huge memory regions could exhaust the heap.
-   ;; gencgc can do better though: pin SEG-OBJECT once only outside the loop.
-   (macrolet ((with-pinned-segment (&body body)
-                #-gencgc `(without-gcing
-                            (setf (dstate-segment-sap dstate)
-                                  (funcall (seg-sap-maker segment)))
-                            ,@body)
-                #+gencgc `(progn ,@body)))
-
     (rewind-current-segment dstate segment)
 
-    ;; Do not pin anything yet if using cheneygc, as that would inhibit GC
-    ;; with a larger scope than strictly necessary.
-    (with-pinned-objects (#+gencgc (seg-object (dstate-segment dstate))
-                          #+gencgc dstate) ; for SAP access to SCRATCH-BUF
-     #+gencgc (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
+    (with-pinned-objects ((seg-object (dstate-segment dstate))
+                          dstate) ; for SAP access to SCRATCH-BUF
+     (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
 
      ;; Now commence disssembly of instructions
      (loop
@@ -648,15 +624,14 @@
       (call-offs-hooks nil stream dstate)
 
       (unless (> (dstate-next-offs dstate) (dstate-cur-offs dstate))
-        (with-pinned-segment
          (let* ((bytes-remaining (- (seg-length (dstate-segment dstate))
                                     (dstate-cur-offs dstate)))
-                (chunk (get-dchunk dstate))
-                (fun-prefix-p (call-fun-hooks chunk stream dstate)))
+                (raw-chunk (get-dchunk dstate))
+                (fun-prefix-p (call-fun-hooks raw-chunk stream dstate)))
            (declare (index bytes-remaining))
            (if (> (dstate-next-offs dstate) (dstate-cur-offs dstate))
                (setf prefix-p fun-prefix-p)
-               (let ((inst (find-inst chunk ispace)))
+               (multiple-value-bind (inst len chunk) (find-inst raw-chunk ispace dstate)
                  (cond ((null inst)
                         (handle-bogus-instruction stream dstate prefix-len)
                         (setf prefix-p nil))
@@ -664,19 +639,17 @@
                        ;; decode as "ADD [RAX], AL" if there are 2 bytes,
                        ;; but if there's only 1 byte, it should show "BYTE 0".
                        ;; There's really nothing we can do about the former.
-                       ((> (inst-length inst) bytes-remaining)
+                       ((> len bytes-remaining)
                         (when stream
                           (print-inst bytes-remaining stream dstate)
                           (print-bytes bytes-remaining stream dstate)
                           (terpri stream))
                         (return))
                        (t
-                        (setf (dstate-inst dstate) inst)
-                        (setf (dstate-next-offs dstate)
-                              (+ (dstate-cur-offs dstate) (inst-length inst)))
+                        (setf (dstate-inst dstate) inst
+                              (dstate-next-offs dstate) (+ (dstate-cur-offs dstate) len))
                         (when stream
-                          (print-inst (inst-length inst) stream dstate
-                                      :trailing-space nil))
+                          (print-inst len stream dstate :trailing-space nil))
                         (let ((orig-next (dstate-next-offs dstate)))
                           (funcall (inst-prefilter inst) dstate chunk)
                           (setf prefix-p (null (inst-printer inst)))
@@ -688,12 +661,11 @@
                                                  orig-next)))
                               (when (plusp suffix-len)
                                 (print-inst suffix-len stream dstate
-                                            :offset (inst-length inst)
+                                            :offset len
                                             :trailing-space nil))
                               ;; Keep track of the number of bytes
                               ;; printed so far.
-                              (incf prefix-len (+ (inst-length inst)
-                                                  suffix-len)))
+                              (incf prefix-len (+ len suffix-len)))
                             (if prefix-p
                                 (awhen (inst-print-name inst)
                                   (push it prefix-print-names))
@@ -708,7 +680,7 @@
                           (funcall function chunk inst)
 
                           (awhen (inst-control inst)
-                            (funcall it chunk inst stream dstate))))))))))
+                            (funcall it chunk inst stream dstate)))))))))
 
       (setf (dstate-cur-offs dstate) (dstate-next-offs dstate))
 
@@ -723,7 +695,7 @@
               (nconc (dstate-filtered-arg-pool-free dstate)
                      (dstate-filtered-arg-pool-in-use dstate)))
         (setf (dstate-filtered-arg-pool-in-use dstate) nil)
-        (setf (dstate-inst-properties dstate) 0)))))))
+        (setf (dstate-inst-properties dstate) 0))))))
 
 
 (defun collect-labelish-operands (args cache)
@@ -757,29 +729,18 @@
   ;; add labels at the beginning with a label-number of nil; we'll notice
   ;; later and fill them in (and sort them)
   (declare (type disassem-state dstate))
-  ;; Holy cow, is this flaky. The problem is that labels are computed as absolute
-  ;; addresses, yet GC is (in theory) able to relocate the code while disassembling.
-  ;; The labels wouldn't make sense if that happens.
-  ;; I'm disinclined to revise all of the backends to compute labels relative to
-  ;; code-instructions. Probably we shouldn't try to support code movement while
-  ;; disassembling, it's just not worth the headache.
-  ;; However, a potential fix might be to pin the code while scanning it for
-  ;; labels, then relativize all labels to the segment base.
-  ;; When disassembling arbitrary memory, relativization would be skipped.
   (let ((labels (dstate-labels dstate)))
     (map-segment-instructions
      (lambda (chunk inst)
        (declare (type dchunk chunk) (type instruction inst))
-       (declare (optimize (sb-c::insert-array-bounds-checks 0)))
-       (loop with list = (inst-labeller inst)
-             while list
-             ;; item = #(FUNCTION PREFILTERED-VALUE-INDEX)
-             ;;      | #(FUNCTION SIGN-EXTEND-P BYTE-SPEC ...)
-             for item = (if (listp list) (pop list) (prog1 list (setq list nil)))
-             then (pop list)
-          do (let* ((item-length (length item))
-                    (index/signedp (svref item 1))
-                    (adjusted-value
+       (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+       (loop
+         ;; item = #(FUNCTION PREFILTERED-VALUE-INDEX)
+         ;;      | #(FUNCTION SIGN-EXTEND-P BYTE-SPEC ...)
+         for item in (ensure-list (inst-labeller inst))
+         do (let* ((item-length (length item))
+                   (index/signedp (svref item 1))
+                   (adjusted-value
                      (funcall
                       (svref item 0)
                       (flet ((extract-byte (spec-index)
@@ -791,7 +752,7 @@
                         (case item-length
                           (2 (svref (dstate-filtered-values dstate) index/signedp))
                           (3 (extract-byte 2)) ; extract exactly one byte
-                          (t ; extract >1 byte.
+                          (t                   ; extract >1 byte.
                            ;; FIXME: this is strictly redundant.
                            ;; You should combine fields in the prefilter
                            ;; so that the labeller receives a single byte.
@@ -799,25 +760,22 @@
                            (loop for i from 2 below item-length
                                  collect (extract-byte i)))))
                       dstate)))
-               ;; If non-integer, the value is not a label.
-               (when (and (integerp adjusted-value)
-                          (not (assoc adjusted-value labels)))
-                 (push (cons adjusted-value nil) labels)))))
+              ;; If non-integer, the value is not a label.
+              (when (and (integerp adjusted-value)
+                         (not (assoc adjusted-value labels)))
+                (push (cons adjusted-value nil) labels)))))
      segment
      dstate)
     ;; erase any notes that got there by accident
     (setf (dstate-notes dstate) nil)
-    ;; add labels from code header jump tables. As noted above,
-    ;; this is buggy if code moves, but no worse than anything else.
+    ;; add labels from code header jump tables.
     ;; CODE-JUMP-TABLE-WORDS = 0 if the architecture doesn't have jump tables.
     (binding* ((code (seg-code segment) :exit-if-null))
       (with-pinned-objects (code)
         (loop with insts = (code-instructions code)
               for i from 1 below (code-jump-table-words code)
               do (pushnew (cons (sap-ref-word insts (ash i sb-vm:word-shift)) nil)
-                          labels :key #'car
-                          ;; FIXME: compiler uses EQ instead of EQL unless forced
-                          :test #'=))))
+                          labels :key #'car :test #'=))))
     ;; Return the new list
     (setf (dstate-labels dstate) labels)))
 
@@ -1278,7 +1236,7 @@
       (let ((insts nil))
         (do-symbols (symbol package)
           (setq insts (nconc (copy-list (get symbol 'instructions)) insts)))
-        (setf ispace (build-inst-space insts)))
+        (setf ispace (sb-vm:without-arena "disassem" (build-inst-space insts))))
       (setf *disassem-inst-space* ispace))
     ispace))
 
@@ -1286,6 +1244,8 @@
   (setf (dstate-addr-print-len dstate) ; in characters
         ;; 4 bits per hex digit
         (ceiling (integer-length (logxor from (+ from length))) 4)))
+
+(defconstant label-column-width 7)
 
 ;;; Print the current address in DSTATE to STREAM, plus any labels that
 ;;; correspond to it, and leave the cursor in the instruction column.
@@ -1409,7 +1369,7 @@
       (format stream "#X~2,'0x" (sap-ref-8 sap (+ offs start-offs))))))
 
 (defvar *default-dstate-hooks*
-  (list* #-(or x86 x86-64) #'lra-hook nil))
+  (list* #-(or x86 x86-64 arm64 riscv) #'lra-hook nil))
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
@@ -1442,7 +1402,8 @@
   (dotimes (i (code-n-entries (seg-code segment)))
     (let* ((fun (%code-entry-point (seg-code segment) i))
            (length (seg-length segment))
-           (offset (code-offs-to-segment-offs (%fun-code-offset fun) segment)))
+           (code-offs (%fun-code-offset fun))
+           (offset (code-offs-to-segment-offs code-offs segment)))
       (when (<= 0 offset length)
         ;; Up to 2 words (less a byte) of padding might be present to align the
         ;; next simple-fun. Limit on OFFSET is to avoid incorrect triggering
@@ -1455,11 +1416,12 @@
                           (incf (dstate-next-offs dstate) offset))
                  :offset 0) ; at 0 bytes into this seg, skip OFFSET bytes
                 (seg-hooks segment)))
-        (push (make-offs-hook
-               :offset offset
-               :fun (let ((i i)) ; capture the _current_ I, not the final value
-                      (lambda (stream dstate) (fun-header-hook i stream dstate))))
-              (seg-hooks segment))))))
+        (unless (minusp offset)
+          (push (make-offs-hook
+                 :offset offset
+                 :fun (let ((i i)) ; capture the _current_ I, not the final value
+                        (lambda (stream dstate) (fun-header-hook i stream dstate))))
+                (seg-hooks segment)))))))
 
 ;;; A SAP-MAKER is a no-argument function that returns a SAP.
 
@@ -1518,6 +1480,13 @@
 ;;; objects).
 ;;; INITIAL-OFFSET is the displacement into the instruction bytes
 ;;; of CODE (if supplied) that the segment begins at.
+;;;
+;;; Technically we need to pin OBJECT around all of calls of MAKE-SEGMENT
+;;; with that same object. Otherwise, the VIRTUAL-LOCATION slots could come
+;;; out inconsistently across them. It's unlikely to happen, but if it did,
+;;; that would tend to lead to buggy disassemblies due to subtlety of
+;;; absolute addressing in MAP-SEGMENT-INSTRUCTIONS that supposedly hides
+;;; the movability of the underlying object.
 (defun make-segment (object sap-maker length
                      &key
                      code (initial-offset 0) virtual-location
@@ -1558,25 +1527,6 @@
          ;; had an origin address of 0, uncomment this next line:
          ;; :virtual-location offset
          :code code :initial-offset offset args))
-
-;;; Show the compiled debug function chain
-(defun show-cdf-chain (code)
-  (let* ((cdf
-          (sb-c::compiled-debug-info-fun-map
-           (sb-kernel:%code-debug-info (sb-kernel:fun-code-header #'open))))
-         (ct 0))
-    (format t "begin      end   startPC  elsewhere~%")
-    (loop
-      (incf ct)
-      (let ((begin (sb-c::compiled-debug-fun-offset cdf))
-            (end (1- (acond ((sb-c::compiled-debug-fun-next cdf)
-                             (sb-c::compiled-debug-fun-offset it))
-                            (t
-                             (%code-text-size code)))))
-            (elsewhere (sb-c::compiled-debug-fun-elsewhere-pc cdf))
-            (start-pc (sb-c::compiled-debug-fun-start-pc cdf)))
-        (format t "~5x .. ~5x     ~5x      ~5x~%" begin end start-pc elsewhere)
-        (unless (setq cdf (sb-c::compiled-debug-fun-next cdf)) (return ct))))))
 
 (defun make-memory-segment (code address &rest args)
   (declare (type address address))
@@ -1628,11 +1578,12 @@
 
 (defun code-fun-map (code)
   (declare (type code-component code))
-  (sb-c::compiled-debug-info-fun-map (%code-debug-info code)))
+  (sb-di::get-debug-info-fun-map (%code-debug-info code)))
 
 ;;; Assuming that CODE-OBJ is pinned, return true if ADDR is anywhere
 ;;; between the tagged pointer and the first occuring simple-fun.
 (defun points-to-code-constant-p (addr code-obj)
+  (declare (type word addr) (type code-component code-obj))
   (<= (get-lisp-obj-address code-obj)
       addr
       (get-lisp-obj-address (%code-entry-point code-obj 0))))
@@ -1727,7 +1678,8 @@
                           (offset (sb-c:sc+offset-offset sc+offset)))
                      (when (>= offset length)
                        (setf locations (adjust-array locations
-                                                     (max (* 2 length) (1+ offset)))
+                                                     (max (* 2 length) (1+ offset))
+                                                     :initial-element nil)
                              (location-group-locations group) locations))
                      (let ((already-there (aref locations offset)))
                        (cond ((null already-there)
@@ -1829,6 +1781,8 @@
                   ))))
         (no-debug-blocks () nil)))))
 
+;;; Disabled because it produces poor annotations, especially around
+;;; macros.
 (defvar *disassemble-annotate* nil
   "Annotate DISASSEMBLE output with source code.")
 
@@ -1847,62 +1801,60 @@
   (let* ((function (%fun-fun function))
          (code (fun-code-header function))
          (fun-map (code-fun-map code))
-         (fname (%simple-fun-name function))
          (sfcache (make-source-form-cache))
-         (first-block-seen-p nil)
-         (nil-block-seen-p nil)
-         (last-offset 0)
-         (last-debug-fun nil)
-         (segments nil))
-    (flet ((add-seg (offs len df)
-             (when (> len 0)
-               (push (make-code-segment code offs len
-                                        :debug-fun df
-                                        :source-form-cache sfcache)
-                     segments))))
-      (loop for fmap-entry = fun-map then next
-            for offset = (sb-c::compiled-debug-fun-offset fmap-entry)
-            for next = (sb-c::compiled-debug-fun-next fmap-entry)
-            do
-            (when first-block-seen-p
-              (add-seg last-offset
-                       (- offset last-offset)
-                       last-debug-fun)
-              (setf last-debug-fun nil))
-            (setf last-offset offset)
-            (let ((name (sb-c::compiled-debug-fun-name fmap-entry))
-                  (kind (sb-c::compiled-debug-fun-kind fmap-entry)))
-              #+nil
-              (format t ";;; SAW ~S ~S ~S,~S ~W,~W~%"
-                      name kind first-block-seen-p nil-block-seen-p
-                      last-offset
-                      (sb-c::compiled-debug-fun-start-pc fmap-entry))
-              (cond (#+nil (eq last-offset fun-offset)
-                     (and (equal name fname)
-                          (null kind)
-                          (not first-block-seen-p))
-                     (setf first-block-seen-p t))
-                    ((eq kind :external)
-                     (when first-block-seen-p
-                       (return)))
-                    ((eq kind nil)
-                     (when nil-block-seen-p
-                       (return))
-                     (when first-block-seen-p
-                       (setf nil-block-seen-p t))))
-              (setf last-debug-fun
-                    (sb-di::make-compiled-debug-fun fmap-entry code)))
-            while next)
-      (let ((max-offset (%code-text-size code)))
-        (when (and first-block-seen-p last-debug-fun)
-          (add-seg last-offset
-                   (- max-offset last-offset)
-                   last-debug-fun))
-        (if (null segments) ; FIXME: when does this happen? Comment PLEASE
-            (let ((offs (fun-insts-offset function)))
-              (list
-               (make-code-segment code offs (- max-offset offs))))
-            (nreverse segments))))))
+         (fun-start (sb-di::function-start-pc-offset function)))
+    (let ((first-block-seen-p nil)
+          (nil-block-seen-p nil)
+          (last-offset 0)
+          (last-debug-fun nil)
+          (segments nil))
+      (flet ((add-seg (offs len df)
+               (when (> len 0)
+                 (push (make-code-segment code offs len
+                                          :debug-fun df
+                                          :source-form-cache sfcache)
+                       segments))))
+        (dotimes (fmap-index (length fun-map))
+          (let ((fmap-entry (aref fun-map fmap-index)))
+            (etypecase fmap-entry
+              (integer
+               (when first-block-seen-p
+                 (add-seg last-offset
+                          (- fmap-entry last-offset)
+                          last-debug-fun)
+                 (setf last-debug-fun nil))
+               (setf last-offset fmap-entry))
+              (sb-c::compiled-debug-fun
+               (let ((kind (sb-c::compiled-debug-fun-kind fmap-entry)))
+                 #+nil
+                 (format t ";;; SAW ~S ~S ~S,~S ~W,~W~%"
+                         name kind first-block-seen-p nil-block-seen-p
+                         last-offset
+                         (sb-c::compiled-debug-fun-start-pc fmap-entry))
+                 (cond ((and (>= last-offset fun-start)
+                             (null kind)
+                             (not first-block-seen-p))
+                        (setf first-block-seen-p t))
+                       ((eq kind :external)
+                        (when first-block-seen-p
+                          (return)))
+                       ((eq kind nil)
+                        (when nil-block-seen-p
+                          (return))
+                        (when first-block-seen-p
+                          (setf nil-block-seen-p t))))
+                 (setf last-debug-fun
+                       (sb-di::make-compiled-debug-fun fmap-entry code)))))))
+        (let ((max-offset (%code-text-size code)))
+          (when (and first-block-seen-p last-debug-fun)
+            (add-seg last-offset
+                     (- max-offset last-offset)
+                     last-debug-fun))
+          (if (null segments) ; FIXME: when does this happen? Comment PLEASE
+              (let ((offs (sb-di::function-start-pc-offset function)))
+                (list
+                 (make-code-segment code offs (- max-offset offs))))
+              (nreverse segments)))))))
 
 ;;; Return a list of the segments of memory containing machine code
 ;;; instructions for the code-component CODE. If START-OFFSET and/or
@@ -1917,7 +1869,20 @@
            (type disassem-length length))
   (unless (sb-c::compiled-debug-info-p (%code-debug-info code))
     (return-from get-code-segments
-      (list (make-code-segment code start-offset length))))
+      (if (typep (%code-debug-info code) '(or hash-table (cons hash-table)))
+          (collect ((segs))
+            (dohash ((name locs) (sb-fasl::%asm-routine-table code))
+              (destructuring-bind (start end . index) locs
+                (declare (ignore index))
+                (let ((seg (make-code-segment code start (- (1+ end) start))))
+                  (push (make-offs-hook :offset 0
+                                        :fun (lambda (stream dstate)
+                                               (declare (ignore stream))
+                                               (note (string name) dstate)))
+                        (seg-hooks seg))
+                  (segs seg))))
+            (sort (segs) #'< :key #'seg-virtual-location))
+          (list (make-code-segment code start-offset length)))))
   (let ((segments nil)
         (sfcache (make-source-form-cache))
         (last-offset (code-n-unboxed-data-bytes code))
@@ -1935,22 +1900,20 @@
                                           :debug-fun df
                                           :source-form-cache sfcache)
                        segments)))))
-      (loop for fmap-entry = (code-fun-map code) then next
-            for offset = (sb-c::compiled-debug-fun-offset fmap-entry)
-            for next = (sb-c::compiled-debug-fun-next fmap-entry)
-            do
-            (unless (zerop offset)
-              (add-seg last-offset (- offset last-offset)
-                       last-debug-fun)
-              (setf last-debug-fun nil)
-              (setf last-offset offset))
-            (setf last-debug-fun
-                  (sb-di::make-compiled-debug-fun fmap-entry code))
-            (unless next
-              (add-seg last-offset
-                       (- (%code-text-size code) last-offset)
-                       last-debug-fun))
-            while next))
+      (dovector (fun-map-entry (code-fun-map code))
+        (etypecase fun-map-entry
+          (integer
+           (add-seg last-offset (- fun-map-entry last-offset)
+                    last-debug-fun)
+           (setf last-debug-fun nil)
+           (setf last-offset fun-map-entry))
+          (sb-c::compiled-debug-fun
+           (setf last-debug-fun
+                 (sb-di::make-compiled-debug-fun fun-map-entry code)))))
+      (when last-debug-fun
+        (add-seg last-offset
+                 (- (%code-text-size code) last-offset)
+                 last-debug-fun)))
     (nreverse segments)))
 
 ;;; Compute labels for all the memory segments in SEGLIST and adds
@@ -1985,7 +1948,13 @@
   (declare (type segment segment)
            (type stream stream)
            (type disassem-state dstate))
-  (let ((*print-pretty* nil)) ; otherwise the pp conses hugely
+  (let ((*print-pretty* nil) ; otherwise the pp conses hugely
+        ;; million-element bit vectors are no fun to see
+        (*print-vector-length*
+         (min (if (integerp *print-vector-length*)
+                  *print-vector-length*
+                  most-positive-fixnum)
+              100)))
     (number-labels dstate)
     (map-segment-instructions
      (lambda (chunk inst)
@@ -2011,12 +1980,13 @@
                       (name (and debug-fun (debug-fun-name debug-fun))))
                  (when name
                    (format stream " ~Vt ; " *disassem-note-column*)
-                   (typecase (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun)
-                     (sb-c::compiled-debug-fun-external
+                   (case (sb-c::compiled-debug-fun-kind
+                          (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
+                     (:external
                       (format stream "(XEP ~s)" name))
-                     (sb-c::compiled-debug-fun-optional
+                     (:optional
                       (format stream "(&OPTIONAL ~s)" name))
-                     (sb-c::compiled-debug-fun-more
+                     (:more
                       (format stream "(&MORE ~s)" name))
                      (t (prin1 name stream)))))))
         ;; One origin per segment is printed. As with the per-line display,
@@ -2071,6 +2041,8 @@
       (sb-pcl::%method-function
        ;; user's code is in the fast-function
        (cons fun (recurse (sb-pcl::%method-function-fast-function fun))))
+      (funcallable-instance
+       (list (%funcallable-instance-fun fun)))
       (function
        (list fun)))))
 
@@ -2141,29 +2113,15 @@
            (function (fun-code-header (%fun-fun thing)))
            (code-component thing)))
          (dstate (make-dstate))
-         (segments
-          (if (eq code-component sb-fasl:*assembler-routines*)
-              (collect ((segs))
-                (dohash ((name locs) (%code-debug-info code-component))
-                  (destructuring-bind (start end . index) locs
-                    (declare (ignore index))
-                    (let ((seg (make-code-segment
-                                code-component start (- (1+ end) start))))
-                      (push (make-offs-hook :offset 0
-                                            :fun (lambda (stream dstate)
-                                                   (declare (ignore stream))
-                                                   (note (string name) dstate)))
-                            (seg-hooks seg))
-                      (segs seg))))
-                (sort (segs) #'< :key #'seg-virtual-location))
-              (get-code-segments code-component))))
+         (segments (get-code-segments code-component)))
     (when use-labels
       (label-segments segments dstate))
     (disassemble-segments segments stream dstate)
     (let ((n (code-jump-table-words code-component)))
       (when (> n 1)
-        (format stream "; Jump table (~d entries)~%" (1- n))
         (let ((sap (code-instructions code-component)))
+          (format stream "; Jump table (~d entries) @ ~X~%" (1- n)
+                  (sap-int (sap+ sap sb-vm:n-word-bytes)))
           (dotimes (i (1- n))
             (let ((a (sap-ref-word sap (ash (1+ i) sb-vm:word-shift))))
               (format stream "; ~vt~v,'02x = ~a~%"
@@ -2191,12 +2149,16 @@
                           ;; What could it do- disassemble the interpreter?
                           (error "Can't disassemble a special operator"))
                          (t (get-compiled-funs object))))
+      (when (code-component-p object)
+        (let* ((base (- (get-lisp-obj-address object) sb-vm:other-pointer-lowtag))
+               (insts (code-instructions object)))
+        (format stream "~&; Base: ~x Data: ~x~%" base (sap-int insts))))
       (disassemble-code-component thing :stream stream)))))
 
 ;;;; code to disassemble assembler segments
 
 ;;; Disassemble the machine code instructions associated with
-;;; BYTES (a vector of assembly-unit) betwen each of RANGES.
+;;; BYTES (a vector of assembly-unit) between each of RANGES.
 (defun disassemble-assem-segment (bytes ranges stream)
   (declare (type stream stream))
   (let* ((dstate (make-dstate))
@@ -2216,8 +2178,7 @@
 (define-load-time-global *grokked-symbol-slots*
   (sort (copy-list `((,sb-vm:symbol-value-slot . symbol-value)
                      (,sb-vm:symbol-info-slot . symbol-info)
-                     (,sb-vm:symbol-name-slot . symbol-name)
-                     (,sb-vm:symbol-package-slot . symbol-package)))
+                     (,sb-vm:symbol-name-slot . symbol-name)))
         #'<
         :key #'car))
 
@@ -2264,28 +2225,26 @@
                         (setf (gethash (funcall addr-xform address) addr->name) name))
                       name->addr)))
       (let ((code sb-fasl:*assembler-routines*))
-        (invert (%code-debug-info code)
+        (invert (sb-fasl::%asm-routine-table code)
                 (lambda (x) (sap-int (sap+ (code-instructions code) (car x)))))))
     (dovector (name sb-vm::+all-static-fdefns+)
       ;; ENTER-ALIEN-CALLBACK is not fboundp until src/code/alien-callback
       ;; is compiled, so don't fail in function-raw-address.
       (when (fboundp name)
         (let ((address
-               #+immobile-code (sb-vm::function-raw-address name)
-               #-immobile-code (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
+                #+(and x86-64 immobile-code) (sb-vm::function-raw-address name :rel32)
+                #-(and x86-64 immobile-code) (+ sb-vm:nil-value (sb-vm:static-fun-offset name))))
           (setf (gethash address addr->name) name))))
     ;; Not really a routine, but it uses the similar logic for annotations
-    #+sb-safepoint
-    (setf (gethash (+ sb-vm:gc-safepoint-page-addr
-                      sb-c:+backend-page-bytes+
-                      (- sb-vm:gc-safepoint-trap-offset)) addr->name)
+    #+(and sb-safepoint (not x86-64))
+    (setf (gethash (- sb-vm:static-space-start sb-vm:gc-safepoint-trap-offset) addr->name)
           "safepoint"))
   (let ((found (gethash address addr->name)))
     (cond (found
            (values found 0))
           (t
            (let* ((code sb-fasl:*assembler-routines*)
-                  (hashtable (%code-debug-info code))
+                  (hashtable (sb-fasl::%asm-routine-table code))
                   (start (sap-int (code-instructions code)))
                   (end (+ start (1- (%code-text-size code)))))
              (when (<= start address end) ; it has to be an asm routine
@@ -2345,6 +2304,13 @@
                    length
                    (dstate-byte-order dstate))
       (incf (dstate-next-offs dstate) length))))
+
+(defun read-signed-suffix (length dstate)
+  (declare (type (member 8 16 32 64) length)
+           (type disassem-state dstate)
+           (optimize (speed 3) (safety 0)))
+  (sign-extend (read-suffix length dstate) length))
+
 
 ;;;; optional routines to make notes about code
 
@@ -2384,15 +2350,23 @@
 
 (defun note-code-constant (location dstate &optional (how :relative))
   (declare (type disassem-state dstate))
+  (multiple-value-bind (const valid)
+      (code-constant-value location dstate how)
+    (when valid
+      (note (lambda (stream) (prin1-quoted-short const stream)) dstate)
+      (values const t))))
+
+(defun code-constant-value (location dstate &optional (how :relative))
+  (declare (type disassem-state dstate))
   (binding* ((code (seg-code (dstate-segment dstate)))
              ((addr index)
               (ecase how
                (:relative
                 ;; When CODE-TN has a lowtag (as it usually does), we add it in here.
-                ;; x86-64 does not have a code-tn, but it behaves like ppc64
+                ;; x86-64 and arm64 do not have a code-tn, but they behave like ppc64
                 ;; in that the displacement is relative to the base of the code.
                 (let ((addr (+ location
-                               #-(or x86-64 ppc64) sb-vm:other-pointer-lowtag)))
+                               #-(or x86-64 ppc64 arm64) sb-vm:other-pointer-lowtag)))
                   (values addr (ash addr (- sb-vm:word-shift)))))
                (:absolute
                 ;; Concerning object movement:
@@ -2413,9 +2387,7 @@
     (cond ((and code (< 1 index (code-header-words code)))
            (when addr ; ADDR must be word-aligned to be sensible
              (aver (not (logtest addr (ash sb-vm:lowtag-mask -1)))))
-           (let ((const (code-header-ref code index)))
-             (note (lambda (stream) (prin1-quoted-short const stream)) dstate)
-             (values const t)))
+           (values (code-header-ref code index) t))
           (t
            (values nil nil)))))
 
@@ -2423,6 +2395,13 @@
   (let* ((seg (dstate-segment dstate))
          (code (seg-code seg)))
     (when code
+      ;; check for exact pointers first
+      (loop for i from sb-vm:code-constants-offset
+            below (code-header-words code)
+            when (eql (get-lisp-obj-address (code-header-ref code i))
+                      value)
+            do (return-from find-code-constant-from-interior-pointer
+                 (code-header-ref code i)))
       (let ((callables (seg-code-callables seg)))
         (when (eq callables :?)
           (setq callables nil)
@@ -2509,12 +2488,15 @@
     (when name
       (when (eql offs 0)
         (setq offs nil))
-      (note (cond (note-address-p
-                   (format nil "#x~8,'0x: ~a~@[ +~d~]" address name offs))
-                  (offs
-                   (format nil "~a +~d" name offs))
-                  (t
-                   (string name)))
+      (note (lambda (stream)
+              (cond (note-address-p
+                     (format stream "#x~8,'0x: ~a~@[ +~d~]" address name offs))
+                    (offs
+                     (format stream "~a +~d" name offs))
+                    ((stringp name)
+                     (princ name stream))
+                    (t
+                     (prin1 name stream))))
             dstate))
     name))
 
@@ -2574,32 +2556,7 @@
              (dovector (symbol sb-vm:+static-symbols+)
                (when (= (get-lisp-obj-address symbol) address)
                  (return-from found symbol))))
-           ;; Guess whether 'address' is an immobile-space symbol by looking at
-           ;; code header constants. If it matches any constant, assume that it
-           ;; is a use of the constant.  This has false positives of course,
-           ;; as does MAYBE-NOTE-STATIC-SYMBOL in general - any random immediate
-           ;; used in an unboxed context, such as an ADD instruction,
-           ;; might be wrongly construed as an address.
-           #+immobile-space
-           (let ((code (seg-code (dstate-segment dstate))))
-             (when code
-               (loop for i downfrom (1- (code-header-words code))
-                     to sb-vm:code-constants-offset
-                     for const = (code-header-ref code i)
-                     when (eql (get-lisp-obj-address const) address)
-                     do (return-from found const))
-               ;; Kludge: layout of STREAM, FILE-STREAM, and STRING-STREAM can be used
-               ;; as immediate operands without a corresponding boxed header constant.
-               ;; I think we always elide the boxed constant for builtin layouts,
-               ;; but these three have some slightly unusual codegen that causes a PUSH
-               ;; instruction to need some help to show its operand as a lisp object.
-               (dolist (thing (load-time-value (list (find-layout 'stream)
-                                                     (find-layout 'file-stream)
-                                                     (find-layout 'string-stream))
-                                               t))
-                 (when (eql (get-lisp-obj-address thing) address)
-                   (return-from found thing)))))
-           (return-from maybe-note-static-symbol))))
+          (return-from maybe-note-static-symbol))))
     (note (lambda (s) (prin1 symbol s)) dstate)))
 
 (defun get-internal-error-name (errnum)
@@ -2638,21 +2595,22 @@
            (type (or null stream) stream)
            (type disassem-state dstate))
   (multiple-value-bind (errnum adjust sc+offsets lengths error-byte)
-       (funcall error-parse-fun
-                (dstate-segment-sap dstate)
-                (dstate-next-offs dstate)
-                trap-number
-                (null stream))
+      (funcall error-parse-fun
+               (dstate-segment-sap dstate)
+               (dstate-next-offs dstate)
+               trap-number
+               (null stream))
     (when stream
        (setf (dstate-cur-offs dstate)
              (dstate-next-offs dstate))
        (flet ((emit-err-arg ()
                 (let ((num (pop lengths)))
-                  (print-notes-and-newline stream dstate)
-                  (print-current-address stream dstate)
-                  (print-inst num stream dstate)
-                  (print-bytes num stream dstate)
-                  (incf (dstate-cur-offs dstate) num)))
+                  (unless (zerop num)
+                    (print-notes-and-newline stream dstate)
+                    (print-current-address stream dstate)
+                    (print-inst num stream dstate)
+                    (print-bytes num stream dstate)
+                    (incf (dstate-cur-offs dstate) num))))
               (emit-note (note)
                 (when note
                   (note (string note) dstate))))
@@ -2670,11 +2628,10 @@
 ;;; so can't easily share this code.
 ;;; But probably we should just add the conditionalization in here.
 #-arm64
-(defun snarf-error-junk (sap offset trap-number &optional length-only (compact-error-trap t))
+(defun snarf-error-junk (sap offset trap-number &optional length-only)
   (let* ((index offset)
          (error-byte t)
-         (error-number (cond ((and compact-error-trap
-                                   (>= trap-number sb-vm:error-trap))
+         (error-number (cond ((>= trap-number sb-vm:error-trap)
                               (setf error-byte nil)
                               (- trap-number sb-vm:error-trap))
                              (t
@@ -2769,13 +2726,14 @@
   ;; nontrivial, the code-generating code is not so useful after the
   ;; initial instruction space is built, so it can all be removed.
   ;; But if you need all these macros to exist for some reason,
-  ;; then define one of the two following features to keep them:
-  #-(or sb-fluid sb-retain-assembler-macros)
+  ;; then define the following feature to keep them:
+  #-sb-retain-assembler-macros
   (do-symbols (symbol sb-assem::*backend-instruction-set-package*)
     (remf (symbol-plist symbol) 'arg-type)
     (remf (symbol-plist symbol) 'inst-format)))
 
 ;; Remove macros that only make sense with metadata available.
 ;; Tree shaker will remove everything that the macros depended on.
-(push '("SB-DISASSEM" define-arg-type define-instruction-format)
+(push '("SB-DISASSEM" define-arg-type define-instruction-format
+        gen-arg-forms %gen-arg-forms)
       *!removable-symbols*)

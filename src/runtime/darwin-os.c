@@ -15,7 +15,7 @@
  */
 
 #include "thread.h"
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "globals.h"
 #include "runtime.h"
 #include "interr.h"
@@ -26,21 +26,6 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <pthread.h>
-#include <mach/mach.h>
-#include <mach/clock.h>
-#include <stdlib.h>
-#include <time.h>
-#include <sys/syscall.h>
-
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-#include <libkern/OSAtomic.h>
-#endif
-
-#if defined(LISP_FEATURE_SB_WTIMER)
-# include <sys/types.h>
-# include <sys/event.h>
-# include <sys/time.h>
-#endif
 
 char *os_get_runtime_executable_path()
 {
@@ -53,168 +38,26 @@ char *os_get_runtime_executable_path()
     return copied_string(path);
 }
 
-
-semaphore_t clock_sem = MACH_PORT_NULL;
-mach_port_t clock_port = MACH_PORT_NULL;
-
-void init_mach_clock() {
-    if (host_get_clock_service(mach_host_self(), SYSTEM_CLOCK, &clock_port)
-        != KERN_SUCCESS) {
-        lose("Error initializing clocks");
-    }
-
-    if (semaphore_create(mach_task_self_, &clock_sem, SYNC_POLICY_FIFO, 0)
-        != KERN_SUCCESS) {
-        lose("Error initializing clocks");
-    }
-}
-
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-
-/* exc_server handles mach exception messages from the kernel and
- * calls catch exception raise. We use the system-provided
- * mach_msg_server, which, I assume, calls exc_server in a loop.
- *
- */
-extern boolean_t exc_server();
-
-void *
-mach_exception_handler(void *port)
-{
-  mach_msg_server(exc_server, 2048, (mach_port_t) port, 0);
-  /* mach_msg_server should never return, but it should dispatch mach
-   * exceptions to our catch_exception_raise function
-   */
-  lose("mach_msg_server returned");
-}
-
-/* Sets up the thread that will listen for mach exceptions. note that
-   the exception handlers will be run on this thread. This is
-   different from the BSD-style signal handling situation in which the
-   signal handlers run in the relevant thread directly. */
-
-mach_port_t mach_exception_handler_port_set = MACH_PORT_NULL;
-
-pthread_t
-setup_mach_exception_handling_thread()
-{
-    kern_return_t ret;
-    pthread_t mach_exception_handling_thread = NULL;
-    pthread_attr_t attr;
-
-    /* allocate a mach_port for this process */
-    ret = mach_port_allocate(mach_task_self(),
-                             MACH_PORT_RIGHT_PORT_SET,
-                             &mach_exception_handler_port_set);
-
-    /* create the thread that will receive the mach exceptions */
-
-    FSHOW((stderr, "Creating mach_exception_handler thread!\n"));
-
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN);
-    pthread_create(&mach_exception_handling_thread,
-                   &attr,
-                   mach_exception_handler,
-                   (void*)(long)mach_exception_handler_port_set);
-    pthread_attr_destroy(&attr);
-
-    return mach_exception_handling_thread;
-}
-
-/* tell the kernel that we want EXC_BAD_ACCESS exceptions sent to the
-   exception port (which is being listened to do by the mach
-   exception handling thread). */
-kern_return_t
-mach_lisp_thread_init(struct thread * thread)
-{
-    kern_return_t ret;
-    mach_port_t current_mach_thread, thread_exception_port;
-
-    if (mach_port_allocate(mach_task_self(),
-                           MACH_PORT_RIGHT_RECEIVE,
-                           &thread_exception_port) != KERN_SUCCESS) {
-        lose("Cannot allocate thread_exception_port");
-    }
-
-    if (mach_port_set_context(mach_task_self(), thread_exception_port,
-                              (mach_vm_address_t)thread)
-        != KERN_SUCCESS) {
-        lose("Cannot set thread_exception_port context");
-    }
-    thread->mach_port_name = thread_exception_port;
-
-    /* establish the right for the thread_exception_port to send messages */
-    ret = mach_port_insert_right(mach_task_self(),
-                                 thread_exception_port,
-                                 thread_exception_port,
-                                 MACH_MSG_TYPE_MAKE_SEND);
-    if (ret) {
-        lose("mach_port_insert_right failed with return_code %d", ret);
-    }
-
-    current_mach_thread = mach_thread_self();
-    ret = thread_set_exception_ports(current_mach_thread,
-                                     EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
-                                     thread_exception_port,
-                                     EXCEPTION_DEFAULT,
-                                     THREAD_STATE_NONE);
-    if (ret) {
-        lose("thread_set_exception_ports failed with return_code %d", ret);
-    }
-
-    ret = mach_port_deallocate (mach_task_self(), current_mach_thread);
-    if (ret) {
-        lose("mach_port_deallocate failed with return_code %d", ret);
-    }
-
-    ret = mach_port_move_member(mach_task_self(),
-                                thread_exception_port,
-                                mach_exception_handler_port_set);
-    if (ret) {
-        lose("mach_port_move_member failed with return_code %d", ret);
-    }
-
-    return ret;
-}
-
-void
-mach_lisp_thread_destroy(struct thread *thread) {
-    mach_port_t port = thread->mach_port_name;
-    FSHOW((stderr, "Deallocating mach port %x\n", port));
-    if (mach_port_move_member(mach_task_self(), port, MACH_PORT_NULL)
-        != KERN_SUCCESS) {
-        lose("Error destroying an exception port");
-    }
-    if (mach_port_deallocate(mach_task_self(), port) != KERN_SUCCESS) {
-        lose("Error destroying an exception port");
-    }
-
-    if (mach_port_destroy(mach_task_self(), port) != KERN_SUCCESS) {
-        lose("Error destroying an exception port");
-    }
-}
-#endif
-
 void
 darwin_reinit() {
-    init_mach_clock();
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-    setup_mach_exception_handling_thread();
-    mach_lisp_thread_init(all_threads);
+#ifdef LISP_FEATURE_SB_THREAD
+    struct extra_thread_data *extra_data = thread_extra_data(get_sb_vm_thread());
+#ifndef LISP_FEATURE_SB_SAFEPOINT
+    os_sem_init(&extra_data->state_sem, 1);
+    os_sem_init(&extra_data->state_not_running_sem, 0);
+    os_sem_init(&extra_data->state_not_stopped_sem, 0);
+#endif
+    os_sem_init(&extra_data->sprof_sem, 0);
 #endif
 }
 
 void darwin_init(void)
 {
-    init_mach_clock();
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-    setup_mach_exception_handling_thread();
-#endif
+
 }
 
 
-#ifdef LISP_FEATURE_SB_THREAD
+#if defined LISP_FEATURE_SB_THREAD && defined USE_DARWIN_GCD_SEMAPHORES
 
 inline void
 os_sem_init(os_sem_t *sem, unsigned int value)
@@ -224,13 +67,13 @@ os_sem_init(os_sem_t *sem, unsigned int value)
 }
 
 inline void
-os_sem_wait(os_sem_t *sem, char *what)
+os_sem_wait(os_sem_t *sem)
 {
     dispatch_semaphore_wait(*sem, DISPATCH_TIME_FOREVER);
 }
 
 void
-os_sem_post(os_sem_t *sem, char *what)
+os_sem_post(os_sem_t *sem)
 {
     dispatch_semaphore_signal(*sem);
 }
@@ -241,130 +84,115 @@ os_sem_destroy(os_sem_t *sem)
     dispatch_release(*sem);
 }
 
-#endif
+#ifdef LISP_FEATURE_SB_FUTEX
+// ulock (~futex) junk from xnu.  timeout=0 means wait forever
+int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout);             // timeout in us
+int __ulock_wait2(uint32_t operation, void *addr, uint64_t value, uint64_t timeout, uint64_t value2); // timeout in ns.  only available as of macos 11
+int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
 
-#if defined(LISP_FEATURE_SB_WTIMER)
+// operation bits [7, 0] contain the operation code.
+#define UL_COMPARE_AND_WAIT             1
+#define UL_UNFAIR_LOCK                  2
+#define UL_COMPARE_AND_WAIT_SHARED      3
+#define UL_UNFAIR_LOCK64_SHARED         4
+#define UL_COMPARE_AND_WAIT64           5
+#define UL_COMPARE_AND_WAIT64_SHARED    6
 
-# error Completely untested. Go ahead! Remove this line, try your luck!
+// operation bits [15, 8] contain the flags for __ulock_wake
+#define ULF_WAKE_ALL                    0x00000100 // wake all waiting threads (default is to just wake one)
+#define ULF_WAKE_THREAD                 0x00000200 // thread id specified in wake_value
+#define ULF_WAKE_ALLOW_NON_OWNER        0x00000400 // allow lock to be released other than by its owner, only for UL_UNFAIR_LOCK
 
-/*
- * Waitable timer implementation for the safepoint-based (SIGALRM-free)
- * timer facility using kqueue.
- *
- * Unlike FreeBSD with its ms (!) timer resolution, Darwin supports ns
- * timer resolution -- or at least it pretends to do so on the API
- * level (?).  To use it, we need the *64 versions of the functions and
- * structures.
- *
- * Unfortunately, I don't run Darwin, and can't test this code, so it's
- * just a hopeful translation from FreeBSD.
- */
+// operation bits [23, 16] contain the flags for __ulock_wait
+#define ULF_WAIT_WORKQ_DATA_CONTENTION  0x00010000 // The waiter is contending on this lock for synchronization around global data.  This causes the workqueue subsystem to not create new threads to offset for waiters on this lock.
+#define ULF_WAIT_CANCEL_POINT           0x00020000 // This wait is a cancelation point.
+#define ULF_WAIT_ADAPTIVE_SPIN          0x00040000 // Use adaptive spinning when the thread that currently holds the unfair lock is on core.
+
+// operation bits [31, 24] contain the generic flags, which can be used with both __ulock_wait and __ulock_wake
+#define ULF_NO_ERRNO                    0x01000000 // return errors as negative codes instead of setting errno
 
 int
-os_create_wtimer()
+futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
 {
-    int kq = kqueue();
-    if (kq == -1)
-        lose("os_create_wtimer: kqueue");
-    return kq;
-}
+    unsigned long timeout;
+    if (sec == 0 && usec == 0)
+        return 1;
 
-int
-os_wait_for_wtimer(int kq)
-{
-    struct kevent64_s ev;
-    int n;
-    if ( (n = kevent64(kq, 0, 0, &ev, 1, 0, 0)) == -1) {
-        if (errno != EINTR)
-            lose("os_wtimer_listen failed");
-        n = 0;
-    }
-    return n != 1;
-}
-
-void
-os_close_wtimer(int kq)
-{
-    if (close(kq) == -1)
-        lose("os_close_wtimer failed");
-}
-
-void
-os_set_wtimer(int kq, int sec, int nsec)
-{
-    int64_t nsec = ((int64_t) sec) * 1000000000 + (int64_t) nsec;
-
-    struct kevent64_s ev;
-    EV_SET64(&ev, 1, EVFILT_TIMER, EV_ADD|EV_ENABLE|EV_ONESHOT, NOTE_NSECONDS,
-             nsec, 0, 0, 0);
-    if (kevent64(kq, &ev, 1, 0, 0, 0, 0) == -1)
-        perror("os_set_wtimer: kevent");
-}
-
-void
-os_cancel_wtimer(int kq)
-{
-    struct kevent64_s ev;
-    EV_SET64(&ev, 1, EVFILT_TIMER, EV_DISABLE, 0, 0, 0, 0, 0);
-    if (kevent64(kq, &ev, 1, 0, 0, 0, 0) == -1 && errno != ENOENT)
-        perror("os_cancel_wtimer: kevent");
-}
-#endif
-
-/* nanosleep() is not re-entrant on some versions of Darwin,
- * reimplement it using the underlying syscalls. */
-int
-sb_nanosleep(time_t sec, int nsec) {
-    int ret;
-    mach_timespec_t current_time;
-    mach_timespec_t start_time;
-
-    if (sec < 0 || nsec >= (int)NSEC_PER_SEC) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    ret = clock_get_time(clock_port, &start_time);
-    if (ret != KERN_SUCCESS) {
-            lose("%s", mach_error_string(ret));
-    }
-
-    for (;;) {
-
-      /* Older version do not have a wrapper. */
-      ret = syscall(SYS___semwait_signal, (int)clock_sem, (int)MACH_PORT_NULL, (int)1, (int)1,
-                    (__int64_t)sec, (__int32_t)nsec);
-        if (ret < 0) {
-            if (errno == ETIMEDOUT) {
-                return 0;
-            }
-            if (errno == EINTR) {
-                ret = clock_get_time(clock_port, &current_time);
-                if (ret != KERN_SUCCESS) {
-                    lose("%s", mach_error_string(ret));
-                }
-                time_t elapsed_sec = current_time.tv_sec - start_time.tv_sec;
-                int elapsed_nsec = current_time.tv_nsec - start_time.tv_nsec;
-                if (elapsed_nsec < 0) {
-                    elapsed_sec--;
-                    elapsed_nsec += NSEC_PER_SEC;
-                }
-                sec -= elapsed_sec;
-                nsec -= elapsed_nsec;
-                if (nsec < 0) {
-                    sec--;
-                    nsec += NSEC_PER_SEC;
-                }
-                if (sec < 0 || (sec == 0 && nsec == 0)) {
-                    return 0;
-                }
-                start_time = current_time;
-            } else {
-                errno = EINVAL;
-                return -1;
-            }
-        } else {
-            return -1;
+    if (sec < 0) {
+        timeout = 0;
+    } else {
+        if (__builtin_umull_overflow((unsigned long)sec, 1000000000ul, &timeout)
+            || __builtin_umull_overflow(usec, 1000ul, &usec)
+            || __builtin_uaddl_overflow(usec, timeout, &timeout)) {
+            timeout = 0xfffffffffffffffful;
         }
     }
+
+    int ret = __ulock_wait2(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, lock_word, oldval, timeout, 0);
+    if (ret == 0)
+        return 0;
+    else if (ret == -ETIMEDOUT)
+        return 1;
+    else if (ret == -EINTR)
+        return 2;
+    else
+        return -1;
 }
+
+int
+futex_wake(int *lock_word, int n)
+{
+    __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO | (n == 1 ? 0 : ULF_WAKE_ALL), lock_word, 0);
+    return 0;
+}
+#endif
+
+#elif defined LISP_FEATURE_SB_THREAD && defined CANNOT_USE_POSIX_SEM_T
+
+inline void
+os_sem_init(os_sem_t *sem, unsigned int value)
+{
+    if (KERN_SUCCESS!=semaphore_create(mach_task_self(), sem, SYNC_POLICY_FIFO, (int)value))
+        lose("os_sem_init(%p): %s", sem, strerror(errno));
+}
+
+inline void
+os_sem_wait(os_sem_t *sem)
+{
+    kern_return_t ret;
+  restart:
+    ret = semaphore_wait(*sem);
+    switch (ret) {
+    case KERN_SUCCESS:
+        return;
+        /* It is unclear just when we can get this, but a sufficiently
+         * long wait seems to do that, at least sometimes.
+         *
+         * However, a wait that long is definitely abnormal for the
+         * GC, so we complain before retrying.
+         */
+    case KERN_OPERATION_TIMED_OUT:
+        fprintf(stderr, "os_sem_wait(%p): %s", sem, strerror(errno));
+        /* This is analogous to POSIX EINTR. */
+    case KERN_ABORTED:
+        goto restart;
+    default:
+        lose("os_sem_wait(%p): %lu, %s", sem, (long unsigned)ret, strerror(errno));
+    }
+}
+
+void
+os_sem_post(os_sem_t *sem)
+{
+    if (KERN_SUCCESS!=semaphore_signal(*sem))
+        lose("os_sem_post(%p): %s", sem, strerror(errno));
+}
+
+void
+os_sem_destroy(os_sem_t *sem)
+{
+    if (-1==semaphore_destroy(mach_task_self(), *sem))
+        lose("os_sem_destroy(%p): %s", sem, strerror(errno));
+}
+
+#endif

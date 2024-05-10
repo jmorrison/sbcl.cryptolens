@@ -15,6 +15,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <ntstatus.h>
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -28,14 +29,16 @@
 #include "target-arch-os.h"
 #include "target-arch.h"
 
-#ifdef LISP_FEATURE_SB_THREAD
 #include "pthreads_win32.h"
-#else
-typedef void *siginfo_t;
-typedef int sigset_t;
-#endif
 
+#ifdef LISP_FEATURE_64_BIT
+/* LPVOID can't be legally used in pointer arithmetic.
+ * (so all the arithmetic in 'validate.h' is technically illegal).
+ * But I can't test 32-bit so let it stay as was */
+typedef char* os_vm_address_t;
+#else
 typedef LPVOID os_vm_address_t;
+#endif
 typedef uword_t os_vm_size_t;
 typedef intptr_t os_vm_offset_t;
 typedef int os_vm_prot_t;
@@ -45,17 +48,11 @@ typedef int os_vm_prot_t;
 #define OS_VM_PROT_WRITE   2
 #define OS_VM_PROT_EXECUTE 4
 
-#define os_open_core(file,mode) win32_open_for_mmap(file)
-#define HAVE_os_open_core
-
-#define os_fopen_runtime(file,mode) win32_fopen_runtime()
-#define HAVE_os_fopen_runtime
-
 extern int os_number_of_processors;
 #define HAVE_os_number_of_processors
 
-extern int win32_open_for_mmap(const char* file);
-extern FILE* win32_fopen_runtime();
+extern ULONG win32_stack_guarantee;
+extern DWORD win32_page_size;
 
 // 64-bit uses whatever TLS index the kernels gives us which we store in
 // 'sbcl_thread_tls_index' to hold our thread-local value of the pointer
@@ -68,11 +65,6 @@ extern DWORD sbcl_thread_tls_index;
 #else
 #define OUR_TLS_INDEX 63
 #endif
-#define SIG_MEMORY_FAULT SIGSEGV
-
-#define SIG_STOP_FOR_GC (SIGRTMIN+1)
-#define SIG_DEQUEUE (SIGRTMIN+2)
-#define SIG_THREAD_EXIT (SIGRTMIN+3)
 
 struct lisp_exception_frame {
     struct lisp_exception_frame *next_frame;
@@ -83,8 +75,7 @@ struct lisp_exception_frame {
 void wos_install_interrupt_handlers(struct lisp_exception_frame *handler);
 char *dirname(char *path);
 
-boolean win32_maybe_interrupt_io(void* thread);
-void os_revalidate_bzero(os_vm_address_t addr,  os_vm_size_t len);
+bool win32_maybe_interrupt_io(void* thread);
 
 int sb_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
 

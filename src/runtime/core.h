@@ -12,8 +12,14 @@
 #ifndef _CORE_H_
 #define _CORE_H_
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
+
+/* This is the largest ID of any core space that can be saved to disk, so
+ * disregarding THREAD-STRUCT-CORE-SPACE-ID and ALIEN-LINKAGE-TABLE-CORE-SPACE-ID.
+ * The constant is mainly for dimensioning some C arrrays, and a given platform
+ * might not utilize all possible space IDs */
+#define MAX_CORE_SPACE_ID 7
 
 typedef sword_t core_entry_elt_t;
 
@@ -50,7 +56,7 @@ extern os_vm_offset_t search_for_embedded_core(char *filename,
  * against a runtime with patches which add new C code) */
 extern unsigned char build_id[];
 
-char* get_asm_routine_by_name(const char* name);
+char* get_asm_routine_by_name(const char* name, int*);
 
 // By setting this to 0, all objects begin life in the nursery, and nothing
 // is pseudo-static. As such, any bugs due to code movement are likely to

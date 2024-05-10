@@ -13,7 +13,7 @@
 ;;;; signalling forms into code compiled at high debug settings, and
 ;;;; having a handler for them at the toplevel.
 
-(in-package "SB-IMPL") ; in warm SBCL
+(in-package "SB-IMPL")
 
 (defun step-form (form args)
   (restart-case
@@ -41,7 +41,7 @@
       t)))
 
 (defun step-values (form &rest values)
-  (declare (truly-dynamic-extent values))
+  (declare (dynamic-extent values))
   (signal 'step-values-condition :form form :result values)
   (values-list values))
 

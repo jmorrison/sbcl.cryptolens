@@ -44,26 +44,7 @@
          (index :scs (unsigned-reg))
          (value :scs (descriptor-reg)))
   (:arg-types simple-array-nil positive-fixnum *)
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
-  (:ignore index value result)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 1
-    (error-call vop 'nil-array-accessed-error object)))
-
-(define-vop (data-vector-set/simple-array-nil)
-  (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
-         (value :scs (descriptor-reg)))
-  (:info offset)
-  (:arg-types simple-array-nil positive-fixnum *
-              (:constant (integer 0 0)))
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
-  (:ignore index value result offset)
+  (:ignore index value)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
@@ -85,7 +66,7 @@
     ;; instruction pipe with undecodable junk (the sc-numbers).
     (error-call vop errcode object)))
 
-#+immobile-space
+#+(or immobile-space permgen) ; i.e. can LAYOUT instance have immediate SC
 (defun type-err-type-tn-loadp (thing)
   (cond ((sc-is thing immediate)
          (let ((obj (tn-value thing)))
@@ -111,7 +92,7 @@
                                                 unsigned-reg signed-reg constant
                                                 single-reg double-reg
                                                 complex-single-reg complex-double-reg)
-                                          #+immobile-space
+                                          #+(or immobile-space permgen)
                                           ,@(if (eq name 'sb-c::%type-check-error)
                                                 `(:load-if (type-err-type-tn-loadp ,arg)))))
                                  args))
@@ -130,27 +111,46 @@
   (def "UNKNOWN-KEY-ARG"         sb-c::%unknown-key-arg-error t   key)
   (def "ECASE-FAILURE"           ecase-failure                nil value keys)
   (def "ETYPECASE-FAILURE"       etypecase-failure            nil value keys)
-  (def "NIL-FUN-RETURNED"        nil                          nil fun)
+  (def "NIL-FUN-RETURNED"        nil-fun-returned-error       nil fun)
   (def "UNREACHABLE"             sb-impl::unreachable         nil)
   (def "FAILED-AVER"             sb-impl::%failed-aver        nil form))
 
 
-(defun emit-internal-error (kind code values &key trap-emitter
-                                                  (compact-error-trap t))
-  (let ((trap-number (if (and (eq kind error-trap)
-                              compact-error-trap)
+(defun emit-internal-error (kind code values &key trap-emitter)
+  (let ((trap-number (if (eq kind error-trap)
                          (+ kind code)
                          kind)))
     (if trap-emitter
         (funcall trap-emitter trap-number)
         (inst byte trap-number)))
-  (unless (and (eq kind error-trap)
-               compact-error-trap)
+  (unless (eq kind error-trap)
     (inst byte code))
   (encode-internal-error-args values))
 
+(defvar *adjustable-vectors*)
+
+(defmacro with-adjustable-vector ((var) &rest body)
+  `(let ((,var (or (pop *adjustable-vectors*)
+                   (make-array 16
+                               :element-type '(unsigned-byte 8)
+                               :fill-pointer 0
+                               :adjustable t))))
+     ;; Don't declare the length - if it gets adjusted and pushed back
+     ;; onto the freelist, it's anyone's guess whether it was expanded.
+     ;; This code was wrong for >12 years, so nobody must have needed
+     ;; more than 16 elements. Maybe we should make it nonadjustable?
+     (declare (type (vector (unsigned-byte 8)) ,var))
+     (setf (fill-pointer ,var) 0)
+     ;; No UNWIND-PROTECT here - semantics are unaffected by nonlocal exit,
+     ;; and this macro is about speeding up the compiler, not slowing it down.
+     ;; GC will clean up any debris, and since the vector does not point
+     ;; to anything, even an accidental promotion to a higher generation
+     ;; will not cause transitive garbage retention.
+     (prog1 (progn ,@body)
+       (push ,var *adjustable-vectors*))))
+
 (defun encode-internal-error-args (values)
-  (sb-c::with-adjustable-vector (vector)
+  (with-adjustable-vector (vector)
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset

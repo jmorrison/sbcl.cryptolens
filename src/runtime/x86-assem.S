@@ -18,7 +18,7 @@
 .section .note.GNU-stack,"",%progbits
 #endif
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "genesis/closure.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
@@ -51,15 +51,9 @@
  */
 #if defined(__linux__) || defined(LISP_FEATURE_FREEBSD) || defined(__NetBSD__) || defined(__OpenBSD__) || \
         defined(__sun) || defined(LISP_FEATURE_WIN32) || defined(__DragonFly__)
-#define align_4byte	4
-#define align_8byte	8
 #define align_16byte	16
-#define align_page	4096
 #else
-#define	align_4byte	2
-#define	align_8byte	3
 #define	align_16byte	4
-#define align_page	12
 #endif
 
 /*
@@ -654,7 +648,7 @@ GNAME(call_into_lisp_tramp):
         andl    $0xfffffff0, %esp  /* align stack */
         movl    $0x40, 4(%esp)
         movl    %ecx, (%esp)
-        call    GNAME(os_invalidate)
+        call    GNAME(os_alloc_gc_space)
 
         /* call call_into_lisp */
         leal    -48(%ebp), %esp
@@ -688,145 +682,6 @@ GNAME(post_signal_tramp):
 	ret
 	SIZE(GNAME(post_signal_tramp))
 
-
-#ifndef LISP_FEATURE_LINUX
-        /* fast_bzero implementations and code to detect which implementation
-         * to use.
-         */
-
-	.globl GNAME(fast_bzero_pointer)
-	.data
-        .align  align_16byte
-GNAME(fast_bzero_pointer):
-        /* Variable containing a pointer to the bzero function to use.
-         * Initially points to a basic function.  Change this variable
-         * to fast_bzero_detect if OS supports SSE.  */
-        .long GNAME(fast_bzero_base)
-
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(fast_bzero)
-	TYPE(GNAME(fast_bzero))
-GNAME(fast_bzero):
-        /* Indirect function call */
-        jmp *GNAME(fast_bzero_pointer)
-	SIZE(GNAME(fast_bzero))
-
-
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(fast_bzero_detect)
-	TYPE(GNAME(fast_bzero_detect))
-GNAME(fast_bzero_detect):
-        /* Decide whether to use SSE, MMX or REP version */
-        push %eax /* CPUID uses EAX-EDX */
-        push %ebx
-        push %ecx
-        push %edx
-        mov $1, %eax
-        cpuid
-        test $0x04000000, %edx    /* SSE2 needed for MOVNTDQ */
-        jnz Lsse2
-        /* Originally there was another case here for using the
-         * MOVNTQ instruction for processors that supported MMX but
-         * not SSE2. This turned out to be a loss especially on
-         * Athlons (where this instruction is apparently microcoded
-         * somewhat slowly). So for simplicity revert to REP STOSL
-         * for all non-SSE2 processors.
-         */
-Lbase:
-        movl $(GNAME(fast_bzero_base)), GNAME(fast_bzero_pointer)
-        jmp Lrestore
-Lsse2:
-        movl $(GNAME(fast_bzero_sse)), GNAME(fast_bzero_pointer)
-        jmp Lrestore
-
-Lrestore:
-        pop %edx
-        pop %ecx
-        pop %ebx
-        pop %eax
-        jmp *GNAME(fast_bzero_pointer)
-
-	SIZE(GNAME(fast_bzero_detect))
-
-
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(fast_bzero_sse)
-	TYPE(GNAME(fast_bzero_sse))
-
-GNAME(fast_bzero_sse):
-        /* A fast routine for zero-filling blocks of memory that are
-         * guaranteed to start and end at a 4096-byte aligned address.
-         */
-        push %esi                 /* Save temporary registers */
-        push %edi
-        mov 16(%esp), %esi        /* Parameter: amount of bytes to fill */
-        mov 12(%esp), %edi        /* Parameter: start address */
-        shr $6, %esi              /* Amount of 64-byte blocks to copy */
-        jz Lend_sse               /* If none, stop */
-        movups %xmm7, -16(%esp)   /* Save XMM register */
-        xorps  %xmm7, %xmm7       /* Zero the XMM register */
-        jmp Lloop_sse
-        .align align_16byte
-Lloop_sse:
-
-        /* Copy the 16 zeroes from xmm7 to memory, 4 times. MOVNTDQ is the
-         * non-caching double-quadword moving variant, i.e. the memory areas
-         * we're touching are not fetched into the L1 cache, since we're just
-         * going to overwrite the memory soon anyway.
-         */
-        movntdq %xmm7, 0(%edi)
-        movntdq %xmm7, 16(%edi)
-        movntdq %xmm7, 32(%edi)
-        movntdq %xmm7, 48(%edi)
-
-        add $64, %edi /* Advance pointer */
-        dec %esi      /* Decrement 64-byte block count */
-        jnz Lloop_sse
-        movups -16(%esp), %xmm7 /* Restore the XMM register */
-        sfence        /* Ensure that weakly ordered writes are flushed. */
-Lend_sse:
-        mov 12(%esp), %esi      /* Parameter: start address */
-        prefetcht0 0(%esi)      /* Prefetch the start of the block into cache,
-                                 * since it's likely to be used immediately. */
-        pop %edi      /* Restore temp registers */
-        pop %esi
-	ret
-	SIZE(GNAME(fast_bzero_sse))
-
-
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(fast_bzero_base)
-	TYPE(GNAME(fast_bzero_base))
-
-GNAME(fast_bzero_base):
-        /* A fast routine for zero-filling blocks of memory that are
-         * guaranteed to start and end at a 4096-byte aligned address.
-         */
-        push %eax                 /* Save temporary registers */
-        push %ecx
-        push %edi
-        mov 20(%esp), %ecx        /* Parameter: amount of bytes to fill */
-        mov 16(%esp), %edi        /* Parameter: start address */
-        xor %eax, %eax            /* Zero EAX */
-        shr $2, %ecx              /* Amount of 4-byte blocks to copy */
-        jz  Lend_base
-
-        rep
-        stosl                     /* Store EAX to *EDI, ECX times, incrementing
-                                   * EDI by 4 after each store */
-
-Lend_base:
-        pop %edi                  /* Restore temp registers */
-        pop %ecx
-        pop %eax
-	ret
-	SIZE(GNAME(fast_bzero_base))
-#endif /* LISP_FEATURE_LINUX */
-
 
 /* When LISP_FEATURE_C_STACK_IS_CONTROL_STACK, we cannot safely scrub
  * the control stack from C, largely due to not knowing where the
@@ -850,7 +705,7 @@ GNAME(arch_scrub_control_stack):
 	 * guard page upper bound in ECX, and our hard guard
 	 * page upper bound in EDX. */
 	lea	-4(%esp), %eax
-	mov	$BACKEND_PAGE_BYTES,%edx
+	mov	GNAME(os_vm_page_size),%edx
 	mov	%edx, %ecx
 	add	8(%esp), %ecx
 	add	12(%esp), %edx

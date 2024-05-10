@@ -63,9 +63,7 @@
   (:info target not-p test-layout)
   (:temporary (:sc unsigned-reg) this-id temp)
   (:generator 4
-    (let ((offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                             instance-slots-offset)
-                          word-shift)
+    (let ((offset (+ (id-bits-offset)
                      (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lw this-id x offset)
@@ -99,8 +97,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -121,10 +119,9 @@
 (define-vop (set-header-data)
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res)
-         (data :scs (any-reg immediate)))
+  (:args (x :scs (descriptor-reg))
+         (data :scs (any-reg immediate zero)))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) t1 t2)
   (:generator 6
     (load-type t1 x (- other-pointer-lowtag))
@@ -138,9 +135,9 @@
                 (inst ori t1 t1 val))
                (t
                 (inst li t2 val)
-                (inst or t1 t1 t2))))))
-    (storew t1 x 0 other-pointer-lowtag)
-    (move res x)))
+                (inst or t1 t1 t2)))))
+      (zero))
+    (storew t1 x 0 other-pointer-lowtag)))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)
@@ -152,14 +149,6 @@
 
 
 ;;;; Allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
@@ -236,38 +225,6 @@
     (inst add ndescr ndescr offset)
     (inst subi ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
-;;;
-(define-vop (symbol-info-vector)
-  (:policy :fast-safe)
-  (:translate symbol-info-vector)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    (inst andi temp res lowtag-mask)
-    (inst xori temp temp list-pointer-lowtag)
-    (inst bne temp zero-tn not-equal)
-    (loadw res res cons-cdr-slot list-pointer-lowtag)
-    NOT-EQUAL))
-
-(define-vop (symbol-plist)
-  (:policy :fast-safe)
-  (:translate symbol-plist)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc non-descriptor-reg) temp)
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; Instruction pun: (CAR x) is the same as (VECTOR-LENGTH x)
-    ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
-    (loadw res res cons-car-slot list-pointer-lowtag)
-    (inst andi temp res fixnum-tag-mask)
-    (inst bne temp zero-tn not-equal)
-    (move res null-tn)
-    NOT-EQUAL))
-
 
 ;;;; Other random VOPs.
 

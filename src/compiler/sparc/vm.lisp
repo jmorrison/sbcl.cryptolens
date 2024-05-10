@@ -46,7 +46,7 @@
 
   ;; Globals.  These are difficult to extract from a sigcontext.
   (defreg zero 0)                               ; %g0
-  (defreg alloc 1)                              ; %g1
+  (defreg thread 1)                             ; %g1
   (defreg null 2)                               ; %g2
   (defreg csp 3)                                ; %g3
   (defreg cfp 4)                                ; %g4
@@ -279,7 +279,7 @@
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
   (defregtn lip descriptor-reg)
-  (defregtn alloc any-reg)
+  (defregtn thread any-reg)
 
   (defregtn nargs any-reg)
   (defregtn bsp any-reg)
@@ -302,7 +302,10 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc zero-sc-number)
@@ -356,10 +359,6 @@
       (non-descriptor-stack (format nil "NS~D" offset))
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed"))))
-
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node) (ignore node))
-  (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))

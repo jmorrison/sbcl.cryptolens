@@ -14,75 +14,70 @@
 #-c-headers-only
 (macrolet ((frob ()
              `(progn ,@*!late-primitive-object-forms*)))
-  (frob)
-  (defknown symbol-extra (t) t (flushable))
-  (def-reffer 'symbol-extra symbol-size other-pointer-lowtag)
-  (defknown (setf symbol-extra) (t t) t ())
-  (def-setter '(setf symbol-extra) symbol-size other-pointer-lowtag))
-
-(defconstant extended-symbol-size (1+ symbol-size))
+  (frob))
 
 #+sb-thread
-(dolist (slot (primitive-object-slots
-               (find 'thread *primitive-objects* :key #'primitive-object-name)))
+(dovector (slot (primitive-object-slots (primitive-object 'thread)))
   (when (slot-special slot)
     (setf (info :variable :wired-tls (slot-special slot))
           (ash (slot-offset slot) word-shift))))
 
-#+gencgc
-(defconstant large-object-size
-  (* 4 (max +backend-page-bytes+ gencgc-card-bytes
-            gencgc-alloc-granularity)))
-
+(progn
+;;; don't change allocation granularity
+(assert (= gencgc-alloc-granularity 0))
+;;; cards are not larger than pages
+(assert (<= gencgc-page-bytes +backend-page-bytes+))
+;;; largeness does not depend on the hardware page size
+(defconstant large-object-size #-mark-region-gc (* 4 gencgc-page-bytes)
+                               #+mark-region-gc (* 3/4 gencgc-page-bytes))
+(assert (integerp large-object-size)))
 
 ;;; Keep this (mostly) lined up with 'early-objdef' for sanity's sake!
+;;; The "transport" function is used only if the object is an OTHER-POINTER
+;;; (which goes through the dispatch table).
 #+sb-xc-host
 (defparameter *scav/trans/size*
  (mapcar
   (lambda (entry)
     (cons (symbol-value (symbolicate (car entry) "-WIDETAG"))
           (cdr entry)))
-  `((bignum "unboxed" "bignum" "bignum")
+  `((bignum "bignum")
     (ratio "boxed" "ratio_or_complex" "boxed")
     (single-float ,(or #+64-bit "immediate" "unboxed"))
     (double-float "unboxed")
-    (complex "boxed" "ratio_or_complex" "boxed")
+    (complex-rational "boxed" "ratio_or_complex" "boxed")
     (complex-single-float "unboxed")
     (complex-double-float "unboxed")
 
-    (code-header "code_header")
-    ;; For all 3 function subtypes, the transporter is "lose"
-    ;; because functions are not OTHER pointer objects.
-    ;; The scavenge function for fun-header is basically "lose",
-    ;; but it's only defined on non-x86 platforms for some reason.
-    ;; The sizer is "lose" because it's an error if a function is encountered
-    ;; in a heap scan.
-    (simple-fun ,(or #+(or x86 x86-64) "lose" "fun_header") "lose" "lose")
+    (code-header "code_blob")
+    ;; For simple-fun, all three methods are "lose": "scav" is because you can't
+    ;; encounter a simple-fun in heap scanning; "trans" is because it's not an OTHER pointer,
+    ;; and "size" is because you can't take the size of a simple-fun by itself.
+    (simple-fun "lose")
     ;; The closure scavenge function needs to know if the "self" slot
     ;; has pointer nature though it be fixnum tagged, as on x86.
     ;; The sizer is short_boxed.
-    (closure ,(or #+(or x86 x86-64) "closure" "short_boxed") "lose" "short_boxed")
+    (closure ,(or #+(or x86 x86-64 arm64) "closure" "short_boxed") "lose" "short_boxed")
     ;; Like closure, but these can also have a layout pointer in the high header bytes.
     (funcallable-instance "funinstance" "lose" "short_boxed")
     ;; These have a scav and trans function, but no size function.
-    #-(or x86 x86-64) (return-pc "return_pc_header" "return_pc_header" "lose")
+    #-(or x86 x86-64 arm64 riscv)
+    (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
-    (symbol "tiny_boxed")
+    (symbol "symbol")
     ;; Can't transport characters as "other" pointer objects.
     ;; It should be a cons cell half which would go through trans_list()
     (character "immediate")
     (sap "unboxed")
     (unbound-marker "immediate")
-    (weak-pointer "weak_pointer" "weak_pointer" "boxed")
+    (weak-pointer "weakptr")
     (instance "instance" "lose" "instance")
     (fdefn "fdefn")
 
-    (no-tls-value-marker "immediate")
-
     #+sb-simd-pack (simd-pack "unboxed")
     #+sb-simd-pack-256 (simd-pack-256 "unboxed")
-    (filler "unboxed")
+    (filler "filler" "lose" "filler")
 
     (simple-array "array")
     (simple-array-unsigned-byte-2 "vector_unsigned_byte_2")
@@ -111,11 +106,13 @@
     (simple-array-complex-double-float "vector_unsigned_byte_128")
 
     (simple-bit-vector "vector_bit")
-    (simple-vector "vector")
+    (simple-vector "vector_t")
 
     (simple-array-nil "vector_nil")
     (simple-base-string "base_string")
-    #+sb-unicode (simple-character-string "character_string")
+    ;; UB32 works fine for character string, unless we decide to reimplement
+    ;; using 3 octets per code point.
+    #+sb-unicode (simple-character-string "vector_unsigned_byte_32")
     #+sb-unicode (complex-character-string "array")
     (complex-base-string "array")
 
@@ -125,7 +122,7 @@
 
 #+sb-xc-host
 (defun write-gc-tables (stream)
-  (format stream "#include \"lispobj.h\"~%")
+  (format stream "#include ~S~%" (sb-fasl::lispobj-dot-h))
   ;; Compute a bitmask of all specialized vector types,
   ;; not including array headers, for maybe_adjust_large_object().
   (let ((min #xff) (bits 0))
@@ -139,7 +136,7 @@
             min (ldb (byte 32 32) bits))
     ;; Union in the bits for other unboxed object types.
     (dolist (entry *scav/trans/size*)
-      (when (string= (second entry) "unboxed")
+      (when (member (second entry) '("bignum" "unboxed" "filler") :test 'string=)
         (setf bits (logior bits (ash 1 (ash (car entry) -2))))))
     (format stream "static inline int leaf_obj_widetag_p(unsigned char widetag) {~%")
     #+64-bit (format stream "  return (0x~XLU >> (widetag>>2)) & 1;" bits)
@@ -147,10 +144,6 @@
   return (bit<32 ? 0x~XU >> bit : 0x~XU >> (bit-32)) & 1;"
                       (ldb (byte 32 0) bits) (ldb (byte 32 32) bits))
     (format stream "~%}~%"))
-
-  (format stream "extern unsigned char widetag_lowtag[256];
-static inline lispobj compute_lispobj(lispobj* base_addr) {
-  return make_lispobj(base_addr, LOWTAG_FOR_WIDETAG(*base_addr & WIDETAG_MASK));~%}~%")
 
   (format stream "~%#ifdef WANT_SCAV_TRANS_SIZE_TABLES~%")
   (let ((lowtag-tbl (make-array 256 :initial-element 0)))
@@ -178,6 +171,7 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
                 (+ #x80 (case widetag
                           (#.instance-widetag instance-pointer-lowtag)
                           (#.+function-widetags+ fun-pointer-lowtag)
+                          (#.filler-widetag 0)
                           (t other-pointer-lowtag)))))))
     (format stream "unsigned char widetag_lowtag[256] = {")
     (dotimes (line 16)
@@ -208,6 +202,8 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
     #+ppc64
     (progn
       (fill ptrtab "scav_lose")
+      (setf (aref scavtab #xff) "consfiller"
+            (aref sizetab #xff) "consfiller")
       (setf (nth instance-pointer-lowtag ptrtab) "scav_instance_pointer"
             (nth list-pointer-lowtag ptrtab)     "scav_list_pointer"
             (nth fun-pointer-lowtag ptrtab)      "scav_fun_pointer"
@@ -237,21 +233,45 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
  = {~{~%  (void(*)(lispobj*,lispobj))~A~^,~}~%};~%" (length ptrtab) ptrtab)
       (write-table "static lispobj (*transother[64])(lispobj object)"
                    "trans_" transtab)
-      (format stream "#define size_pointer size_immediate~%")
+      (format stream "#define size_pointer (sizerfn)0~%")
+      (format stream "#define size_immediate (sizerfn)0~%")
       (format stream "#define size_unboxed size_boxed~%")
       (write-table "sword_t (*sizetab[256])(lispobj *where)"
                    "size_" sizetab)
+      (format stream "#undef size_immediate~%")
       (format stream "#undef size_pointer~%")
       (format stream "#undef size_unboxed~%")))
   (format stream "#endif~%"))
 
-;;; AVLNODE is primitive-object-like because it is needed by C code that looks up
-;;; entries in the tree of lisp threads.  But objdef doesn't have SB-XC:DEFSTRUCT
-;;; working, and I'm reluctant to create yet another 'something-thread' file to
-;;; put this in, not to mention that SB-THREAD is the wrong package anyway.
-(in-package "SB-THREAD")
-(sb-xc:defstruct (avlnode (:constructor avlnode (key data left right)))
-  (left  nil :read-only t)
-  (right nil :read-only t)
-  (key   0   :read-only t :type sb-vm:word)
-  data)
+(sb-xc:defstruct (arena (:constructor nil))
+  ;; Address of the 'struct arena_memblk' we're currently allocating to.
+  (current-block 0 :type word)
+  ;; Address of the one mandatory 'struct arena_memblk' for this arena
+  (first-block 0 :type word)
+  ;; Huge objects are those whose size exceeds a tiny fraction of the growth amount.
+  (huge-objects 0 :type word)
+  ;; Arena allocation parameters
+  (original-size 0 :type word)
+  (growth-amount 0 :type word) ; additive
+  ;; Maximum we'll allow the arena to grow to, accounting for extension blocks
+  ;; and huge object blocks.
+  (size-limit 0 :type word)
+  ;; Sum of sizes of currently allocated blocks
+  (length 0 :type word)
+  ;; Sum of unusable bytes resulting from discarding the tail of the
+  ;; most recently claimed chunk when switching from the arena to the heap.
+  (bytes-wasted 0 :type word)
+  ;; Small integer identifier starting from 0
+  (index 0 :type fixnum)
+  ;; T if all memory has been protected with PROT_NONE (for debugging)
+  hidden
+  ;; a counter that increments on each rewind, and which can be used by a threads
+  ;; in a pool to detect that their cached TLAB pointers are invalid
+  (token 0 :type word)
+  userdata
+  ;; Link for global chain of all arenas, needed for GC when 'scavenge_arenas' is 1,
+  ;; so that GC can find all in-use arenas.
+  ;; This is a tagged pointer to the next arena in the chain, terminated by NIL.
+  ;; It is 0 until added to the global chain so we can tell the difference between
+  ;; an arena that was made but never used, and one that was used at some point.
+  (link 0))

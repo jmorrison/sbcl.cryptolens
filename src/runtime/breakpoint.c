@@ -12,18 +12,19 @@
 #include <stdio.h>
 #include <signal.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
+#include "genesis/sap.h"
 #include "runtime.h"
 #include "os.h"
 #include "interrupt.h"
 #include "arch.h"
+#include "gc.h"
 #include "lispregs.h"
 #include "globals.h"
-#include "alloc.h"
 #include "breakpoint.h"
 #include "thread.h"
 #include "code.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 
 #define REAL_LRA_SLOT 0
 
@@ -82,7 +83,7 @@ lispobj find_code(os_context_t *context)
         return code - HeaderValue(header)*sizeof(lispobj);
 #else
     lispobj codeptr =
-        (lispobj)component_ptr_from_pc((char *)(*os_context_pc_addr(context)));
+        (lispobj)component_ptr_from_pc((char *)os_context_pc(context));
 
     if (codeptr == 0)
         return NIL;
@@ -94,7 +95,7 @@ lispobj find_code(os_context_t *context)
 static long compute_offset(os_context_t *context, lispobj code)
 {
   if (code != NIL) {
-        uword_t pc = *os_context_pc_addr(context);
+        uword_t pc = os_context_pc(context);
         struct code *codeptr = (struct code *)native_pointer(code);
         uword_t code_start = (uword_t)code_text_start(codeptr);
         int offset;
@@ -113,7 +114,7 @@ void handle_breakpoint(os_context_t *context)
     fake_foreign_function_call(context);
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals();
+    unblock_gc_stop_signal();
 #endif
     code = find_code(context);
 
@@ -140,7 +141,7 @@ void *handle_fun_end_breakpoint(os_context_t *context)
     fake_foreign_function_call(context);
 
 #ifndef LISP_FEATURE_SB_SAFEPOINT
-    unblock_gc_signals();
+    unblock_gc_stop_signal();
 #endif
 
     code = find_code(context);

@@ -83,6 +83,10 @@
   (process handle)
   (exit-code uint))
 
+(defun zero-alien (alien type)
+  `(alien-funcall (extern-alien "memset" (function void system-area-pointer int unsigned))
+                  (alien-sap ,alien) 0 (alien-size ,type :bytes)))
+
 (defun mswin-spawn (program argv stdin stdout stderr searchp envp directory window preserve-handles)
   (let ((std-handles (multiple-value-list (get-std-handles)))
         (inheritp nil))
@@ -95,9 +99,7 @@
               do (setf (inheritable-handle-p handle) t)))
       (with-alien ((process-information process-information)
                    (startup-info startup-info))
-        (sb-kernel:system-area-ub8-fill
-         0 (alien-sap startup-info)
-         0 (alien-size startup-info :bytes))
+        (zero-alien startup-info startup-info)
         (setf (slot startup-info 'cb) (alien-size startup-info :bytes)
               (slot startup-info 'stdin) (maybe-std-handle stdin)
               (slot startup-info 'stdout) (maybe-std-handle stdout)
@@ -159,7 +161,7 @@
 (defvar *console-control-enabled* nil)
 (defvar *console-control-spec* nil)
 
-(sb-alien::define-alien-callback *alien-console-control-handler* (:stdcall int)
+(define-alien-callable alien-console-control-handler (:stdcall int)
     ((event-code int))
   (if (ignore-errors (funcall *console-control-handler* event-code)) 1 0))
 
@@ -181,7 +183,7 @@ true to stop searching)." *console-control-spec*)
      (setf *console-control-enabled* nil))
     ((or symbol function)
      (setf *console-control-handler* new-handler)
-     (aver (plusp (set-console-ctrl-handler *alien-console-control-handler* 1)))))
+     (aver (plusp (set-console-ctrl-handler (alien-callable-function 'alien-console-control-handler) 1)))))
   (setf *console-control-spec* new-handler))
 
 (defun initialize-console-control-handler (&optional reset-to-default-p)
@@ -269,11 +271,6 @@ true to stop searching)." *console-control-spec*)
   overlapped)
 
 (defconstant +copier-buffer+ 256)
-
-(defmacro zero-alien (alien type)
-  `(sb-kernel:system-area-ub8-fill
-    0 (alien-sap ,alien)
-    0 (alien-size ,type :bytes)))
 
 (defun setup-copiers (copiers)
   (let ((result (make-array (length copiers))))
@@ -390,11 +387,5 @@ true to stop searching)." *console-control-spec*)
              (do ()
                  ((= 0
                      (wait-object-or-signal handle))))))
-      (multiple-value-bind (ok code) (get-exit-code-process handle)
-        (when (and (plusp ok) (/= code still-active))
-          (setf (sb-impl::process-handle process) nil)
-          (close-handle handle)
-
-          (setf (sb-impl::process-%status process) :exited
-                (sb-impl::process-%exit-code process) code)))))
+      (sb-impl::get-processes-status-changes)))
   process)

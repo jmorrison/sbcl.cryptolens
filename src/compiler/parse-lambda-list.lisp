@@ -9,11 +9,12 @@
 
 (in-package "SB-C")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
+(declaim (special *lexenv*))
+
 (defconstant-eqx lambda-list-parser-states
     #(:required &optional &rest &more &key &aux &environment &whole
       &allow-other-keys &body :post-env :post-rest :post-more)
-  #'equalp))
+  #'equalp)
 
 ;; Return a bitmask representing the LIST of lambda list keywords.
 (defmacro lambda-list-keyword-mask (list)
@@ -112,7 +113,7 @@
              (probably-ll-keyword-p (arg)
                ;; Compiler doesn't see that the check is manually done. :-(
                #-sb-xc-host
-               (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+               (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                (and (symbolp arg)
                     (let ((name (symbol-name arg)))
                       (and (plusp (length name))
@@ -122,11 +123,16 @@
                     (member form lambda-list-keywords)
                     (report-suspicious kind form)))
              (report-suspicious (kind what)
-               (style-warn-once list "suspicious ~A ~S in lambda list: ~S."
+               (style-warn-once list (sb-format:tokens
+                                      "suspicious ~A ~S in lambda list: ~
+                                       ~/sb-impl:print-lambda-list/.")
                                 kind what list)
                nil) ; Avoid "return convention is not fixed" optimizer note
              (need-arg (state)
-               (croak "expecting variable after ~A in: ~S" state list))
+               (croak (sb-format:tokens
+                       "expecting variable after ~A in: ~
+                        ~/sb-impl:print-lambda-list/")
+                      state list))
              (need-symbol (x why)
                (unless (symbolp x)
                  (croak "~A is not a symbol: ~S" why x)))
@@ -179,7 +185,10 @@
                        (symbolp input))
                   (setf rest (list input)))
                  (t
-                  (croak "illegal dotted lambda list: ~S" list)))
+                  (croak (sb-format:tokens
+                          "illegal dotted lambda list: ~
+                           ~/sb-impl:print-lambda-list/")
+                         list)))
            (return))
          (shiftf last-arg arg (pop input))
 
@@ -220,7 +229,10 @@
                           (destructuring-bind "a destructuring lambda list")
                           (defmethod "a specialized lambda list")
                           (t context))))
-                   (croak "~A is not allowed in ~A: ~S" arg where list)))
+                   (croak (sb-format:tokens
+                           "~A is not allowed in ~A: ~
+                            ~/sb-impl:print-lambda-list/")
+                          arg where list)))
 
                ;; &ENVIRONMENT can't intercede between &KEY,&ALLOW-OTHER-KEYS.
                ;; For all other cases it's as if &ENVIRONMENT were never there.
@@ -235,9 +247,14 @@
                ;; a better thing can be said, e.g. &WHOLE must go to the front.
                (cond ((logbitp to-state seen) ; Oops! Been here before.
                       (if (= rest-bits 3)
-                          (croak "~S and ~S are mutually exclusive: ~S"
+                          (croak (sb-format:tokens
+                                  "~S and ~S are mutually exclusive: ~
+                                   ~/sb-impl:print-lambda-list/")
                                  '&body '&rest list)
-                          (croak "repeated ~S in lambda list: ~S" arg list)))
+                          (croak (sb-format:tokens
+                                  "repeated ~S in lambda list: ~
+                                   ~/sb-impl:print-lambda-list/")
+                                 arg list)))
                      ((logbitp state from-states) ; valid transition
                       (setq state to-state
                             seen (logior seen (ash 1 state))
@@ -245,10 +262,11 @@
                      ((logbitp state (bits &whole &rest &more &environment))
                       (need-arg last-arg)) ; Variable expected.
                      (t
-                      (croak (if (state= to-state &whole)
-                                 "~A must appear first in a lambda list: ~S"
-                                 "misplaced ~A in lambda list: ~S")
-                             arg list)))
+                      (croak (sb-format:tokens
+                              "~:[misplaced ~A in lambda list~;~
+                               ~A must appear first in a lambda list~]:
+                               ~/sb-impl:print-lambda-list/")
+                             (state= to-state &whole) arg list)))
                (go LOOP)))
            ;; Fell through, so warn if desired, and fall through some more.
            (unless silent (report-suspicious "variable" arg)))
@@ -256,7 +274,10 @@
          ;; Handle a lambda variable
          (when (logbitp state (bits &allow-other-keys ; Not a collecting state.
                                     :post-env :post-rest :post-more))
-           (croak "expected lambda list keyword at ~S in: ~S" arg list))
+           (croak (sb-format:tokens
+                   "expected lambda list keyword at ~S in: ~
+                    ~/sb-impl:print-lambda-list/")
+                  arg list))
          (let ((item (list arg)))
            (setq tail (if tail (setf (cdr tail) item) (begin-list item))))
          (when (logbitp state (bits &rest &more &whole &environment))
@@ -278,7 +299,9 @@
         (style-warn-once
          list
          (make-condition '&optional-and-&key-in-lambda-list
-                         :format-control "&OPTIONAL and &KEY found in the same lambda list: ~S"
+                         :format-control (sb-format:tokens
+                                          "&OPTIONAL and &KEY found in the same lambda list: ~
+                                           ~/sb-impl:print-lambda-list/")
                          :format-arguments (list list))))
 
       ;; For CONTEXT other than :VALUES-TYPE/:FUNCTION-TYPE we reject
@@ -531,7 +554,9 @@
                  (if (ll-kwds-keyp llks) (cons '&key keys)) ; KEYS can be nil
                  (if (ll-kwds-allowp llks) '(&allow-other-keys))
                  ;; Should &AUX be inserted even if empty? Probably not.
-                 (if aux (cons '&aux aux)))))))
+                 (if aux (cons '&aux aux))
+                 ;; fresh lambda list spine everywhere
+                 nil)))))
 
 ;;; Produce a destructuring lambda list from its internalized representation,
 ;;; excluding any parts that don't constrain the shape of the expected input.
@@ -781,7 +806,7 @@
                                   (if sup-p-var `(values ,def nil) def))))
              (cond ((not sup-p-var) (bind-pat var vals))
                    ((not (symbolp var))
-                    (let ((var-temp (sb-xc:gensym))
+                    (let ((var-temp (gensym))
                           (sup-p-temp (copy-symbol suppliedp)))
                       (bind `((,var-temp ,sup-p-temp) ,vals))
                       (descend var var-temp)
@@ -804,7 +829,7 @@
              ;; in theory, (MULTIPLE-VALUE-BIND () (EXPR) ...)
              ;; but in practice it becomes a binding of an ignored gensym.
              (let* ((bindings-p (or whole required opt rest keys))
-                    (temp (and bindings-p (sb-xc:gensym))))
+                    (temp (and bindings-p (gensym))))
                (bind `(,temp
                        ,(cond ((or emit-pre-test (ll-kwds-keyp llks))
                                (emit-ds-bind-check parsed-lambda-list input
@@ -854,10 +879,14 @@
              (dolist (elt keys)
                (multiple-value-bind (keyword var def sup-p-var)
                    (parse-key-arg-spec elt default-default)
-                 (let ((temp (sb-xc:gensym)))
-                   (bind `(,temp (ds-getf ,input ',keyword)))
-                   (bind-if :not `(eql ,temp 0) `(car (truly-the cons ,temp))
-                            var sup-p-var def))))
+                 (let ((temp (gensym)))
+                   (cond ((and (not sup-p-var)
+                               (constantp def))
+                          (bind-pat var `(getf ,input ',keyword ,@(and def `(,def)))))
+                         (t
+                          (bind `(,temp (getf ,input ',keyword (make-unbound-marker))))
+                          (bind-if :not `(unbound-marker-p ,temp) temp
+                                   var sup-p-var def))))))
 
              ;; &AUX bindings aren't destructured. Finally something easy.
              (dolist (elt aux)
@@ -894,10 +923,8 @@
        (values nil 'destructuring-bind pattern)))))
 
 ;;; Helpers for the variations on CHECK-DS-mumble.
-(defun ds-bind-error (input min max pattern)
+(define-error-wrapper ds-bind-error (input min max pattern)
   (multiple-value-bind (name kind lambda-list) (get-ds-bind-context pattern)
-    #-sb-xc-host
-    (declare (optimize allow-non-returning-tail-call))
     (case kind
      (:special-form
       ;; IR1 translators should call COMPILER-ERROR instead of
@@ -955,8 +982,6 @@
                        (setq seen-other t bad-key key)))))
              (setq tail (cdr next))))))
     (multiple-value-bind (kind name) (get-ds-bind-context pattern)
-      #-sb-xc-host
-      (declare (optimize allow-non-returning-tail-call))
       ;; KLUDGE: Compiling (COERCE x 'list) transforms to COERCE-TO-LIST,
       ;; but COERCE-TO-LIST is an inline function not yet defined, and
       ;; its subsequent definition would signal an inlining failure warning.
@@ -1065,25 +1090,6 @@
                                       :argument key))))
                     (check-ds-bind-keys input list valid-keys pattern)))))
 
-;; Like GETF but return CDR of the cell whose CAR contained the found key,
-;; instead of CADR; and return 0 for not found.
-;; This helps destructuring-bind slightly by avoiding a secondary value as a
-;; found/not-found indicator, and using 0 is better for backends which don't
-;; wire a register to NIL. Also, NIL would accidentally allow taking its CAR
-;; if the caller were to try, whereas we'd want to see a explicit error.
-(defun ds-getf (place indicator)
-  (do ((plist place (cddr plist)))
-      ((null plist) 0)
-    (cond ((atom (cdr plist))
-           (error 'simple-type-error
-                  :format-control "malformed property list: ~S."
-                  :format-arguments (list place)
-                  :datum (cdr plist)
-                  :expected-type 'cons))
-          ((eq (car plist) indicator)
-           ;; Typecheck the next cell so that calling code doesn't get an atom.
-           (return (the cons (cdr plist)))))))
-
 ;;; Make a lambda expression that receives an s-expression, destructures it
 ;;; according to LAMBDA-LIST, and executes BODY.
 ;;; NAME and KIND provide error-reporting context.
@@ -1133,10 +1139,15 @@
              ;; Drop &WHOLE and &ENVIRONMENT
              (new-ll (make-lambda-list llks nil req opt rest keys aux))
              #-sb-xc-host
-             (*lexenv* (process-muffle-decls decls
-                                             (if (boundp '*lexenv*)
-                                                 *lexenv*
-                                                 (make-null-lexenv))))
+             ((*lexenv* source-form) (process-muffle-decls decls
+                                                           (if (boundp '*lexenv*)
+                                                               *lexenv*
+                                                               (make-null-lexenv))))
+             #-sb-xc-host
+             (*current-path* (or (and source-form
+                                      (get-source-path source-form))
+                                 (and (boundp '*current-path*)
+                                      *current-path*)))
              (parse (parse-ds-lambda-list new-ll))
              ((declared-lambda-list decls)
               (let ((ll
@@ -1182,6 +1193,9 @@
                 (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
               ,@(when (and docstring (eq doc-string-allowed :internal))
                   (prog1 (list docstring) (setq docstring nil)))
+              #-sb-xc-host
+              ,@(and source-form
+                     `((declare (source-form ,source-form))))
               ;; MACROLET doesn't produce an object capable of reflection,
               ;; so don't bother inserting a different lambda-list.
               ,@(unless (eq kind 'macrolet)
@@ -1196,7 +1210,12 @@
                      '(destructuring-bind))
                ,new-ll (,accessor ,ll-whole)
                #-sb-xc-host
-               (declare (constant-value ,@variables))
+               (declare (constant-value ,@variables)
+                        ;; Avoid warnings about emitted full calls
+                        ;; inside the body of a compiler macro itself.
+                        ,@(and (eq kind 'define-compiler-macro)
+                               `((no-compiler-macro ,name))))
+
                ,@decls
                ,@(if wrap-block
                      `((block ,(fun-name-block-name name) ,@forms))

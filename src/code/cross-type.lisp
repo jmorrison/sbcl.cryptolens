@@ -69,7 +69,7 @@
 ;;; Defined here so that CROSS-TYPEP can use it.
 ;;; The target variant of this is in src/code/package.
 (defmacro system-package-p (package)
-  `(eql (mismatch "SB-" (package-name ,package)) 3))
+  `(eql (mismatch "SB-" (cl:package-name ,package)) 3))
 
 ;;; This is like TYPEP, except that it asks whether OBJ (a host object acting
 ;;; as a proxy for some logically equivalent object in the target sytem)
@@ -82,7 +82,7 @@
 ;;; The logic is a mixture of the code for CTYPEP and %%TYPEP
 ;;; because it handles both.
 ;;; The order of clauses is fairly symmetrical with that of %%TYPEP.
-(defvar *xtypep-uncertainty-action* 'warn) ; {BREAK WARN STYLE-WARN ERROR NIL}
+(defvar *xtypep-uncertainty-action* #-sb-devel 'warn #+sb-devel nil) ; {BREAK WARN STYLE-WARN ERROR NIL}
 (macrolet ((unimplemented ()
              '(bug "Incomplete implementation of ~S ~S ~S" caller obj type))
            (uncertain ()
@@ -137,7 +137,7 @@
             #+sb-simd-pack-256 simd-pack-256-type)
         (values nil t))
        (character-set-type
-        ;; provided that SB-XC:CHAR-CODE doesn't fail, the answer is certain
+        ;; provided that CHAR-CODE doesn't fail, the answer is certain
         (values (test-character-type type) t))
        (classoid ; = {built-in,structure,condition,standard,static}-classoid
         (let ((name (classoid-name type)))
@@ -157,11 +157,9 @@
                     ((not (%instancep obj))
                      (values nil t)) ; false certainly
                     (t
-                     (if (and (cl:find-class name nil) ; see if the host knows the type
-                              ;; and it's in our object hierarchy
-                              (cl:subtypep name 'structure!object))
+                     (if (cl:find-class name nil) ; see if the host knows the type
                          (values (cl:typep obj name) t)
-                       (unimplemented)))))))
+                         (unimplemented)))))))
        (fun-type
         (if (fun-designator-type-p type)
              (values (typep obj '(or symbol function)) t)
@@ -172,7 +170,7 @@
              (if (and (functionp obj) (eq caller 'sb-xc:typep))
                  (error "TYPEP called with function type")
                  (values (functionp obj) t))))
-       (alien-type-type (if (null obj) (values nil t) (unimplemented)))
+       (alien-type-type (if (symbolp obj) (values nil t) (unimplemented)))
        ;; Test UNKNOWN before falling into the HAIRY case
        (unknown-type
         (let ((spec (unknown-type-specifier type)))
@@ -186,8 +184,8 @@
           ;; true for various X that are not known yet.
           (cond ((and (symbolp spec)
                       (cl:find-class spec nil)
-                      ;; See if the host knows our DEF!STRUCT yet
-                      (cl:subtypep spec 'structure!object))
+                      ;; See if the host knows our DEFSTRUCT yet
+                      (cl:subtypep spec 'instance))
                  (values (cl:typep obj spec) t))
                 ;; Sometimes we try to test a forward-referenced type
                 ;; that was unknown at the point of creation but has
@@ -241,6 +239,10 @@
                 ;; Keep in sync with KEYWORDP test in src/code/target-type
                 (cond ((eq predicate 'keywordp)
                        (test-keywordp))
+                      ;; These are needed in order to compile the predicates
+                      ;; for the initial pprint dispatch table.
+                      ((and (eq obj nil) (member predicate '(fboundp macro-function)))
+                       (values nil t))
                       ((acceptable-cross-typep-pred predicate caller)
                        (values (funcall predicate obj) t))
                       (t
@@ -309,8 +311,10 @@
             (and (boundp 'sb-c::*compilation*)
                  (eq (sb-c::block-compile sb-c::*compilation*) t)))
         (values answer certain)
+        #-sb-devel
         (warn 'cross-type-giving-up :call `(ctypep ,obj ,ctype)))))
 
+;; TODO: would it be feasible to unify this definition with that in src/code/typep ?
 (defun ctype-of (x)
   (typecase x
     (function
@@ -344,14 +348,15 @@
            (t
             ;; Beyond this, there seems to be no portable correspondence.
             (error "can't map host Lisp CHARACTER ~S to target Lisp" x))))
-    (sb-c::opaque-box (find-classoid 'structure-object))
-   (instance
-    (let ((type (type-of x)))
-      (if (eq type 'sb-format::fmt-control-proxy)
-          ;; These are functions, but they're weird. We don't want any IR1 transform
-          ;; on FORMAT to kick in and try to convert to FUNCALL on the thing.
-          (specifier-type '(or string function))
-          (find-classoid type))))
+    (instance
+     (let ((type (type-of x)))
+       (if (eq type 'sb-format::fmt-control-proxy)
+           ;; These are functions, but they're weird. We don't want any IR1 transform
+           ;; on FORMAT to kick in and try to convert to FUNCALL on the thing.
+           (specifier-type '(or string function))
+           ;; The structure may not be defined on the target yet.
+           (or (find-classoid type nil)
+               (find-classoid 'structure-object)))))
     (t
      ;; There might be more cases which we could handle with
      ;; sufficient effort; since all we *need* to handle are enough
@@ -361,4 +366,14 @@
      (error "can't handle ~S in cross CTYPE-OF" x))))
 
 (defun sb-pcl::class-has-a-forward-referenced-superclass-p (x)
-  (bug "CLASS-HAS-A-FORWARD-REFERENCED-SUPERCLASS-P reached: ~S" x))
+  (declare (ignore x))
+  nil)
+
+(defun non-null-symbol-p (x) (and x (symbolp x)))
+;; these two functions don't need to be fully general
+(defun pointerp (x)
+  (aver (or (symbolp x) (fixnump x)))
+  (symbolp x))
+;; Use of non-ASCII during build occurs no sooner than make-target-2,
+;; therefore _every_ character satisfies BASE-CHAR-P prior to that.
+#+sb-unicode (defun base-char-p (x) (characterp x))

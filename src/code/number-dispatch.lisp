@@ -92,11 +92,11 @@
           (let ((var (first vars))
                 (cases (sort cases #'type-test-order :key #'car)))
             (flet ((error-if-sub-or-supertype (type1 type2)
-                     (when (or (subtypep type1 type2)
-                               (subtypep type2 type1))
+                     (when (or (cl:subtypep type1 type2)
+                               (cl:subtypep type2 type1))
                        (error "Types not disjoint: ~S ~S." type1 type2)))
                    (error-if-supertype (type1 type2)
-                     (when (subtypep type2 type1)
+                     (when (cl:subtypep type2 type1)
                        (error "Type ~S ordered before subtype ~S."
                               type1 type2)))
                    (test-type-pairs (fun)
@@ -114,9 +114,12 @@
               (test-type-pairs (if (cdr vars)
                                    #'error-if-sub-or-supertype
                                    #'error-if-supertype)))
-            `((typecase ,var
+            `((typecase ,(car var)
                 ,@(mapcar (lambda (case)
                             `(,(first case)
+                              ,@(when (eq (cadr var) 'unsigned-byte)
+                                  `((when (minusp ,(car var))
+                                      (go ,(car error-tags)))))
                               ,@(generate-number-dispatch (rest vars)
                                                           (rest error-tags)
                                                           (cdr case))))
@@ -164,7 +167,7 @@
 (defmacro number-dispatch (var-specs &body cases)
   (let ((res (list nil))
         (vars (mapcar #'car var-specs))
-        (block (gensym)))
+        (block (gensym "NUMBER-DISPATCH")))
     (dolist (case cases)
       (if (symbolp (first case))
           (let ((cases (apply (symbol-function (first case)) (rest case))))
@@ -175,24 +178,27 @@
     (collect ((errors)
               (error-tags))
       (dolist (spec var-specs)
-        (let ((var (first spec))
-              (type (second spec))
-              (tag (gensym)))
+        (let* ((var (first spec))
+               (type (second spec))
+               (tag (gensym (symbol-name var))))
           (error-tags tag)
           (errors tag)
           (errors
+           #+sb-xc-host
+           `(error "~S is not of type ~S." ,var ',type)
+           #-sb-xc-host
            (sb-c::internal-type-error-call var type))))
 
       `(block ,block
          (tagbody
             (return-from ,block
-              ,@(generate-number-dispatch vars (error-tags)
+              ,@(generate-number-dispatch var-specs (error-tags)
                                           (cdr res)))
             ,@(errors))))))
 
 ;;;; binary operation dispatching utilities
 
-(eval-when (:compile-toplevel :execute)
+(eval-when (:compile-toplevel :execute #+sb-devel :load-toplevel)
 
 ;;; Return NUMBER-DISPATCH forms for rational X float.
 (defun float-contagion (op x y &optional (rat-types '(fixnum bignum ratio)))
@@ -216,12 +222,30 @@
 
 ;;; Return NUMBER-DISPATCH forms for bignum X fixnum.
 (defun bignum-cross-fixnum (fix-op big-op)
-  `(((fixnum fixnum) (,fix-op x y))
-    ((fixnum bignum)
-     (,big-op (make-small-bignum x) y))
-    ((bignum fixnum)
-     (,big-op x (make-small-bignum y)))
-    ((bignum bignum)
-     (,big-op x y))))
+  (case fix-op
+    (+
+     `(((fixnum fixnum) (,fix-op x y))
+       ((fixnum bignum)
+        (add-bignum-fixnum y x))
+       ((bignum fixnum)
+        (add-bignum-fixnum x y))
+       ((bignum bignum)
+        (,big-op x y))))
+    (-
+     `(((fixnum fixnum) (,fix-op x y))
+       ((fixnum bignum)
+        (subtract-fixnum-bignum x y))
+       ((bignum fixnum)
+        (subtract-bignum-fixnum x y))
+       ((bignum bignum)
+        (,big-op x y))))
+    (t
+     `(((fixnum fixnum) (,fix-op x y))
+       ((fixnum bignum)
+        (,big-op (make-small-bignum x) y))
+       ((bignum fixnum)
+        (,big-op x (make-small-bignum y)))
+       ((bignum bignum)
+        (,big-op x y))))))
 
 ) ; EVAL-WHEN

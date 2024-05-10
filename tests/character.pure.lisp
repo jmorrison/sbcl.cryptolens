@@ -62,7 +62,7 @@
                  (digit-char -1)
                  (digit-char 4 1)
                  (digit-char 4 37)
-                 (sb-int:two-arg-char-equal 10 10)))
+                 (char-equal 10 10)))
    (assert-error (apply (car form) (mapcar 'eval (cdr form))) type-error)))
 
 ;; All of the inequality predicates when called out-of-line
@@ -145,7 +145,7 @@
     (assert (equal `(function (t) (values (sb-kernel:character-set
                                            ((1 . ,(1- char-code-limit))))
                                           &optional))
-                   (sb-impl::%fun-type f)))))
+                   (sb-impl::%fun-ftype f)))))
 
 (with-test (:name (:case-insensitive-char-comparisons :eacute))
   (assert (char-equal (code-char 201) (code-char 233))))
@@ -178,3 +178,58 @@
 (with-test (:name :name-char-short-string)
   (name-char "")
   (name-char "A"))
+
+(with-test (:name :char-case-latin-1-base-strings)
+  (let ((string (map-into (make-array 10 :element-type 'character :adjustable t)
+                          #'code-char
+                          '(192 193 194 195 196 197 198 199 200 201))))
+    (assert (equal
+             (map 'list #'char-code (nstring-downcase string))
+             '(224 225 226 227 228 229 230 231 232 233)))
+    (assert (equal
+             (map 'list #'char-code (string-upcase string))
+             '(192 193 194 195 196 197 198 199 200 201)))))
+
+(with-test (:name :char-equal-transform)
+  (let ((fun (checked-compile
+              `(lambda (x y)
+                 (declare (base-char x y)
+                          (optimize speed))
+                 (char-equal x y)))))
+    (loop for a below sb-int:base-char-code-limit
+          for char-a = (code-char a)
+          do
+          (loop for b below sb-int:base-char-code-limit
+                for char-b = (code-char b)
+                for equal = (char= (char-downcase char-a)
+                                   (char-downcase char-b))
+                do (assert (eql (funcall fun char-a char-b)
+                                equal))))))
+(with-test (:name :code-char-type-unions)
+  (assert-type
+   (lambda (b)
+     (declare ((or (eql 5) (eql 10)) b))
+     (typep (code-char b) 'base-char))
+   (member t)))
+
+(with-test (:name :char<-out-of-range)
+  (assert-type
+   (lambda (c)
+     (when (char> c (code-char (1- char-code-limit)))
+       c))
+   null)
+  (assert-type
+   (lambda (c)
+     (when (char< c (code-char 0))
+       c))
+   null))
+
+
+(with-test (:name :equalp-to-eql)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b)
+      (declare (character a))
+      (equalp a (the (or null character) b)))
+   ((#\a #\A) t)
+   ((#\a #\b) nil)))

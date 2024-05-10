@@ -11,42 +11,22 @@
  * files for more information.
  */
 
-/*
- * FIXME:
- *   Some of the code in here is deeply broken, depending on guessing
- *   already out-of-date values instead of getting them from sbcl.h.
- */
-
 #include <stdio.h>
 #include <string.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "print.h"
 #include "runtime.h"
 #include "code.h"
-#include "gc-internal.h"
-#include "gc-private.h"
-#include <stdarg.h>
-#include "thread.h"              /* genesis/primitive-objects.h needs this */
+#include "gc.h"
+#include "genesis/gc-tables.h"
+#include "thread.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <setjmp.h>
 
-/* FSHOW and odxprint provide debugging output for low-level information
- * (signal handling, exceptions, safepoints) which is hard to debug by
- * other means.
- *
- * If enabled at all, environment variables control whether calls of the
- * form odxprint(name, ...) are enabled at run-time, e.g. using
- * SBCL_DYNDEBUG="fshow fshow_signal safepoints".
- *
- * In the case of FSHOW and FSHOW_SIGNAL, old-style code from runtime.h
- * can also be used to enable or disable these more aggressively.
- */
-
-struct dyndebug_config dyndebug_config = {
-    QSHOW == 2, QSHOW_SIGNALS == 2
-};
+struct dyndebug_config dyndebug_config;
 
 void
 dyndebug_init()
@@ -65,8 +45,6 @@ dyndebug_init()
     char *names[DYNDEBUG_NFLAGS];
     int *ptrs[DYNDEBUG_NFLAGS];
 
-    dyndebug_init1(fshow,          "FSHOW");
-    dyndebug_init1(fshow_signal,   "FSHOW_SIGNAL");
     dyndebug_init1(gencgc_verbose, "GENCGC_VERBOSE");
     dyndebug_init1(safepoints,     "SAFEPOINTS");
     dyndebug_init1(seh,            "SEH");
@@ -119,7 +97,7 @@ dyndebug_init()
             }
         }
     }
-#if defined(LISP_FEATURE_GENCGC)
+#if defined(LISP_FEATURE_GENERATIONAL)
     if (dyndebug_config.dyndebug_gencgc_verbose) {
         gencgc_verbose = 1;
     }
@@ -129,87 +107,8 @@ dyndebug_init()
 #undef DYNDEBUG_NFLAGS
 }
 
-/* Temporarily, odxprint merely performs the equivalent of a traditional
- * FSHOW call, i.e. it merely formats to stderr.  Ultimately, it should
- * be restored to its full win32 branch functionality, where output to a
- * file or to the debugger can be selected at runtime. */
-
-void vodxprint_fun(const char *, va_list);
-
-void
-odxprint_fun(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    vodxprint_fun(fmt, args);
-    va_end(args);
-}
-
-void
-vodxprint_fun(const char *fmt, va_list args)
-{
-#ifdef LISP_FEATURE_WIN32
-    DWORD lastError = GetLastError();
-#endif
-    int original_errno = errno;
-
-    char buf[1024];
-    int n = 0;
-
-#ifdef LISP_FEATURE_SB_THREAD
-    snprintf(buf, sizeof(buf), "["THREAD_ID_LABEL"] ", THREAD_ID_VALUE);
-    n = strlen(buf);
-#endif
-
-    vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, args);
-    /* buf is now zero-terminated (even in case of overflow).
-     * Our caller took care of the newline (if any) through `fmt'. */
-
-    /* A sufficiently POSIXy implementation of stdio will provide
-     * per-FILE locking, as defined in the spec for flockfile.  At least
-     * glibc complies with this.  Hence we do not need to perform
-     * locking ourselves here.  (Should it turn out, of course, that
-     * other libraries opt for speed rather than safety, we need to
-     * revisit this decision.) */
-    fputs(buf, stderr);
-
-#ifdef LISP_FEATURE_WIN32
-    /* stdio's stderr is line-bufferred, i.e. \n ought to flush it.
-     * Unfortunately, MinGW does not behave the way I would expect it
-     * to.  Let's be safe: */
-    fflush(stderr);
-#endif
-
-#ifdef LISP_FEATURE_WIN32
-    SetLastError(lastError);
-#endif
-    errno = original_errno;
-}
-
-/* Translate the rather awkward syntax
- *   FSHOW((stderr, "xyz"))
- * into the new and cleaner
- *   odxprint("xyz").
- * If we were willing to clean up all existing call sites, we could remove
- * this wrapper function.  (This is a function, because I don't know how to
- * strip the extra parens in a macro.) */
-void
-fshow_fun(void __attribute__((__unused__)) *ignored,
-          const char *fmt,
-          ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    vodxprint_fun(fmt, args);
-    va_end(args);
-}
-
-#include "monitor.h"
 #include "vars.h"
 #include "os.h"
-#ifdef LISP_FEATURE_GENCGC
-#include "gencgc-alloc-region.h" /* genesis/thread.h needs this */
-#endif
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
 #include "genesis/static-symbols.h"
@@ -218,7 +117,7 @@ fshow_fun(void __attribute__((__unused__)) *ignored,
 static int max_lines = 20, cur_lines = 0;
 static int max_depth = 5, brief_depth = 2, cur_depth = 0;
 static int max_length = 5;
-static boolean dont_descend = 0, skip_newline = 0;
+static bool dont_descend = 0, skip_newline = 0;
 static int cur_clock = 0;
 
 static void print_obj(char *prefix, lispobj obj);
@@ -237,7 +136,8 @@ static void indent(int in)
         fputs(spaces + 64 - in, stdout);
 }
 
-static boolean continue_p(boolean newline)
+static jmp_buf ldb_print_nlx;
+static bool continue_p(bool newline)
 {
     char buffer[256];
 
@@ -256,7 +156,7 @@ static boolean continue_p(boolean newline)
 
             if (fgets(buffer, sizeof(buffer), stdin)) {
                 if (buffer[0] == 'n' || buffer[0] == 'N')
-                    throw_to_monitor();
+                    longjmp(ldb_print_nlx, 1);
                 else
                     cur_lines = 0;
             } else {
@@ -392,6 +292,22 @@ static void brief_list(lispobj obj)
     }
 }
 
+void print_list_car_ptrs(lispobj obj, FILE* f)
+{
+    char sep = '(';
+    int len = 0;
+    if (obj == NIL) { fprintf(f, "NIL"); return; }
+    do {
+        if (++len > 20) { fprintf(f, "...)"); return; }
+        fprintf(f, "%c%p", sep, (void*)CONS(obj)->car);
+        obj = CONS(obj)->cdr;
+        sep = ' ';
+    } while (listp(obj) && obj != NIL);
+    if (obj != NIL) fprintf(f, " . %p", (void*)obj);
+    putc(')', f);
+}
+
+
 static void print_list(lispobj obj)
 {
     if (obj == NIL) {
@@ -407,7 +323,7 @@ char * simple_base_stringize(struct vector * string)
 {
   if (widetag_of(&string->header) == SIMPLE_BASE_STRING_WIDETAG)
       return (char*)string->data;
-  int length = string->length;
+  int length = vector_len(string);
   char * newstring = malloc(length+1);
   uint32_t * data = (uint32_t*)string->data;
   int i;
@@ -419,7 +335,7 @@ char * simple_base_stringize(struct vector * string)
 
 static void brief_struct(lispobj obj)
 {
-    struct instance *instance = (struct instance *)native_pointer(obj);
+    struct instance *instance = INSTANCE(obj);
     extern struct vector * instance_classoid_name(lispobj*);
     struct vector * classoid_name;
     classoid_name = instance_classoid_name((lispobj*)instance);
@@ -434,10 +350,8 @@ static void brief_struct(lispobj obj)
     }
 }
 
-#include "genesis/layout.h"
 #include "genesis/defstruct-description.h"
-#include "genesis/defstruct-slot-description.h"
-static boolean tagged_slot_p(struct layout *layout, int slot_index)
+static bool tagged_slot_p(struct layout *layout, int slot_index)
 {
     // Since we're doing this scan, we could return the name
     // and exact raw type.
@@ -451,12 +365,20 @@ static boolean tagged_slot_p(struct layout *layout, int slot_index)
                 return (fixnum_value(dsd->bits) & DSD_RAW_TYPE_MASK) == 0;
         }
     }
-    return 0;
+    /* Revision 2b783b49 said to prefer LAYOUT-INFO vs BITMAP because the bitmap
+     * can indicate a 0 bit ("raw") for any slot that _may_ be ignored by GC, such as
+     * slots constrained to FIXNUM. Unfortunately that misses that CONDITION instances
+     * have trailing variable-length tagged data. In practice an instance may have raw
+     * words only if it has a DD, which most CONDITION subtypes do not. Therefore this
+     * could almost always return 1. But layout-of-layout is an important use of trailing
+     * raw slots. Attempting to print random words as tagged could be disastrous.
+     * Therefore, test the bitmap if the above loop failed to find slot_index. */
+    return bitmap_logbitp(slot_index, get_layout_bitmap(layout));
 }
 
 static void print_struct(lispobj obj)
 {
-    struct instance *instance = (struct instance *)native_pointer(obj);
+    struct instance *instance = INSTANCE(obj);
     short int i;
     char buffer[16];
     lispobj layout = instance_layout(native_pointer(obj));
@@ -475,7 +397,7 @@ static void print_struct(lispobj obj)
 void show_lstring(struct vector * string, int quotes, FILE *s)
 {
   int ucs4_p = 0;
-  int i, len = fixnum_value(string->length);
+  int i, len = vector_len(string);
 
 #ifdef SIMPLE_CHARACTER_STRING_WIDETAG
   if (widetag_of(&string->header) == SIMPLE_CHARACTER_STRING_WIDETAG) {
@@ -507,7 +429,6 @@ void show_lstring(struct vector * string, int quotes, FILE *s)
 
 static void brief_fun_or_otherptr(lispobj obj)
 {
-    extern void safely_show_lstring(struct vector*, int, FILE*);
     lispobj *ptr, header;
     int type;
     struct symbol *symbol;
@@ -518,9 +439,10 @@ static void brief_fun_or_otherptr(lispobj obj)
     switch (type) {
         case SYMBOL_WIDETAG:
             symbol = (struct symbol *)ptr;
-            if (symbol->package == NIL)
+            lispobj package = symbol_package(symbol);
+            if (package == NIL)
                 printf("#:");
-            show_lstring(VECTOR(symbol->name), 0, stdout);
+            show_lstring(symbol_name(symbol), 0, stdout);
             break;
 
         case SIMPLE_BASE_STRING_WIDETAG:
@@ -539,7 +461,7 @@ static void brief_fun_or_otherptr(lispobj obj)
                 if (lowtag_of(name) == OTHER_POINTER_LOWTAG
                     && widetag_of(native_pointer(name)) == SYMBOL_WIDETAG) {
                   printf(" for ");
-                  struct vector* str = symbol_name(native_pointer(name));
+                  struct vector* str = symbol_name(SYMBOL(name));
                   safely_show_lstring(str, 0, stdout);
                 }
             }
@@ -551,10 +473,14 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 {
     while (count-- > 0) {
         if (*slots) {
-            // kludge for half-lispword sized slot
-            print_obj(*slots,
-                      (N_WORD_BYTES == 8 && !strcmp(*slots, "boxed_size: "))
-                      ? *ptr & 0xFFFFFFFF : *ptr);
+            // kludge for encoded slots
+            lispobj word = *ptr;
+            char* slot_name = *slots;
+            if (N_WORD_BYTES == 8 && !strcmp(slot_name, "boxed_size: ")) word = word & 0xFFFFFFFF;
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+            else if (!strcmp(slot_name, "name: ")) word = decode_symbol_name(word);
+#endif
+            print_obj(slot_name, word);
             slots++;
         } else {
             print_obj("???: ", *ptr);
@@ -563,42 +489,20 @@ static void print_slots(char **slots, int count, lispobj *ptr)
     }
 }
 
-lispobj symbol_function(lispobj* symbol)
-{
-    lispobj info = ((struct symbol*)symbol)->info;
-    if (listp(info))
-        info = CONS(info)->cdr;
-    if (lowtag_of(info) == OTHER_POINTER_LOWTAG) {
-        struct vector* v = VECTOR(info);
-        int len = fixnum_value(v->length);
-        if (len != 0) {
-            lispobj elt = v->data[0];  // Just like INFO-VECTOR-FDEFN
-            if (fixnump(elt) && (fixnum_value(elt) & 07777) >= 07701) {
-                lispobj fdefn = v->data[len-1];
-                if (lowtag_of(fdefn) == OTHER_POINTER_LOWTAG)
-                    return FDEFN(fdefn)->fun;
-            }
-        }
-    }
-    return NIL;
-}
-
 static void print_fun_or_otherptr(lispobj obj)
 {
-    lispobj *ptr;
-    unsigned long header;
-    int count, type, index;
+    int index;
     char buffer[16];
 
-    ptr = native_pointer(obj);
+    lispobj *ptr = native_pointer(obj);
     if (ptr == NULL) {
         printf(" (NULL Pointer)");
         return;
     }
 
-    header = *ptr++;
-    count = HeaderValue(header);
-    type = header_widetag(header);
+    int count = object_size(ptr)-1;
+    uword_t header = *ptr++;
+    int type = header_widetag(header);
 
     print_obj("header: ", header);
     if (!other_immediate_lowtag_p(header)) {
@@ -609,6 +513,7 @@ static void print_fun_or_otherptr(lispobj obj)
 
     switch (type) {
     case BIGNUM_WIDETAG:
+        count &= 0x7fffff;
         ptr += count;
         NEWLINE_OR_RETURN;
         printf("0x");
@@ -626,7 +531,7 @@ static void print_fun_or_otherptr(lispobj obj)
         print_slots(ratio_slots, count, ptr);
         break;
 
-    case COMPLEX_WIDETAG:
+    case COMPLEX_RATIONAL_WIDETAG:
         print_slots(complex_slots, count, ptr);
         break;
 
@@ -634,15 +539,20 @@ static void print_fun_or_otherptr(lispobj obj)
         // Only 1 byte of a symbol header conveys its size.
         // The other bytes may be freely used by the backend.
         print_slots(symbol_slots, count & 0xFF, ptr);
-        if (symbol_function(ptr-1) != NIL)
-            print_obj("fun: ", symbol_function(ptr-1));
+        struct symbol* sym = (void*)(ptr - 1);
+        if (symbol_function(sym) != NIL) print_obj("fun: ", symbol_function(sym));
 #ifdef LISP_FEATURE_SB_THREAD
-        int tlsindex = tls_index_of((struct symbol*)(ptr-1));
-        struct thread*th = arch_os_get_current_thread();
+        int tlsindex = tls_index_of(sym);
+        struct thread*th = get_sb_vm_thread();
         if (th != 0 && tlsindex != 0) {
             lispobj v = *(lispobj*)(tlsindex + (char*)th);
             print_obj("tlsval: ", v);
         }
+#endif
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+        // print_obj doesn't understand raw words, so make it a fixnum
+        int pkgid = symbol_package_id(sym) << N_FIXNUM_TAG_BITS;
+        print_obj("pkgid: ", pkgid);
 #endif
         break;
 
@@ -710,7 +620,7 @@ static void print_fun_or_otherptr(lispobj obj)
     case SIMPLE_VECTOR_WIDETAG:
         NEWLINE_OR_RETURN;
         {
-        long length = fixnum_value(*ptr);
+        long length = vector_len(VECTOR(obj));
         printf("length = %ld", length);
         ptr++;
         index = 0;
@@ -721,15 +631,21 @@ static void print_fun_or_otherptr(lispobj obj)
         }
         break;
 
-    // FIXME: This case looks unreachable. print_struct() does it
-    case INSTANCE_WIDETAG:
+    case SIMPLE_BIT_VECTOR_WIDETAG:
         NEWLINE_OR_RETURN;
-        count = instance_length(header);
-        printf("length = %ld", (long) count);
-        index = 0;
-        while (count-- > 0) {
-            sprintf(buffer, "%d: ", index++);
-            print_obj(buffer, *ptr++);
+        {
+        long length = vector_len(VECTOR(obj));
+        printf("length = %ld : ", length);
+        int bits_to_print = (length < N_WORD_BITS) ? length : N_WORD_BITS;
+        uword_t word = ptr[1];
+        int i;
+        for(i=0; i<bits_to_print; ++i) {
+            putchar((word & 1) ? '1' : '0');
+            if ((i%8)==7) putchar('_');
+            word >>= 1;
+        }
+        if(bits_to_print < length) printf("...");
+        printf("\n");
         }
         break;
 
@@ -786,14 +702,14 @@ static void print_fun_or_otherptr(lispobj obj)
 
     case FDEFN_WIDETAG:
         print_slots(fdefn_slots, 2, ptr);
-        print_obj("entry: ", fdefn_callee_lispobj((struct fdefn*)(ptr-1)));
+        print_obj("entry: ", decode_fdefn_rawfun((struct fdefn*)(ptr-1)));
         break;
 
-    // Make certain vectors printable from C for when all hell breaks lose
+    // Make some vectors printable from C, for when all hell breaks lose
     case SIMPLE_ARRAY_UNSIGNED_BYTE_32_WIDETAG:
         NEWLINE_OR_RETURN;
         {
-        long length = fixnum_value(*ptr);
+        long length = vector_len(VECTOR(obj));
         uint32_t * data = (uint32_t*)(ptr + 1);
         long i;
         printf("#(");
@@ -806,9 +722,8 @@ static void print_fun_or_otherptr(lispobj obj)
         break;
     default:
         NEWLINE_OR_RETURN;
-        if (type >= SIMPLE_ARRAY_UNSIGNED_BYTE_2_WIDETAG &&
-            type <= SIMPLE_BIT_VECTOR_WIDETAG)
-            printf("length = %ld", (long)fixnum_value(*ptr));
+        if (specialized_vector_widetag_p(type))
+            printf("length = %"OBJ_FMTd, vector_len(VECTOR(obj)));
         else
             printf("Unknown header object?");
         break;
@@ -821,7 +736,7 @@ static void print_obj(char *prefix, lispobj obj)
     int type = lowtag_of(obj);
     struct var *var = lookup_by_obj(obj);
     char buffer[256];
-    boolean verbose = cur_depth < brief_depth;
+    bool verbose = cur_depth < brief_depth;
 
     if (!continue_p(verbose))
         return;
@@ -885,7 +800,8 @@ void print(lispobj obj)
     max_depth = 5;
     max_lines = 20;
 
-    print_obj("", obj);
+    if (!setjmp(ldb_print_nlx))
+        print_obj("", obj);
 
     putchar('\n');
 }
@@ -906,23 +822,22 @@ void brief_print(lispobj obj)
 // and return a Lisp string, are designed to be foolproof during GC,
 // hence all the forwarding checks.
 
-#include "forwarding-ptr.h"
-#include "genesis/classoid.h"
-struct vector * symbol_name(lispobj * sym)
+struct vector * symbol_name(struct symbol* sym)
 {
-  if (forwarding_pointer_p(sym))
-    sym = native_pointer(forwarding_pointer_value(sym));
-  if (lowtag_of(((struct symbol*)sym)->name) != OTHER_POINTER_LOWTAG)
-      return NULL;
-  return VECTOR(follow_maybe_fp(((struct symbol*)sym)->name));
+  if (forwarding_pointer_p((lispobj*)sym))
+    sym = (void*)native_pointer(forwarding_pointer_value((lispobj*)sym));
+  lispobj name = sym->name;
+  if (lowtag_of(name) != OTHER_POINTER_LOWTAG) return NULL;
+  lispobj string = decode_symbol_name(name);
+  return VECTOR(follow_fp(string)); // can't have a nameless symbol
 }
 struct vector * classoid_name(lispobj * classoid)
 {
   if (forwarding_pointer_p(classoid))
       classoid = native_pointer(forwarding_pointer_value(classoid));
+  // Classoids are named by symbols even though a CLASS name is arbitrary (theoretically)
   lispobj sym = ((struct classoid*)classoid)->name;
-  return lowtag_of(sym) != OTHER_POINTER_LOWTAG ? NULL
-    : symbol_name(native_pointer(sym));
+  return lowtag_of(sym) != OTHER_POINTER_LOWTAG ? NULL : symbol_name(SYMBOL(sym));
 }
 struct vector * layout_classoid_name(lispobj * layout)
 {

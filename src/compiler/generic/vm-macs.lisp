@@ -12,6 +12,40 @@
 
 (in-package "SB-VM")
 
+;;;; Arenas
+(defmacro thread-current-arena ()
+  `(sap-ref-lispobj (current-thread-offset-sap thread-this-slot)
+                    (ash thread-arena-slot word-shift)))
+#-sb-xc-host
+(progn
+ ;;; During evaluation of FORM use the main heap, automatically
+ ;;; switching away from, and back to, the current arena if one was in use.
+  (defmacro without-arena (&body body)
+    #-system-tlabs `(progn ,@body)
+    #+system-tlabs
+    `(let ((arena (thread-current-arena)))
+       (when (%instancep arena) (switch-to-arena 0))
+       (unwind-protect (progn ,@body)
+         (when (%instancep arena) (switch-to-arena arena)))))
+  #+system-tlabs
+  (progn
+    (defun switch-to-arena (a)
+      (sb-sys:%primitive sb-vm::switch-to-arena a))
+    (define-compiler-macro switch-to-arena (a)
+      `(sb-sys:%primitive sb-vm::switch-to-arena ,a))))
+
+(defmacro with-pseudo-atomic-foreign-calls (&body body)
+  ;; Used judiciously, this can prevent some deadlocks.
+  ;; It's possible that git rev 7143001bbe7d50c6 was an attempt to solve a
+  ;; similar issue, but either its author had an incomplete understanding - GC can't
+  ;; actually deadlock now - or else things were very different from what they are.
+  ;; In any case, we desire a way to say that certain foreign calls are
+  ;; uninterruptible, but this technique has less overhead than WITHOUT-GCING
+  ;; which is to be eschewed as no such thing exists in most collectors.
+  ;; If using safepoints, then this reduces to PROGN.
+  `(symbol-macrolet (#-sb-safepoint (sb-vm::.pseudo-atomic-call-out. t))
+     ,@body))
+
 ;;;; other miscellaneous stuff
 
 ;;; This returns a form that returns a dual-word aligned number of bytes when
@@ -32,30 +66,25 @@
          (list* (car options) (cadr options)
                 (remove-keywords (cddr options) keywords)))))
 
-(defstruct (prim-object-slot
-             (:constructor make-slot (name rest-p offset special options))
-             (:copier nil)
-             (:conc-name slot-))
-  (name nil :type symbol :read-only t)
-  (rest-p nil :type (member t nil) :read-only t)
-  (offset 0 :type fixnum :read-only t)
-  (options nil :type list :read-only t)
-  ;; On some targets (e.g. x86-64) slots of the thread structure are
-  ;; referenced as special variables, this slot holds the name of that variable.
-  (special nil :type symbol :read-only t))
-
 (defstruct (primitive-object (:copier nil))
   (name nil :type symbol :read-only t)
   (widetag nil :type symbol :read-only t)
   (lowtag nil :type symbol :read-only t)
-  (options nil :type list :read-only t)
-  (slots nil :type list :read-only t)
   (length 0 :type fixnum :read-only t)
-  (variable-length-p nil :type (member t nil) :read-only t))
+  (variable-length-p nil :type boolean :read-only t)
+  (slots #() :type vector :read-only t))
 
-(declaim (freeze-type prim-object-slot primitive-object))
+(defun slot-offset (slot) (car slot))
+(defun slot-name (slot) (cadr slot))
+(defun slot-special (slot) (getf (cddr slot) :special))
+
+(declaim (freeze-type primitive-object))
 
 (define-load-time-global *primitive-objects* nil)
+(defun primitive-object (name)
+  (find name *primitive-objects* :key #'primitive-object-name))
+(defun primitive-object-slot (obj name)
+  (find name (primitive-object-slots obj) :key #'slot-name))
 
 (defun !%define-primitive-object (primobj)
   (let ((name (primitive-object-name primobj)))
@@ -89,8 +118,10 @@
                        &allow-other-keys)
             (if (atom spec) (list spec) spec)
           (declare (ignorable pointer))
-          (slots `(make-slot ',slot-name ,rest-p ,offset ',special
-                             ',(remove-keywords options '(:rest-p :length))))
+          (slots (list* offset slot-name
+                        (remove-keywords
+                         options
+                         `(#+sb-xc :c-type :rest-p ,@(if (= length 1) '(:length))))))
           (let ((offset-sym (symbolicate name "-" slot-name
                                          (if rest-p "-OFFSET" "-SLOT"))))
             (constants
@@ -141,7 +172,7 @@
             (make-primitive-object :name ',name
                                    :widetag ',widetag
                                    :lowtag ',lowtag
-                                   :slots (list ,@(slots))
+                                   :slots ,(coerce (slots) 'vector)
                                    :length ,offset
                                    :variable-length-p ,variable-length-p))
          ,@(constants)
@@ -236,4 +267,12 @@
           (lambda (node block)
             (ir2-convert-casser node block name offset lowtag)))))
 
-;;; Modular functions
+(defglobal *backend-cond-scs* nil)
+
+(defmacro define-cond-sc (name sc &body test)
+  `(setf (getf *backend-cond-scs* ',name)
+         (cons ',sc (defun ,(symbolicate 'make- name '-test) (load-scs)
+                      (lambda (tn)
+                        (if (progn ,@test)
+                            t
+                            load-scs))))))

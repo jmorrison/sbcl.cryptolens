@@ -1,3 +1,8 @@
+#+gc-stress
+(sb-thread:make-thread (lambda ()
+                         (loop (gc :full t) (sleep 0.001)))
+                       :name "gc stress")
+
 (defpackage :test-util
   (:use :cl :sb-ext)
   (:export #:with-test #:report-test-status #:*failures*
@@ -9,10 +14,13 @@
            #:random-type
            #:type-evidently-=
            #:ctype=
+           #:type-specifiers-equal
            #:assert-tri-eq
            #:random-type
+           #:deep-size
 
            ;; thread tools
+           #:*n-cpus*
            #:make-kill-thread #:make-join-thread
            #:wait-for-threads
            #:process-all-interrupts
@@ -31,8 +39,13 @@
            #:assemble
            #:get-simple-fun-instruction-model
 
+           #:scratch-dir-name
            #:scratch-file-name
+           #:*scratch-file-prefix*
            #:with-scratch-file
+           #:with-test-directory
+           #:generate-test-directory-name
+           #:*test-directory*
            #:opaque-identity
            #:runtime #:split-string #:integer-sequence #:shuffle))
 
@@ -46,6 +59,14 @@
 
 (defvar *threads-to-kill*)
 (defvar *threads-to-join*)
+
+(defvar *n-cpus*
+  (max 1
+       #-win32 (sb-alien:alien-funcall
+                (sb-alien:extern-alien "sysconf"
+                                       (function sb-alien:long sb-alien:int))
+                sb-unix::sc-nprocessors-onln)
+       #+win32 (sb-alien:extern-alien "os_number_of_processors" sb-alien:int)))
 
 (defun setenv (name value)
   #-win32
@@ -77,15 +98,16 @@
 (defun type-evidently-= (x y)
   (and (subtypep x y) (subtypep y x)))
 
-(defun ctype= (left right)
-  (let ((a (sb-kernel:specifier-type left)))
+(defun type-specifiers-equal (left right)
+  (let ((a (sb-kernel:values-specifier-type left)))
     ;; SPECIFIER-TYPE is a memoized function, and TYPE= is a trivial
     ;; operation if A and B are EQ.
     ;; To actually exercise the type operation, remove the memoized parse.
     (sb-int:drop-all-hash-caches)
-    (let ((b (sb-kernel:specifier-type right)))
-      (assert (not (eq a b)))
+    (let ((b (sb-kernel:values-specifier-type right)))
       (sb-kernel:type= a b))))
+;;; This isn't a great name. Prefer to use TYPE-SPECIFIERS-EQUAL instead
+(defun ctype= (a b) (type-specifiers-equal a b))
 
 (defmacro assert-tri-eq (expected-result expected-certainp form)
   (sb-int:with-unique-names (result certainp)
@@ -125,13 +147,7 @@
   ;; needs to wait, to have a facsimile of the situation prior to implementation
   ;; of the so-called pauseless thread start feature.
   ;; Wouldn't you know, it's just reintroducing a startup semaphore.
-  ;; And interruption tests are even more likely to fail with sb-thruption
-  ;; because sb-thruption is flawed: it presumes that there is enough synchronization
-  ;; between sender/receiver that checking the INVOKED variable (shared via a closure)
-  ;; makes any sense at all, which it doesn't. (In addition, it supposes that merely
-  ;; by polling at safepoints, interrupts somehow become safe, which is not true
-  ;; in general - it is only true of the GC "interrupt" delivered by the kernel
-  ;; when the safepoint page trap is hit.)
+  ;; And interruption tests are even more likely to fail with :sb-safepoint.
   ;; Noneless, this tries to be robust enough to pass.
   (let* ((sem (sb-thread:make-semaphore))
          (child  (make-kill-thread
@@ -165,46 +181,48 @@
 (defun run-test (test-function name fails-on
                  &aux (start-time (get-internal-real-time)))
   (start-test)
-  (let (#+sb-thread (threads (sb-thread:list-all-threads))
-        (*threads-to-join* nil)
-        (*threads-to-kill* nil))
-    (handler-bind ((error (lambda (error)
-                            (if (expected-failure-p fails-on)
-                                (fail-test :expected-failure name error)
-                                (fail-test :unexpected-failure name error))
-                            (return-from run-test))))
-      ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
-      (log-msg/non-pretty *trace-output* "Running ~S" name)
-      (funcall test-function)
-      #+sb-thread
-      (let ((any-leftover nil))
-        (dolist (thread *threads-to-join*)
-          (ignore-errors (sb-thread:join-thread thread)))
-        (dolist (thread *threads-to-kill*)
-          (ignore-errors (sb-thread:terminate-thread thread)))
-        (setf threads (union (union *threads-to-kill*
-                                    *threads-to-join*)
-                             threads))
-        #+(and sb-safepoint-strictly (not win32))
-        (dolist (thread (sb-thread:list-all-threads))
-          (when (typep thread 'sb-thread:signal-handling-thread)
-            (ignore-errors (sb-thread:join-thread thread))))
-        (dolist (thread (sb-thread:list-all-threads))
-          (unless (or (not (sb-thread:thread-alive-p thread))
-                      (eql (the sb-thread:thread thread)
-                           sb-thread:*current-thread*)
-                      (member thread threads)
-                      (sb-thread:thread-ephemeral-p thread))
-            (setf any-leftover thread)
-            #-win32
-            (ignore-errors (sb-thread:terminate-thread thread))))
-        (when any-leftover
-          (fail-test :leftover-thread name any-leftover)
-          (return-from run-test)))
-      (if (expected-failure-p fails-on)
-          (fail-test :unexpected-success name nil)
-          ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
-          (log-msg/non-pretty *trace-output* "Success ~S" name))))
+  (catch 'skip-test
+    (let (#+sb-thread (threads (sb-thread:list-all-threads))
+          (*threads-to-join* nil)
+          (*threads-to-kill* nil))
+      (handler-bind ((error (lambda (error)
+                              (if (expected-failure-p fails-on)
+                                  (fail-test :expected-failure name error)
+                                  (fail-test :unexpected-failure name error))
+                              (return-from run-test)))
+                     (timeout (lambda (error)
+                                (if (expected-failure-p fails-on)
+                                    (fail-test :expected-failure name error t)
+                                    (fail-test :unexpected-failure name error t))
+                                (return-from run-test))))
+        ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
+        (log-msg/non-pretty *trace-output* "Running ~S" name)
+        (funcall test-function)
+        #+sb-thread
+        (let ((any-leftover nil))
+          (dolist (thread *threads-to-join*)
+            (ignore-errors (sb-thread:join-thread thread)))
+          (dolist (thread *threads-to-kill*)
+            (ignore-errors (sb-thread:terminate-thread thread)))
+          (setf threads (union (union *threads-to-kill*
+                                      *threads-to-join*)
+                               threads))
+          (dolist (thread (sb-thread:list-all-threads))
+            (unless (or (not (sb-thread:thread-alive-p thread))
+                        (eql (the sb-thread:thread thread)
+                             sb-thread:*current-thread*)
+                        (member thread threads)
+                        (sb-thread:thread-ephemeral-p thread))
+              (setf any-leftover thread)
+              #-win32
+              (ignore-errors (sb-thread:terminate-thread thread))))
+          (when any-leftover
+            (fail-test :leftover-thread name any-leftover)
+            (return-from run-test)))
+        (if (expected-failure-p fails-on)
+            (fail-test :unexpected-success name nil)
+            ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
+            (log-msg/non-pretty *trace-output* "Success ~S" name)))))
   (record-test-elapsed-time name start-time))
 
 ;;; Like RUN-TEST but do not perform any of the automated thread management.
@@ -240,17 +258,20 @@
 ;;; but the nice side effect is that the tests finish quicker.
 (defmacro with-test ((&key fails-on broken-on skipped-on name serial slow)
                      &body body)
-  (flet ((name-ok (x y)
-           (declare (ignore y))
-           (typecase x
-             (symbol (let ((package (symbol-package x)))
-                       (or (null package)
-                           (sb-int:system-package-p package)
-                           (eql package (find-package "CL"))
-                           (eql package (find-package "KEYWORD")))))
-             (integer t))))
-    (unless (tree-equal name name :test #'name-ok)
-      (error "test name must be all-keywords: ~S" name)))
+  ;; Failing and skipped tests are written into a summary file which is later read back.
+  ;; To guarantee readability there can't be symbols in random packages.
+  (setq name (sb-int:named-let ensure-ok ((x name))
+               (etypecase x
+                 (cons (cons (ensure-ok (car x)) (ensure-ok (cdr x))))
+                 (symbol (let ((package (symbol-package x)))
+                           (if (or (null package)
+                                   (sb-int:system-package-p package)
+                                   (eql package (find-package "CL"))
+                                   (eql package (find-package "KEYWORD")))
+                               x (copy-symbol x))))
+                 (integer x)
+                 (character `(code-char ,(char-code x)))
+                 (string x))))
   (cond
     ((broken-p broken-on)
      `(progn
@@ -294,7 +315,7 @@
       (enable-debugger)
       (invoke-debugger condition))))
 
-(defun fail-test (type test-name condition)
+(defun fail-test (type test-name condition &optional backtrace)
   (if (stringp condition)
       (log-msg *trace-output* "~@<~A ~S ~:_~A~:>"
                type test-name condition)
@@ -303,7 +324,8 @@
   (push (list type *test-file* (or test-name *test-count*))
         *failures*)
   (unless (stringp condition)
-    ;; (sb-debug:print-backtrace :from :interrupted-frame)
+    (when backtrace
+      (sb-debug:print-backtrace :from :interrupted-frame))
     (when (or (and *break-on-failure*
                    (not (eq type :expected-failure)))
               *break-on-expected-failure*)
@@ -624,25 +646,38 @@
 
 (defun %checked-compile-and-assert-one-case
     (form optimize function args-thunk expected test allow-conditions)
-  (let ((args (multiple-value-list (funcall args-thunk))))
-    (flet ((failed-to-signal (expected-type)
-             (error "~@<Calling the result of compiling~
+  (if (eq args-thunk :return-type)
+      (let ((type (sb-kernel:%simple-fun-type function)))
+       (unless (or (eq type 'function)
+                   #.(and (not (member :unwind-to-frame-and-call-vop sb-impl:+internal-features+))
+                          '(member '(debug 3) optimize :test #'equal))
+                   (type-specifiers-equal (caddr type) expected))
+         (error "~@<The derived type of~
+                   ~/test-util::print-form-and-optimize/ ~
+                   is ~/sb-impl:print-type-specifier/
+                   while
+                    ~/sb-impl:print-type-specifier/
+                   is expected~@:>"
+                (cons form optimize) type expected)))
+      (let ((args (multiple-value-list (funcall args-thunk))))
+        (flet ((failed-to-signal (expected-type)
+                 (error "~@<Calling the result of compiling~
                       ~/test-util::print-form-and-optimize/ ~
                       ~/test-util::print-arguments/~
                       returned normally instead of signaling a ~
                       condition of type ~
                       ~/sb-impl:print-type-specifier/.~@:>"
-                    (cons form optimize) args expected-type))
-           (signaled-unexpected (conditions)
-             (error "~@<Calling the result of compiling~
+                        (cons form optimize) args expected-type))
+               (signaled-unexpected (conditions)
+                 (error "~@<Calling the result of compiling~
                       ~/test-util::print-form-and-optimize/ ~
                       ~/test-util::print-arguments/~
                       signaled unexpected condition~P~
                       ~/test-util::print-signaled-conditions/~
                       .~@:>"
-                    (cons form optimize) args (length conditions) conditions))
-           (returned-unexpected (values expected test)
-             (error "~@<Calling the result of compiling~
+                        (cons form optimize) args (length conditions) conditions))
+               (returned-unexpected (values expected test)
+                 (error "~@<Calling the result of compiling~
                      ~/test-util::print-form-and-optimize/ ~
                      ~/test-util::print-arguments/~
                      returned values~@:_~@:_~
@@ -650,34 +685,34 @@
                      which is not ~S to~@:_~@:_~
                      ~2@T~<~{~S~^~@:_~}~:>~@:_~@:_~
                      .~@:>"
-                    (cons form optimize) args
-                    (list values) test (list expected))))
-      (multiple-value-bind (values conditions)
-          (apply #'call-capturing-values-and-conditions function args)
-        (typecase expected
-          ((cons (eql condition) (cons t null))
-           (let* ((expected-condition-type (second expected))
-                  (unexpected (remove-if (lambda (condition)
-                                           (typep condition
-                                                  expected-condition-type))
-                                         conditions))
-                  (expected (set-difference conditions unexpected)))
-             (cond
-               (unexpected
-                (signaled-unexpected unexpected))
-               ((null expected)
-                (failed-to-signal expected-condition-type)))))
-          (t
-           (let ((expected (funcall expected)))
-             (cond
-               ((and conditions
-                     (not (and allow-conditions
-                               (every (lambda (condition)
-                                        (typep condition allow-conditions))
-                                      conditions))))
-                (signaled-unexpected conditions))
-               ((not (funcall test values expected))
-                (returned-unexpected values expected test))))))))))
+                        (cons form optimize) args
+                        (list values) test (list expected))))
+          (multiple-value-bind (values conditions)
+              (apply #'call-capturing-values-and-conditions function args)
+            (typecase expected
+              ((cons (eql condition) (cons t null))
+               (let* ((expected-condition-type (second expected))
+                      (unexpected (remove-if (lambda (condition)
+                                               (typep condition
+                                                      expected-condition-type))
+                                             conditions))
+                      (expected (set-difference conditions unexpected)))
+                 (cond
+                   (unexpected
+                    (signaled-unexpected unexpected))
+                   ((null expected)
+                    (failed-to-signal expected-condition-type)))))
+              (t
+               (let ((expected (funcall expected)))
+                 (cond
+                   ((and conditions
+                         (not (and allow-conditions
+                                   (every (lambda (condition)
+                                            (typep condition allow-conditions))
+                                          conditions))))
+                    (signaled-unexpected conditions))
+                   ((not (funcall test values expected))
+                    (returned-unexpected values expected test)))))))))))
 
 (defun %checked-compile-and-assert-one-compilation
     (form optimize other-checked-compile-args cases)
@@ -742,20 +777,22 @@
                                             (optimize :quick))
                                          form &body cases)
   (flet ((make-case-form (case)
-           (destructuring-bind (args values &key (test ''equal testp)
-                                     allow-conditions)
-               case
-             (let ((conditionp (typep values '(cons (eql condition) (cons t null)))))
-               (when (and testp conditionp)
-                 (sb-ext:with-current-source-form (case)
-                   (error "~@<Cannot use ~S with ~S ~S.~@:>"
-                          values :test test)))
-               `(list (lambda () (values ,@args))
-                      ,(if conditionp
-                           `(list 'condition ,(second values))
-                           `(lambda () (multiple-value-list ,values)))
-                      ,test
-                      ,allow-conditions)))))
+           (if (typep case '(cons (member :return-type)))
+               `',case
+               (destructuring-bind (args values &key (test ''equal testp)
+                                                     allow-conditions)
+                   case
+                 (let ((conditionp (typep values '(cons (eql condition) (cons t null)))))
+                   (when (and testp conditionp)
+                     (sb-ext:with-current-source-form (case)
+                       (error "~@<Cannot use ~S with ~S ~S.~@:>"
+                              values :test test)))
+                   `(list (lambda () (values ,@args))
+                          ,(if conditionp
+                               `(list 'condition ,(second values))
+                               `(lambda () (multiple-value-list ,values)))
+                          ,test
+                          ,allow-conditions))))))
     `(%checked-compile-and-assert
       ,form (list :name ,name
                   :allow-warnings ,allow-warnings
@@ -865,16 +902,27 @@
 ;;; Return a random file name to avoid writing into the source tree.
 ;;; We can't use any of the interfaces provided in libc because those are inadequate
 ;;; for purposes of COMPILE-FILE. This is not trying to be robust against attacks.
+(defvar *scratch-file-prefix* "sbcl-scratch")
+(defun scratch-dir-name ()
+  (let ((dir (posix-getenv #+win32 "TMP" #+unix "TMPDIR"))
+        (file (format nil "~a~d/" *scratch-file-prefix* (sb-unix:unix-getpid))))
+      (if dir
+          (namestring
+           (merge-pathnames
+            file (parse-native-namestring dir nil *default-pathname-defaults*
+                                          :as-directory t)))
+          (concatenate 'string "/tmp/" file))))
 (defun scratch-file-name (&optional extension)
   (let ((a (make-array 10 :element-type 'character)))
     (dotimes (i 10)
       (setf (aref a i) (code-char (+ (char-code #\a) (random 26)))))
     (let ((dir (posix-getenv #+win32 "TMP" #+unix "TMPDIR"))
-          (file (format nil "sbcl~d~a~@[.~a~]"
+          (file (format nil "~a~d~a~@[.~a~]" *scratch-file-prefix*
                         (sb-unix:unix-getpid) a extension)))
       (if dir
           (namestring
            (merge-pathnames
+            ;; TRUENAME - wtf ?
             file (truename (parse-native-namestring dir nil *default-pathname-defaults*
                                                     :as-directory t))))
           (concatenate 'string "/tmp/" file)))))
@@ -885,6 +933,35 @@
        (unwind-protect
             (let ((,var ,tempname)) ,@forms) ; rebind, as test might asssign into VAR
          (ignore-errors (delete-file ,tempname))))))
+
+(defvar *test-directory*)
+
+(defun generate-test-directory-name ()
+  ;; Why aren't we using TMPDIR???
+  (merge-pathnames
+   (make-pathname :directory `(:relative ,(write-to-string (sb-unix:unix-getpid))))
+   (parse-native-namestring (posix-getenv "TEST_DIRECTORY")
+                            nil *default-pathname-defaults*
+                            :as-directory t)))
+
+(defun call-with-test-directory (fn)
+  ;; FIXME: this writes into the source directory depending on whether
+  ;; TEST_DIRECTORY has been made to point elsewhere or not.
+  (let ((test-directory (generate-test-directory-name)))
+    (ensure-directories-exist test-directory)
+    (unwind-protect
+         ;; WHY REBIND *DEFAULT-PATHNAME-DEFAULTS* ? THIS SUCKS!
+         ;; (It means we can't use the WITH-TEST-DIRECTORY macro for most things)
+         (let ((*default-pathname-defaults* test-directory)
+               (*test-directory* test-directory))
+           (funcall fn test-directory))
+      (delete-directory test-directory :recursive t))))
+
+(defmacro with-test-directory ((&optional (test-directory-var (gensym)))
+                               &body body)
+  `(call-with-test-directory (lambda (,test-directory-var)
+                               (declare (ignorable ,test-directory-var))
+                               ,@body)))
 
 ;;; Take a list of lists and assemble them as though they are
 ;;; instructions inside the body of a vop. There is no need
@@ -926,3 +1003,64 @@
             (when (>= (sb-disassem:dstate-cur-offs dstate) (sb-disassem:seg-length segment))
               (return)))
       (result))))
+
+;;; If a test file is not very tolerant of the statistical profiler, then
+;;; it should call this. There seem to be at least 2 common categories of failure:
+;;;  * the stack exhaustion test can get a profiling signal when you're already
+;;;    near exhaustion, and then the profiler exhausts the stack, which isn't
+;;;    handled very well. Example:
+;;;    Control stack exhausted, fault: 0xd76b9ff8, PC: 0x806cad2
+;;;       0: fp=0xd76ba008 pc=0x806cad2 Foreign function search_dynamic_space
+;;;       1: fp=0xd76ba028 pc=0x80633d1 Foreign function search_all_gc_spaces
+;;;       2: fp=0xd76ba048 pc=0x805647e Foreign function component_ptr_from_pc
+;;;       3: fp=0xd76baa18 pc=0x8065dfd Foreign function (null)
+;;;       4: fp=0xd76baa98 pc=0x806615a Foreign function record_backtrace_from_context
+;;;       5: fp=0xd76baab8 pc=0x806625e Foreign function sigprof_handler
+;;;  * debugger-related tests. I'm not sure why.
+(defun disable-profiling ()
+  (when (find-package "SB-SPROF")
+    (format t "INFO: disabling SB-SPROF~%")
+    (funcall (intern "STOP-PROFILING" "SB-SPROF"))))
+
+;;; This unexported symbol emulates SB-RT. Please don't use it in new tests
+(defmacro deftest (name form &rest results) ; use SB-RT syntax
+  `(test-util:with-test (:name ,(sb-int:keywordicate name))
+     (assert (equalp (multiple-value-list ,form) ',results))))
+
+;;; Compute size of OBJ including descendants.
+;;; LEAFP specifies what object types to treat as not reaching
+;;; any other object. You pretty much have to treat symbols
+;;; as leaves, otherwise you reach a package and then the result
+;;; just explodes to beyond the point of being useful.
+;;; (It works, but might reach the entire heap)
+;;; To turn this into an actual thing, we'd want to reduce the consing.
+(defun deep-size (obj &optional (leafp (lambda (x)
+                                         (typep x '(or package symbol sb-kernel:fdefn
+                                                       function sb-kernel:code-component
+                                                       sb-kernel:layout sb-kernel:classoid)))))
+  (let ((worklist (list obj))
+        (seen (make-hash-table :test 'eq))
+        (tot-bytes 0))
+    (setf (gethash obj seen) t)
+    (flet ((visit (thing)
+             (when (sb-vm:is-lisp-pointer (sb-kernel:get-lisp-obj-address thing))
+               (unless (or (funcall leafp thing)
+                           (gethash thing seen))
+                 (push thing worklist)
+                 (setf (gethash thing seen) t)))))
+      (loop
+        (unless worklist (return))
+        (let ((x (pop worklist)))
+          (incf tot-bytes (primitive-object-size x))
+          (sb-vm:do-referenced-object (x visit)))))
+    ;; Secondary values is number of visited objects not incl. original one.
+    (values tot-bytes
+            (1- (hash-table-count seen))
+            seen)))
+
+;;; x86-64 does not permit var-alloc to translate %make-funcallable-instance
+;;; so this case has to be amenable to fixed-alloc.
+(defun make-funcallable-instance (n)
+  (funcall
+   (compile nil
+            `(lambda () (sb-kernel:%make-funcallable-instance ,n)))))

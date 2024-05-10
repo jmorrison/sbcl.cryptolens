@@ -43,6 +43,9 @@
   (let* ((n-total-bits (+ 1 n-random-chunk-bits bit-count)) ; sign bit
          (length (ceiling n-total-bits digit-size))
          (bignum (%allocate-bignum length)))
+    ;; DO NOT ASSUME THAT %ALLOCATE-BIGNUM PREZEROS
+    ;; [See example in MAKE-RANDOM-BIGNUM]
+    (setf (%bignum-ref bignum (1- length)) 0)
     (multiple-value-bind (n-random-digits n-random-bits)
         (floor bit-count digit-size)
       (declare (type bignum-length n-random-digits))
@@ -53,9 +56,9 @@
           (setf (%bignum-ref bignum n-random-digits) random-chunk)
           (progn
             (setf (%bignum-ref bignum n-random-digits)
-                  (%logior (random-bignum-partial-digit n-random-bits
-                                                        state)
-                           (%ashl random-chunk n-random-bits)))
+                  (logior (random-bignum-partial-digit n-random-bits
+                                                       state)
+                          (%ashl random-chunk n-random-bits)))
             (let ((shift (- digit-size n-random-bits)))
               (when (< shift n-random-chunk-bits)
                 (setf (%bignum-ref bignum (1+ n-random-digits))
@@ -72,6 +75,11 @@
          (length (ceiling n-total-bits digit-size))
          (bignum (%allocate-bignum length)))
     (declare (type bignum-length length))
+    ;; DO NOT ASSUME THAT %ALLOCATE-BIGNUM PREZEROS
+    ;; Consider: n-bits = 64 -> n-total-bits = 65 -> length = 2
+    ;; and n-digits = 1, n-bits-partial-digit = 0
+    ;; so DOTIMES executes exactly once, leaving the final word untouched.
+    (setf (%bignum-ref bignum (1- length)) 0)
     (multiple-value-bind (n-digits n-bits-partial-digit)
         (floor n-bits digit-size)
       (declare (type bignum-length n-digits))
@@ -116,13 +124,13 @@
 ;;;   it.
 (defun %random-bignum (arg state)
   (declare (type (integer #.(1+ most-positive-fixnum)) arg)
-           (type random-state state)
-           (inline bignum-lower-bits-zero-p))
-  (let ((n-bits (bignum-integer-length arg)))
+           (type random-state state))
+  (let* ((length (%bignum-length arg))
+         (n-bits (bignum-buffer-integer-length arg length)))
     (declare (type (integer #.sb-vm:n-fixnum-bits) n-bits))
     ;; Don't use (ZEROP (LOGAND ARG (1- ARG))) to test if ARG is a power
     ;; of two as that would cons.
-    (cond ((bignum-lower-bits-zero-p arg (1- n-bits))
+    (cond ((bignum-lower-bits-zero-p arg (1- n-bits) length)
            ;; ARG is a power of two. We need one bit less than its
            ;; INTEGER-LENGTH. Not using (DECF N-BITS) here allows the
            ;; compiler to make optimal use of the type declaration for
@@ -136,10 +144,10 @@
            (let ((shift (- n-random-chunk-bits n-bits))
                  (arg (%bignum-ref arg 0)))
              (loop
-               (let ((bits (%digit-logical-shift-right (random-chunk state)
-                                                       shift)))
-                 (when (< bits arg)
-                   (return bits))))))
+              (let ((bits (%digit-logical-shift-right (random-chunk state)
+                                                      shift)))
+                (when (< bits arg)
+                  (return bits))))))
           (t
            ;; ARG is not a power of two and we need more than one random
            ;; chunk.
@@ -147,19 +155,19 @@
                   (arg-first-chunk (ldb (byte n-random-chunk-bits shift)
                                         arg)))
              (loop
-               (let ((random-chunk (random-chunk state)))
-                 ;; If the random value is larger than the corresponding
-                 ;; chunk from the most significant bits of ARG we can
-                 ;; retry immediately; no need to generate the remaining
-                 ;; random bits.
-                 (unless (> random-chunk arg-first-chunk)
-                   ;; We need to generate the complete random number.
-                   (let ((bits (concatenate-random-bignum random-chunk
-                                                          shift state)))
-                     ;; While the second comparison below subsumes the
-                     ;; first, the first is faster and will nearly
-                     ;; always be true, so it's worth it to try it
-                     ;; first.
-                     (when (or (< random-chunk arg-first-chunk)
-                               (< bits arg))
-                       (return bits)))))))))))
+              (let ((random-chunk (random-chunk state)))
+                ;; If the random value is larger than the corresponding
+                ;; chunk from the most significant bits of ARG we can
+                ;; retry immediately; no need to generate the remaining
+                ;; random bits.
+                (unless (> random-chunk arg-first-chunk)
+                  ;; We need to generate the complete random number.
+                  (let ((bits (concatenate-random-bignum random-chunk
+                                                         shift state)))
+                    ;; While the second comparison below subsumes the
+                    ;; first, the first is faster and will nearly
+                    ;; always be true, so it's worth it to try it
+                    ;; first.
+                    (when (or (< random-chunk arg-first-chunk)
+                              (< bits arg))
+                      (return bits)))))))))))

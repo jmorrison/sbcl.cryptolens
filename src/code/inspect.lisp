@@ -116,7 +116,8 @@ evaluated expressions.
   (let ((*suppress-print-errors*
          (if (subtypep 'serious-condition *suppress-print-errors*)
              *suppress-print-errors*
-             'serious-condition)))
+             'serious-condition))
+        (unbound (load-time-value (make-unprintable-object "unbound slot") t)))
     (format stream "~%~A" description)
     (loop for element in elements
        for index from 0
@@ -124,10 +125,9 @@ evaluated expressions.
               (if named-p
                   (values (cdr element) (car element))
                   element)
-            (format stream "~W. ~@[~A: ~]~W~%"
-                    index name (if (eq value sb-pcl:+slot-unbound+)
-                                   "unbound"
-                                   value))))))
+            (when (unbound-marker-p value)
+              (setf value unbound))
+            (format stream "~W. ~@[~A: ~]~W~%" index name value)))))
 
 ;;;; INSPECTED-PARTS
 
@@ -168,9 +168,10 @@ evaluated expressions.
         (info (layout-info (sb-kernel:layout-of object))))
     (when (sb-kernel::defstruct-description-p info)
       (dolist (dd-slot (dd-slots info) (nreverse parts-list))
-        (push (cons (dsd-name dd-slot)
-                    (funcall (dsd-accessor-name dd-slot) object))
-              parts-list)))))
+        (let* ((reader (dsd-reader dd-slot (neq (dd-type info) 'structure)))
+               (index (dsd-index dd-slot))
+               (value (funcall reader object index)))
+          (push (cons (dsd-name dd-slot) value) parts-list))))))
 
 (defmethod inspected-parts ((object structure-object))
   (values (format nil "The object is a STRUCTURE-OBJECT of type ~S.~%"
@@ -221,7 +222,7 @@ evaluated expressions.
           ;; to DESCRIBE from the inspector.
           (list*
            (cons "Lambda-list" (%fun-lambda-list object))
-           (cons "Ftype" (%fun-type object))
+           (cons "Ftype" (%fun-ftype object))
            (when (closurep object)
              (list
               (cons "Closed over values" (%closure-values object)))))))
@@ -243,12 +244,14 @@ evaluated expressions.
 (defmethod inspected-parts ((object vector))
   (let ((length (min (length object) *inspect-length*)))
     (values (format nil
-                    "The object is a ~:[~;displaced ~]VECTOR of length ~W.~%"
+                    "The object is a ~:[~;displaced ~](VECTOR ~a) of length ~W.~%"
                     (and (array-header-p object)
                          (%array-displaced-p object))
+                    (array-element-type object)
                     (length object))
             nil
-            (coerce (subseq object 0 length) 'list))))
+            (unless (typep object '(simple-array nil))
+             (coerce (subseq object 0 length) 'list)))))
 
 (defun inspected-index-string (index rev-dimensions)
   (if (null rev-dimensions)
@@ -267,12 +270,13 @@ evaluated expressions.
                                       :displaced-to object))
          (dimensions (array-dimensions object))
          (reversed-elements nil))
-    (dotimes (i length)
-      (push (cons (format nil
-                          "~A "
-                          (inspected-index-string i (reverse dimensions)))
-                  (aref reference-array i))
-            reversed-elements))
+    (unless (typep object '(simple-array nil))
+      (dotimes (i length)
+        (push (cons (format nil
+                            "~A "
+                            (inspected-index-string i (reverse dimensions)))
+                    (aref reference-array i))
+              reversed-elements)))
     (values (format nil "The object is ~:[an~;a displaced~] ARRAY of ~A.~%~
                          Its dimensions are ~:S.~%"
                     (and (array-header-p object)

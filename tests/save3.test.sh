@@ -1,4 +1,3 @@
-export TEST_BASEDIR=${TMPDIR:-/tmp}
 . ./subr.sh
 
 use_test_subdirectory
@@ -15,7 +14,7 @@ run_sbcl_with_core "$tmpcore" --noinform --no-userinit --no-sysinit \
 check_status_maybe_lose "SAVE-LISP-AND-DIE" $? 0 "(saved core ran)"
 
 # Verify that for funcallable instances which were moved into the
-# immobile varyobj space by SAVE-LISP-AND-DIE, setting the layout
+# immobile text space by SAVE-LISP-AND-DIE, setting the layout
 # updates the GC card touched bit.
 # Going through instance-obsolescence stuff makes things mostly work
 # by accident, because (SETF %FUNCALLABLE-INSTANCE-INFO) touches
@@ -29,14 +28,14 @@ run_sbcl <<EOF
     (:generic-function-class subgf)
     (:method ((self integer)) 'hey-integer))
   (defun assign-layout ()
-    #+gencgc (setf (extern-alien "verify_gens" char) 0)
+    (setf (extern-alien "verify_gens" char) 0)
     (defclass subgf (standard-generic-function) (a b) ; add a slot
       (:metaclass sb-mop:funcallable-standard-class))
     (defclass subgf (standard-generic-function) (a) ; remove a slot
       (:metaclass sb-mop:funcallable-standard-class))
     (let ((nl (sb-kernel:find-layout 'subgf))) ; new layout
       (assert (not (eq (sb-kernel:%fun-layout #'myfun) nl)))
-      (setf (sb-kernel:%fun-layout #'myfun) nl)
+      (sb-kernel:%set-fun-layout #'myfun nl)
       (gc)))
   (save-lisp-and-die "$tmpcore" :toplevel #'assign-layout)
 EOF

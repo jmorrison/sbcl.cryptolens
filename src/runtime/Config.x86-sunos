@@ -10,7 +10,7 @@
 # files for more information.
 
 CC=gcc
-CFLAGS = -g -O2 -Wall -D__EXTENSIONS__ -D_POSIX_C_SOURCE=199506L -DSVR4 -D_REENTRANT -fno-omit-frame-pointer
+CFLAGS += -g -O2 -Wall -D__EXTENSIONS__ -DSVR4 -D_REENTRANT -fno-omit-frame-pointer
 GREP = ggrep
 
 ASSEM_SRC = x86-assem.S
@@ -20,11 +20,7 @@ OS_SRC = sunos-os.c x86-sunos-os.c
 OS_LIBS= -ldl -lsocket -lnsl -lrt
 
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-  OS_LIBS += -lz
+  OS_LIBS += -lzstd
 endif
 
 GC_SRC= fullcgc.c gencgc.c traceroot.c
-
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:

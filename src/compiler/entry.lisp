@@ -14,7 +14,7 @@
 (in-package "SB-C")
 
 ;;; This phase runs before IR2 conversion, initializing each XEP's
-;;; ENTRY-INFO structure.  If there was a forward reference to a function,
+;;; ENTRY-INFO structure. If there was a forward reference to a function,
 ;;; then the ENTRY-INFO will already exist, but will be uninitialized.
 (defun entry-analyze (component)
   (let ((2comp (component-info component)))
@@ -26,33 +26,13 @@
           (push info (ir2-component-entries 2comp))))))
   (values))
 
-;;; An "effectively" null environment captures at most
-;;; a compilation policy, nothing more.
-;;; This is to make the 2nd value of FUNCTION-LAMBDA-EXPRESSION
-;;; accurate; but is it really important to do that? Nah.
-#+nil
-(defun effectively-null-lexenv-p (lexenv)
-  (or (null-lexenv-p lexenv)
-      (and (not (or (lexenv-funs lexenv)
-                    (lexenv-vars lexenv)
-                    (lexenv-blocks lexenv)
-                    (lexenv-tags lexenv)
-                    (lexenv-type-restrictions lexenv)
-                    (lexenv-lambda lexenv)
-                    (lexenv-cleanup lexenv)
-                    (lexenv-handled-conditions lexenv)
-                    (lexenv-disabled-package-locks lexenv)
-                    (lexenv-user-data lexenv)))
-           (or (not (lexenv-parent lexenv))
-               (null-lexenv-p (lexenv-parent lexenv))))))
-
 ;;; Initialize INFO structure to correspond to the XEP LAMBDA FUN.
 (defun compute-entry-info (fun info)
   (declare (type clambda fun) (type entry-info info))
   (let ((bind (lambda-bind fun))
         (internal-fun (functional-entry-fun fun)))
     (setf (entry-info-closure-tn info)
-          (if (physenv-closure (lambda-physenv fun))
+          (if (environment-closure (lambda-environment fun))
               (make-normal-tn *backend-t-primitive-type*)
               nil))
     (setf (entry-info-offset info) (gen-label))
@@ -60,7 +40,7 @@
           (leaf-debug-name internal-fun))
     (setf (entry-info-xref info) (pack-xref-data (functional-xref internal-fun)))
     (let* ((inline-expansion (functional-inline-expansion internal-fun))
-           (form  (if (fasl-output-p *compile-object*)
+           (form  (if (producing-fasl-file)
                       ;; If compiling to a file, we only store sources if the STORE-SOURCE
                       ;; quality value is 3. If to memory, any nonzero value will do.
                       (and (policy bind (= store-source-form 3))
@@ -90,8 +70,9 @@ missing MAKE-LOAD-FORM methods?")
                                          (compiler-style-warn
                                           "Can't preserve function source: ~A"
                                           (princ-to-string c)))
-                                       (return nil))))
-                               (constant-value (find-constant inline-expansion)))))
+                                     (return nil))))
+                               (maybe-emit-make-load-forms inline-expansion)
+                               inline-expansion)))
                       (and (policy bind (> store-source-form 0))
                            inline-expansion)))
            (doc (functional-documentation internal-fun)))
@@ -103,8 +84,9 @@ missing MAKE-LOAD-FORM methods?")
         ;; points will be dumped.  If they contain values that need
         ;; make-load-form processing then we need to do it now (bug
         ;; 310132).
-        (setf (entry-info-arguments info)
-              (constant-value (find-constant args))))
+        (when (producing-fasl-file)
+          (maybe-emit-make-load-forms args))
+        (setf (entry-info-arguments info) args))
       ;; Arguably we should not parse/unparse if the type was obtained from
       ;; a proclamation. On the other hand, this preserves exact semantics
       ;; if a later DEFTYPE changes something. Be that as it may, storing
@@ -112,12 +94,15 @@ missing MAKE-LOAD-FORM methods?")
       (let ((spec (type-specifier (leaf-type internal-fun)))
             (result))
         (setf (entry-info-type info)
-              (if (and (listp spec)
-                       (typep (setq result (third spec))
-                              '(cons (eql values)
-                                     (cons t (cons (eql &optional) null)))))
-                  `(sfunction ,(cadr spec) ,(cadr result))
-                  spec)))))
+              (let ((type (if (and (listp spec)
+                                   (typep (setq result (third spec))
+                                          '(cons (eql values)
+                                            (cons t (cons (eql &optional) null)))))
+                              `(sfunction ,(cadr spec) ,(cadr result))
+                              spec)))
+                (when (producing-fasl-file)
+                  (maybe-emit-make-load-forms type))
+                type)))))
   (values))
 
 ;;; Replace all references to COMPONENT's non-closure XEPs that appear
@@ -139,12 +124,12 @@ missing MAKE-LOAD-FORM methods?")
 (defun replace-toplevel-xeps (component)
   (let ((res nil))
     (dolist (lambda (component-lambdas component))
-      (case (functional-kind lambda)
-        (:external
+      (functional-kind-case lambda
+        (external
          (unless (lambda-has-external-references-p lambda)
            (let* ((ef (functional-entry-fun lambda))
                   (new (make-functional
-                        :kind :toplevel-xep
+                        :kind (functional-kind-attributes toplevel-xep)
                         :info (leaf-info lambda)
                         :%source-name (functional-%source-name ef)
                         :%debug-name (functional-%debug-name ef)
@@ -153,8 +138,8 @@ missing MAKE-LOAD-FORM methods?")
                   (closure (and
                             ;; It may have been deleted due to none of
                             ;; the optional entries reaching it.
-                            (neq (functional-kind main-entry) :deleted)
-                            (physenv-closure (lambda-physenv main-entry)))))
+                            (not (functional-kind-eq main-entry deleted))
+                            (environment-closure (lambda-environment main-entry)))))
              (dolist (ref (leaf-refs lambda))
                (let ((ref-component (node-component ref)))
                  (cond ((eq ref-component component))
@@ -166,6 +151,6 @@ missing MAKE-LOAD-FORM methods?")
                         (push ref (leaf-refs new))
                         (setf (leaf-refs lambda)
                               (delq1 ref (leaf-refs lambda))))))))))
-        (:toplevel
+        (toplevel
          (setq res t))))
     res))

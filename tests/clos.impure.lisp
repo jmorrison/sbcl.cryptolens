@@ -11,7 +11,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#+interpreter (sb-ext:exit :code 104)
+#+interpreter (invoke-restart 'run-tests::skip-file)
 
 (load "compiler-test-util.lisp")
 (defpackage "CLOS-IMPURE"
@@ -49,11 +49,17 @@
 ;;; sbcl-0.6.12.25, the implementation of NO-APPLICABLE-METHOD was
 ;;; broken in such a way that the code here would signal an error.
 (defgeneric zut-n-a-m (a b c))
+(defmethod zut-n-a-m :around (a b (c symbol)) nil)
 (defmethod no-applicable-method ((zut-n-a-m (eql #'zut-n-a-m)) &rest args)
   (declare (ignore args))
   :no-applicable-method)
+(defmethod sb-pcl:no-primary-method ((zut-n-a-m (eql #'zut-n-a-m)) &rest args)
+  (declare (ignore args))
+  :no-primary-method)
 (with-test (:name no-applicable-method)
   (assert (eq :no-applicable-method (zut-n-a-m 1 2 3))))
+(with-test (:name :no-primary-method)
+  (assert (eq :no-primary-method (zut-n-a-m 1 2 t))))
 
 ;;; bug reported and fixed by Alexey Dejneka sbcl-devel 2001-09-10:
 ;;; This DEFGENERIC shouldn't cause an error.
@@ -814,11 +820,11 @@
 (assert (= (wam-test-mc-b 13) 13))
 (defmethod wam-test-mc-b :around ((val number))
   (+ val (if (next-method-p) (call-next-method) 0)))
-(assert (= (wam-test-mc-b 13) 26))
+(assert (= (wam-test-mc-b 14) 28))
 (defmethod wam-test-mc-b :somethingelse ((val number))
   (+ val (if (next-method-p) (call-next-method) 0)))
 (let ((*error-output* (make-broadcast-stream)))
-  (assert-error (wam-test-mc-b 13)))
+  (assert-error (wam-test-mc-b 15)))
 
 ;;; now, ensure that it fails with a single group with a qualifier-pattern
 ;;; that is not *
@@ -833,11 +839,11 @@
 (assert-error (wam-test-mc-c 13))
 (defmethod wam-test-mc-c :foo ((val number))
   (+ val (if (next-method-p) (call-next-method) 0)))
-(assert (= (wam-test-mc-c 13) 13))
+(assert (= (wam-test-mc-c 14) 14))
 (defmethod wam-test-mc-c :bar ((val number))
   (+ val (if (next-method-p) (call-next-method) 0)))
 (let ((*error-output* (make-broadcast-stream)))
-  (assert-error (wam-test-mc-c 13)))
+  (assert-error (wam-test-mc-c 15)))
 
 ;;; DEFMETHOD should signal an ERROR if an incompatible lambda list is
 ;;; given:
@@ -1016,6 +1022,14 @@
                          &optional new-value)
   (declare (ignore new-value))
   (values op 1 2 3))
+(defmethod cwasm-sv ((o class-with-all-slots-missing))
+  (slot-value o 'baz))
+(defmethod cwasm-ssv (nv (o class-with-all-slots-missing))
+  (setf (slot-value o 'baz) nv))
+(defmethod cwasm-sbp ((o class-with-all-slots-missing))
+  (slot-boundp o 'baz))
+(defmethod cwasm-smk ((o class-with-all-slots-missing))
+  (slot-makunbound o 'baz))
 
 (with-test (:name :slot-value-missing)
   (assert (equal (multiple-value-list
@@ -1024,6 +1038,9 @@
   (assert (equal (multiple-value-list
                   (funcall (lambda (x) (slot-value x 'bar))
                            (make-instance 'class-with-all-slots-missing)))
+                 '(slot-value)))
+  (assert (equal (multiple-value-list
+                  (cwasm-sv (make-instance 'class-with-all-slots-missing)))
                  '(slot-value))))
 
 (with-test (:name :slot-boundp-missing)
@@ -1033,6 +1050,9 @@
   (assert (equal (multiple-value-list
                   (funcall (lambda (x) (slot-boundp x 'bar))
                            (make-instance 'class-with-all-slots-missing)))
+                 '(t)))
+  (assert (equal (multiple-value-list
+                  (cwasm-sbp (make-instance 'class-with-all-slots-missing)))
                  '(t))))
 
 (with-test (:name :slot-setf-missing)
@@ -1042,7 +1062,21 @@
   (assert (equal (multiple-value-list
                   (funcall (lambda (x) (setf (slot-value x 'bar) 20))
                            (make-instance 'class-with-all-slots-missing)))
-                 '(20))))
+                 '(20)))
+  (assert (equal (multiple-value-list
+                  (cwasm-ssv 30 (make-instance 'class-with-all-slots-missing)))
+                 '(30))))
+
+(with-test (:name :slot-makunbound-missing)
+  (let ((instance (make-instance 'class-with-all-slots-missing)))
+    (assert (equal (multiple-value-list (slot-makunbound instance 'foo))
+                   (list instance)))
+    (assert (equal (multiple-value-list
+                    (funcall (lambda (x) (slot-makunbound x 'bar)) instance))
+                   (list instance)))
+    (assert (equal (multiple-value-list
+                    (cwasm-smk instance))
+                   (list instance)))))
 
 (macrolet ((try (which)
              `(assert (eq ((lambda (x)
@@ -1135,6 +1169,7 @@
     (call-next-method))
   (:method (x (y (eql nil)))
     (setf y t)
+    (opaque-identity y) ; or else "assigned but never read" style-warning
     (call-next-method)))
 (with-test (:name (:cnm-assignment :bug-1734771 1))
   (assert (equal (bug-1734771 2 3) '(2 3))))
@@ -1260,8 +1295,104 @@
   (assert-error (eqls1760987 3 :k2 5) program-error)
   (assert-error (eqls1760987 3 :k1 2 :k2 5) program-error)
   (assert-error (eqls1760987 3 :k4 2 :k2 5) program-error)
-  (assert-error (eqls1760987 3 :k1 2 :k3 3 :k2 5) program-error)
-  )
+  (assert-error (eqls1760987 3 :k1 2 :k3 3 :k2 5) program-error))
+
+;;; CLHS 7.6.5 should still hold in the presence of auxiliary methods
+(defgeneric gf-with-keys-to-check (a &key b)
+  (:method ((a integer) &key b) (declare (ignore b)) (1+ a))
+  (:method ((a string) &key b) (list a b))
+  (:method ((a symbol) &key b c) (declare (ignore b)) (list a c))
+  (:method :around ((a integer) &key b) (declare (ignore b)) (1+ (call-next-method))))
+
+(with-test (:name (:check-keyword-args :no-error))
+  (assert (= (gf-with-keys-to-check 1) 3))
+  (assert (= (gf-with-keys-to-check 1 :b 2) 3))
+  (assert (equal (gf-with-keys-to-check "a") '("a" nil)))
+  (assert (equal (gf-with-keys-to-check "a" :b 2) '("a" 2)))
+  (assert (equal (gf-with-keys-to-check 'a) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :c 2) '(a 2)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2 :c 3) '(a 3))))
+
+(with-test (:name (:check-keyword-args :allow-other-keys :no-error))
+  (assert (= (gf-with-keys-to-check 1 :z 3 :allow-other-keys t) 3))
+  (assert (= (gf-with-keys-to-check 1 :b 2 :z 3 :allow-other-keys t) 3))
+  (assert (equal (gf-with-keys-to-check "a" :z 3 :allow-other-keys t) '("a" nil)))
+  (assert (equal (gf-with-keys-to-check "a" :b 2 :z 3 :allow-other-keys t) '("a" 2)))
+  (assert (equal (gf-with-keys-to-check 'a :z 3 :allow-other-keys t) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2 :z 3 :allow-other-keys t) '(a nil)))
+  (assert (equal (gf-with-keys-to-check 'a :c 2 :z 3 :allow-other-keys t) '(a 2)))
+  (assert (equal (gf-with-keys-to-check 'a :b 2 :c 3 :allow-other-keys t) '(a 3))))
+
+(with-test (:name (:check-keyword-args :unmatched-keyword :error))
+  (assert-error (gf-with-keys-to-check 1 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 1 :b 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check "a" :z 3) program-error)
+  (assert-error (gf-with-keys-to-check "a" :b 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :c 2 :z 3) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :c 3 :z 4) program-error))
+
+(with-test (:name (:check-keyword-args :odd-keyword :error))
+  (assert-error (gf-with-keys-to-check 1 :b) program-error)
+  (assert-error (gf-with-keys-to-check 1 :b 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check "a" :b) program-error)
+  (assert-error (gf-with-keys-to-check "a" :b 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :c 2 :b) program-error)
+  (assert-error (gf-with-keys-to-check 'a :b 2 :c 3 :b) program-error))
+
+;;; verify that we perform these checks for standardized generic
+;;; functions too
+(defclass shared-initialize-keyword-check () ())
+
+(with-test (:name (:check-keyword-args shared-initialize :odd-keyword :error))
+  (assert-error (shared-initialize (make-instance 'shared-initialize-keyword-check) nil :a)
+                program-error))
+
+(with-test (:name (:check-keyword-args shared-initialize :non-keyword :error))
+  (assert-error (shared-initialize (make-instance 'shared-initialize-keyword-check) nil '(abc) 1)
+                program-error))
+
+;;; verify that we can still detect no primary methods and invalid qualifiers
+
+(defmethod gf-with-keys-and-no-primary-method :around ((x integer) &key b)
+  (declare (ignore b))
+  (1+ x))
+
+(with-test (:name (:check-keyword-args :no-primary-method :no-keywords :error))
+  (assert-error (gf-with-keys-and-no-primary-method 3) sb-pcl::no-primary-method-error))
+(with-test (:name (:check-keyword-args :no-primary-method :ok-keyword :error))
+  (assert-error (gf-with-keys-and-no-primary-method 3 :b 2) sb-pcl::no-primary-method-error))
+(with-test (:name (:check-keyword-args :no-primary-method :bad-keyword :error))
+  (assert-error (gf-with-keys-and-no-primary-method 3 :c 2)
+                (or program-error sb-pcl::no-primary-method-error)))
+
+(defgeneric gf-with-keys-and-invalid-qualifier (x &key)
+  (:method-combination progn))
+(defmethod gf-with-keys-and-invalid-qualifier progn ((x integer) &key b)
+  (declare (ignore b))
+  (print (1+ x)))
+;; I'm guessing this is PROGN but spelled wrong purposely, right?
+(defmethod gf-with-keys-and-invalid-qualifier prong ((x fixnum) &key c) (print c))
+
+(with-test (:name (:check-keyword-args :invalid-qualifier :no-keywords :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier 3)))
+(with-test (:name (:check-keyword-args :invalid-qualifier :ok-keyword :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier 3 :b 3)))
+(with-test (:name (:check-keyword-args :invalid-qualifier :bad-keyword :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier 3 :z 4)))
+(with-test (:name (:check-keyword-args :no-applicable-invalid-qualifier :no-keywords :no-error))
+  (assert (= (gf-with-keys-and-invalid-qualifier (1+ most-positive-fixnum))
+             (+ most-positive-fixnum 2))))
+(with-test (:name (:check-keyword-args :no-applicable-invalid-qualifier :ok-keyword :no-error))
+  (assert (= (gf-with-keys-and-invalid-qualifier (1+ most-positive-fixnum) :b 3)
+             (+ most-positive-fixnum 2))))
+(with-test (:name (:check-keyword-args :no-applicable-invalid-qualifier :bad-keyword :error))
+  (assert-error (gf-with-keys-and-invalid-qualifier (1+ most-positive-fixnum) :c 3)))
+
 ;;; class redefinition shouldn't give any warnings, in the usual case
 (defclass about-to-be-redefined () ((some-slot :accessor some-slot)))
 (handler-bind ((warning #'error))
@@ -2673,6 +2804,23 @@
 (sb-mop:remove-direct-subclass (find-class 'standard-object)
                                (sb-ext:weak-pointer-value *removing-a-class*))
 
-(with-test (:name :removing-a-class)
+(with-test (:name :removing-a-class :fails-on :permgen)
   (sb-ext:gc :full t)
   (assert (not (sb-ext:weak-pointer-value *removing-a-class*))))
+
+(locally (declare (optimize safety))
+  (defclass setf-slot-value-restart ()
+    ((a :type integer
+        :accessor setf-slot-value-restart-a))))
+
+(with-test (:name :setf-slot-value-restart
+                  :skipped-on :sparc) ; hangs
+  (let ((instance (make-instance 'setf-slot-value-restart)))
+    (handler-bind ((type-error
+                     (lambda (c) (use-value 1 c))))
+      (setf (slot-value instance 'a) 'x))
+    (assert (eql (slot-value instance 'a) 1))
+    (handler-bind ((type-error
+                     (lambda (c) (use-value 2 c))))
+      (setf (setf-slot-value-restart-a instance) 'y))
+    (assert (eql (setf-slot-value-restart-a instance) 2))))

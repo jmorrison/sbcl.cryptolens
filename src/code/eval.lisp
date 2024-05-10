@@ -11,7 +11,7 @@
 
 (in-package "SB-IMPL")
 
-(defparameter *eval-calls* 0) ; initialized by genesis
+(defparameter *eval-calls* 0)
 
 ;;;; Turns EXPR into a lambda-form we can pass to COMPILE. Returns
 ;;;; a secondary value of T if we must call the resulting function
@@ -21,7 +21,7 @@
   (let ((lambda (if (typep expr '(cons (eql function) (cons t null)))
                     (cadr expr)
                     expr)))
-    (if (typep lambda '(cons (member lambda named-lambda lambda-with-lexenv)))
+    (if (typep lambda '(cons (member lambda named-lambda)))
         (values lambda nil)
         (values `(lambda ()
                  ;; why PROGN? So that attempts to eval free declarations
@@ -100,7 +100,8 @@
            ;; 2002-10-24
            (let* ((sb-c:*lexenv* lexenv)
                   (sb-c::*ir1-namespace* (sb-c::make-ir1-namespace))
-                  (sb-c::*undefined-warnings* nil))
+                  (sb-c::*undefined-warnings* nil)
+                  sb-c::*argument-mismatch-warnings*)
              ;; FIXME: VALUES declaration
              (sb-c::process-decls decls
                                   vars
@@ -339,9 +340,11 @@
 
 (defun values (&rest values)
   "Return all arguments, in order, as values."
-  (declare (truly-dynamic-extent values))
+  (declare (dynamic-extent values))
   (values-list values))
 
 (defun values-list (list)
   "Return all of the elements of LIST, in order, as values."
+  #+(or arm64 x86-64)
+  (declare (explicit-check))
   (values-list list))

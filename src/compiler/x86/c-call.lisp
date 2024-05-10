@@ -130,8 +130,8 @@
 
 
 (deftransform %alien-funcall ((function type &rest args) * * :node node)
-  (aver (sb-c::constant-lvar-p type))
-  (let* ((type (sb-c::lvar-value type))
+  (aver (sb-c:constant-lvar-p type))
+  (let* ((type (sb-c:lvar-value type))
          (env (sb-c::node-lexenv node))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
@@ -287,7 +287,8 @@
            (inst lea edi (make-ea :dword :base ebp-tn
                                   :disp (frame-byte-offset (tn-offset pc-save))))
            (move eax function)
-           (inst call (make-fixup "call_into_c" :foreign))
+           (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+             (inst call (make-fixup "call_into_c" :foreign)))
            (when (and results
                       (location= (tn-ref-tn results) fr0-tn))
              (force-x87-to-mem (tn-ref-tn results) fp-temp)))
@@ -301,7 +302,8 @@
            ;; this, and it should not hurt others either.
            (inst cld)
 
-           (inst call function)
+           (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+             (inst call function))
            ;; To give the debugger a clue. FIXME: not really internal-error?
            (note-this-location vop :internal-error)
 
@@ -378,17 +380,6 @@
         (inst sub (make-ea-for-symbol-value *alien-stack-pointer*)
               delta)))
     (load-symbol-value result *alien-stack-pointer*)))
-
-;;; not strictly part of the c-call convention, but needed for the
-;;; WITH-PINNED-OBJECTS macro used for "locking down" lisp objects so
-;;; that GC won't move them while foreign functions go to work.
-(define-vop (touch-object)
-  (:translate touch-object)
-  (:args (object))
-  (:ignore object)
-  (:policy :fast-safe)
-  (:arg-types t)
-  (:generator 0))
 
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sp offset)

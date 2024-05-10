@@ -18,7 +18,7 @@
 
 (setf (fdefinition 'zonk) (make-instance 'foo :function (lambda (y) y)))
 (with-test (:name :call-nonstandard-funcallable-instance)
-  #+immobile-code
+  #+nil
   (let* ((fdefn (sb-int:find-fdefn 'zonk))
          (raw-entry-point
           (sb-sys:sap-ref-sap (sb-sys:int-sap (sb-kernel:get-lisp-obj-address fdefn))
@@ -154,7 +154,7 @@ index 400772889..229eea81c 100644
 +++ b/src/runtime/interrupt.c
 @@ -42,6 +42,9 @@
 
- #include "sbcl.h"
+ #include "genesis/sbcl.h"
 
 +#define _GNU_SOURCE /* for REG_RAX etc. from sys/ucontext */
 +#include <sys/ucontext.h>

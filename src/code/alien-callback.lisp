@@ -12,11 +12,16 @@
 
 (in-package "SB-ALIEN")
 
-;;; ALIEN-CALLBACK is supposed to be external in SB-ALIEN-INTERNALS, but the
-;;; export gets lost, and then 'chill' gets a conflict with SB-ALIEN over it.
+;;; ALIEN-CALLBACK is supposed to be external in SB-ALIEN-INTERNALS,
+;;; but the export gets lost (as this is now a warm-loaded file), and
+;;; then 'chill' gets a conflict with SB-ALIEN over it.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (export (intern "ALIEN-CALLBACK" "SB-ALIEN-INTERNALS")
-          "SB-ALIEN-INTERNALS"))
+          "SB-ALIEN-INTERNALS")
+  (export (intern "DEFINE-ALIEN-CALLABLE" "SB-ALIEN")
+          "SB-ALIEN")
+  (export (intern "ALIEN-CALLABLE-FUNCTION" "SB-ALIEN")
+          "SB-ALIEN"))
 
 ;;;; ALIEN CALLBACKS
 ;;;;
@@ -250,7 +255,7 @@ and a secondary return value of true if the callback is still valid."
 (defun invalidate-alien-callback (alien)
   "Invalidates the callback designated by the alien, if any, allowing the
 associated lisp function to be GC'd, and causing further calls to the same
-callback signal an error."
+callback to signal an error."
   (let ((info (alien-callback-info alien)))
     (when (and info (callback-info-function info))
       ;; sap cache
@@ -274,25 +279,53 @@ callback signal an error."
       (parse-callback-specification result-type typed-lambda-list)
     `(alien-callback ,specifier (lambda ,lambda-list ,@forms))))
 
-;;; FIXME: Should subsequent (SETF FDEFINITION) affect the callback or not?
-;;; What about subsequent DEFINE-ALIEN-CALLBACKs? My guess is that changing
-;;; the FDEFINITION should invalidate the callback, and redefining the
-;;; callback should change existing callbacks to point to the new defintion.
-(defmacro define-alien-callback (name result-type typed-lambda-list &body forms)
-  "Defines #'NAME as a function with the given body and lambda-list, and NAME as
-the alien callback for that function with the given alien type."
-  (declare (symbol name))
-  (multiple-value-bind (specifier lambda-list)
-      (parse-callback-specification result-type typed-lambda-list)
+;;;; Alien callables
+
+(define-load-time-global *alien-callables* (make-hash-table :test #'eq)
+    "Map from Lisp symbols to the alien callable functions they name.")
+
+(defmacro define-alien-callable (name result-type typed-lambda-list &body body)
+  "Define an alien callable function in the alien callable namespace with result
+type RESULT-TYPE and with lambda list specifying the alien types of the
+arguments."
+  (multiple-value-bind (lisp-name alien-name)
+      (pick-lisp-and-alien-names name)
+    (declare (ignore alien-name))
     `(progn
-       (defun ,name ,lambda-list ,@forms)
-       (defparameter ,name (alien-callback ,specifier #',name)))))
+       (invalidate-alien-callable ',lisp-name)
+       (setf (gethash ',lisp-name *alien-callables*)
+             (alien-lambda ,result-type ,typed-lambda-list ,@body)))))
+
+(defun alien-callable-function (name)
+  "Return the alien callable function associated with NAME."
+  (gethash name *alien-callables*))
+
+(defun invalidate-alien-callable (name)
+  "Invalidates the callable designated by the alien, if any, allowing the
+associated lisp function to be GC'd, and causing further calls to the same
+callable to signal an error."
+  (multiple-value-bind (lisp-name alien-name)
+      (pick-lisp-and-alien-names name)
+    (declare (ignore alien-name))
+    (let ((alien (alien-callable-function lisp-name)))
+      (when alien
+        (invalidate-alien-callback alien)))
+    (remhash lisp-name *alien-callables*)))
+
+(defun initialize-alien-callable-symbol (name)
+  "Initialize the alien symbol named by NAME with its alien callable
+function value."
+  (multiple-value-bind (lisp-name alien-name)
+      (pick-lisp-and-alien-names name)
+    (setf (%alien-value (foreign-symbol-sap alien-name t)
+                        0
+                        (make-alien-pointer-type))
+          (cast (alien-callable-function lisp-name) (* t)))))
 
 (in-package "SB-THREAD")
 #+sb-thread
 (defun enter-foreign-callback (index return arguments)
   (let ((thread (init-thread-local-storage (make-foreign-thread))))
-    #+pauseless-threadstart
     (dx-let ((startup-info (vector nil ; trampoline is n/a
                                    nil ; cell in *STARTING-THREADS* is n/a
                                    #'sb-alien::enter-alien-callback
@@ -301,7 +334,4 @@ the alien callback for that function with the given alien type."
       (copy-primitive-thread-fields thread)
       (setf (thread-startup-info thread) startup-info)
       (update-all-threads (thread-primitive-thread thread) thread)
-      (run))
-    #-pauseless-threadstart
-    (dx-let ((args (list index return arguments)))
-      (run thread nil #'sb-alien::enter-alien-callback args))))
+      (run))))

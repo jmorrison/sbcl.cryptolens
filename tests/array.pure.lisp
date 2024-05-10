@@ -17,7 +17,8 @@
   (let ((testcases '(;; Bug 126, confusion between high-level default string
                      ;; initial element #\SPACE and low-level default array
                      ;; element #\NULL, is gone.
-                     (#\null (make-array 11 :element-type 'character) simple-string)
+                     (#\null (make-array 11 :element-type 'character :initial-element #\null)
+                             simple-string)
                      (#\space (make-string 11 :initial-element #\space) string)
                      (#\* (make-string 11 :initial-element #\*))
                      (#\null (make-string 11))
@@ -25,10 +26,11 @@
                      (#\x (make-string 11 :initial-element #\x))
                      ;; And the other tweaks made when fixing bug 126 didn't
                      ;; mess things up too badly either.
-                     (0 (make-array 11) simple-vector)
+                     (0 (make-array 11 :initial-element 0) simple-vector)
                      (nil (make-array 11 :initial-element nil))
                      (12 (make-array 11 :initial-element 12))
-                     (0 (make-array 11 :element-type '(unsigned-byte 4)) (simple-array (unsigned-byte 4) (*)))
+                     (0 (make-array 11 :element-type '(unsigned-byte 4) :initial-element 0)
+                        (simple-array (unsigned-byte 4) (*)))
                      (12 (make-array 11
                           :element-type '(unsigned-byte 4)
                           :initial-element 12)))))
@@ -231,9 +233,11 @@
     (() 4 :test (lambda (values expected)
                   (= (length (first values)) (first expected))))))
 
+;;; I have no idea how this is testing adjust-array with an initial-element !
 (with-test (:name (make-array adjust-array :initial-element))
   (let ((x (make-array nil :initial-element 'foo)))
-    (adjust-array x nil)
+    ;; make the result look used
+    (opaque-identity (adjust-array x nil))
     (assert (eql (aref x) 'foo))))
 
 ;;; BUG 315: "no bounds check for access to displaced array"
@@ -301,13 +305,14 @@
               (handler-case
                   (let ((array (make-array 12)))
                     (assert (not (array-has-fill-pointer-p array)))
-                    (adjust-array array 12 :fill-pointer t)
+                    ;; make the result look used
+                    (opaque-identity (adjust-array array 12 :fill-pointer t))
                     array)
                 (type-error ()
                   :good)))))
 
 (with-test (:name (adjust-array :multidimensional))
-  (let ((ary (make-array '(2 2))))
+  (let ((ary (make-array '(2 2) :initial-element 0)))
     ;; SBCL used to give multidimensional arrays a bogus fill-pointer
     (assert (not (array-has-fill-pointer-p (adjust-array ary '(2 2)))))))
 
@@ -411,10 +416,16 @@
     (test 'inline)
     (test 'notinline)))
 
-(with-test (:name (make-array :size-overflow))
+(with-test (:name (make-array :size-overflow)
+                  ;; size limit is small enough that this fails by not failing
+                  ;; in the expected way
+                  :skipped-on :ubsan)
   ;; 1-bit fixnum tags make array limits overflow the word length
   ;; when converted to bytes
-  (when (= sb-vm:n-fixnum-tag-bits 1)
+  (when (and (= sb-vm:n-fixnum-tag-bits 1)
+             (<= (- most-positive-fixnum
+                    array-total-size-limit)
+                 2))
     (multiple-value-bind (fun failure-p warnings)
         (checked-compile
          '(lambda ()
@@ -441,6 +452,15 @@
          ;; Strings are null-terminated for C interoperability
          (char #.(coerce "abcd" 'simple-base-string) x))
     ((4) #\Nul)))
+(defun check-bound-multiple-reads (x i)
+  (let* ((x (truly-the simple-vector x))
+         (l (sb-c::vector-length x)))
+    (sb-kernel:%check-bound x l i)
+    l))
+(compile 'check-bound-multiple-reads)
+(with-test (:name :check-bound-vop-optimize)
+  ;; could have crashed with the bad optimizer
+  (check-bound-multiple-reads #(a b c) 2))
 
 (with-test (:name (adjust-array :transform))
   (checked-compile-and-assert ()
@@ -449,7 +469,7 @@
     (() #(4 5 6) :test #'equalp)))
 
 (with-test (:name (adjust-array :fill-pointer))
-  (let ((array (make-array 10 :fill-pointer t)))
+  (let ((array (make-array 10 :fill-pointer t :initial-element 0)))
     (assert (= (fill-pointer (adjust-array array 5 :fill-pointer 2))
                2))))
 
@@ -506,9 +526,7 @@
 
 (with-test (:name (make-array :transform :fill-pointer nil))
   (flet ((test (form)
-           (let ((fun (checked-compile `(lambda () ,form))))
-             (assert (not (ctu:find-named-callees
-                           fun :name 'sb-kernel:%make-array))))))
+           (assert (not (ctu:ir1-named-calls `(lambda () ,form))))))
     (test '(make-array 3      :fill-pointer nil))
     (test '(make-array 3      :fill-pointer nil))
     (test '(make-array 3      :fill-pointer t))
@@ -517,9 +535,9 @@
     (test '(make-array '(3 3) :fill-pointer nil))))
 
 (with-test (:name (make-array :transform :adjustable :fill-pointer))
-  (let ((fun (checked-compile '(lambda (fp)
-                                (make-array 3 :adjustable t :fill-pointer fp)))))
-    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+  (multiple-value-bind (calls fun)
+      (ctu:ir1-named-calls '(lambda (fp) (make-array 3 :adjustable t :fill-pointer fp)))
+    (assert (not (member 'sb-kernel:%make-array calls)))
     (assert (= (length (funcall fun t)) 3))
     (assert (array-has-fill-pointer-p (funcall fun t)))
     (assert (= (length (funcall fun 2)) 2))
@@ -531,18 +549,20 @@
 
 (with-test (:name (make-array :transform :non-constant-fill-pointer))
   ;; Known adjustable with any fill-pointer can be inlined
-  (let ((fun (checked-compile '(lambda (n fillp)
+  (multiple-value-bind (calls fun)
+      (ctu:ir1-named-calls '(lambda (n fillp)
                                  (make-array (the (mod 20) n)
-                                             :adjustable t :fill-pointer fillp)))))
-    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+                                             :adjustable t :fill-pointer fillp)))
+    (assert (not (member 'sb-kernel:%make-array calls)))
     (let ((a (funcall fun 10 3)))
       (assert (= (length a) 3))
       (assert (= (array-dimension a 0) 10))))
   ;; Non-adjustable w/ non-constant numeric fill-pointer can be inlined
-  (let ((fun (checked-compile '(lambda (n)
+  (multiple-value-bind (calls fun)
+      (ctu:ir1-named-calls '(lambda (n)
                                  (make-array (the (mod 20) n)
-                                             :fill-pointer (floor n 2))))))
-    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+                                             :fill-pointer (floor n 2))))
+    (assert (not (member 'sb-kernel:%make-array calls)))
     (let ((a (funcall fun 10)))
       (assert (= (length a) 5))
       (assert (= (array-dimension a 0) 10)))))
@@ -581,7 +601,7 @@
   (checked-compile-and-assert
       ()
       '(lambda (type)
-        (make-array 1 :element-type type))
+        (make-array 1 :element-type type :initial-element 0))
     (('(or (eql -16) unsigned-byte)) #(0) :test #'equalp)))
 
 (with-test (:name :check-bound-signed-bound-notes
@@ -642,3 +662,154 @@
         (declare (vector a))
         (map-into a #'identity a)))
    ((0) #() :test #'equalp)))
+
+(with-test (:name :displaced-index-offset-disallow-nil)
+  (assert-error (eval '(make-array 4 :displaced-index-offset nil))))
+
+(with-test (:name :adjust-array-copies-above-fill-pointer)
+  (let ((a (make-array 4 :fill-pointer 2 :initial-contents '(a b c d))))
+    (let ((b (adjust-array a 6 :initial-element 'e)))
+      (assert (eq (aref b 2) 'c))
+      (assert (eq (aref b 3) 'd))
+      (assert (eq (aref b 4) 'e))
+      (assert (eq (aref b 5) 'e)))))
+
+(with-test (:name :test-array-dimensions-other-pointer-check)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(simple-array t (2 1))))
+    ((1) nil)
+    ((#2A((1) (1))) t)))
+
+(with-test (:name :typep-constant-%array-data-folding)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (typep "abcd" '(simple-array t 2)))
+    (() nil)))
+
+(with-test (:name :vector-push-extend-specialized)
+  (let ((extend (checked-compile `(lambda (e a)
+                                    (vector-push-extend e a)
+                                    a))))
+    (loop for saetp across sb-vm:*specialized-array-element-type-properties*
+          for type = (sb-vm:saetp-specifier saetp)
+          when type
+          do
+          (let* ((value (sb-vm:saetp-initial-element-default saetp))
+                 (value (if (characterp value)
+                            (code-char (1+ (char-code value)))
+                            (1+ value))))
+            (assert (eql (aref (funcall extend value (make-array 1 :element-type type
+                                                                   :adjustable t
+                                                                   :fill-pointer t))
+                               1)
+                         value))))))
+
+(with-test (:name :intersection-type-complexp)
+  (assert (equal (caddr (sb-kernel:%simple-fun-type
+                         (checked-compile `(lambda (x)
+                                             (declare ((and (simple-array * (10))
+                                                            (not simple-vector))
+                                                       x))
+                                             (length x)))))
+                 `(values (integer 10 10) &optional))))
+
+(with-test (:name :vector-length-intersection-types)
+  (assert (equal (caddr (sb-kernel:%simple-fun-type
+                         (checked-compile `(lambda (x)
+                                             (declare ((and (or (simple-array * (11))
+                                                                (simple-array * (12)))
+                                                            (not simple-vector))
+                                                       x))
+                                             (length x)))))
+                 `(values (integer 11 12) &optional))))
+
+(with-test (:name :aref-dimension-checking)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x)
+         (aref x 0))
+    ((#2A((1 2) (3 4))) (condition 'type-error))))
+
+(with-test (:name :aref-constant-type-derive)
+  (flet ((test (form type)
+           (assert
+            (type-specifiers-equal
+             (caddr
+              (sb-kernel:%simple-fun-type
+               (checked-compile
+                `(lambda (a)
+                   ,form))))
+             `(values ,type &optional)))))
+    (test `(aref #(1 2 3) a)
+          '(integer 1 3))
+    (test `(svref #(1 2 3.0) a)
+          '(or (integer 1 2) single-float))
+    (test `(aref ,(make-array 3 :fill-pointer 2 :initial-contents #(1 2 3.0)) a)
+          '(or (integer 1 2) single-float))))
+
+(with-test (:name :make-array-initial-contents-zero-dimensions)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (d)
+         (make-array d :initial-contents 1))
+    ((nil) #0a1 :test #'equalp)))
+
+(with-test (:name :negative-fill-pointer)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (a f)
+      (setf (fill-pointer a) f))
+   (((make-array 0 :fill-pointer 0) -1) (condition 'type-error))))
+
+(with-test (:name :large-index
+            :skipped-on (not :64-bit))
+  (checked-compile
+   `(lambda ()
+      (make-array
+       (1+ (ash 1 32))
+       :element-type 'base-char
+       :initial-element #\a)))
+  (checked-compile
+   `(lambda (x a)
+      (setf (sbit x (ash 1 34)) a)))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910)))
+        (declare (dynamic-extent s))
+        (funcall fn s))))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910 :element-type 'base-char)))
+        (declare (dynamic-extent s))
+        (funcall fn s)))))
+
+(with-test (:name :hairy-aref-check-bounds)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare ((vector t) x))
+                        (aref x 0))
+                     nil))
+             0)))
+
+(with-test (:name :setf-aref-simple-vector-from-new-value)
+  (assert (not
+           (ctu:ir1-named-calls
+            `(lambda (x)
+               (declare ((simple-array * (*)) x))
+               (setf (aref x 0) 'm))))))
+
+(with-test (:name :typep-displaced)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(vector double-float)))
+    (((make-array 1 :element-type 'double-float :displaced-to (make-array '(1 1) :element-type 'double-float))) t))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(vector t 2)))
+    (((make-array 2 :displaced-to (make-array '(2 1)))) t)))

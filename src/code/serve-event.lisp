@@ -192,7 +192,6 @@
 
 ;;;; SERVE-ALL-EVENTS, SERVE-EVENT, and friends
 
-#-sb-devel
 (declaim (start-block wait-until-fd-usable serve-event serve-all-events compute-pollfds))
 
 ;;; When a *periodic-polling-function* is defined the server will not
@@ -260,7 +259,7 @@ waiting."
                                      (+ (* 1000 to-sec) (truncate to-usec 1000))
                                      -1)
                    when (or #+win32 (eq direction :output)
-                            #+win32 (sb-win32:handle-listen fd)
+                            #+win32 (sb-win32:handle-listen fd (or to-sec 0) (or to-usec 0))
                             #-win32
                             (sb-unix:unix-simple-poll fd direction to-msec))
                    do (return-from wait-until-fd-usable t)
@@ -322,7 +321,7 @@ happens. Server returns T if something happened and NIL otherwise. Timeout
     (let ((count 0))
       (declare (type index count))
 
-      ;; Initialize the fd-sets for UNIX-SELECT and return the active
+      ;; Initialize the fd-sets for UNIX-FAST-SELECT and return the active
       ;; descriptor count.
       (map-descriptor-handlers
        (lambda (handler)

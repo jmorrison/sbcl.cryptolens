@@ -10,30 +10,111 @@
 ;;;; files for more information.
 
 (in-package "SB-VM")
+
+;;;; Storage allocation:
+
+;;; This is the main mechanism for allocating memory in the lisp heap.
+;;;
+;;; The allocated space is stored in RESULT-TN with the lowtag LOWTAG
+;;; applied.  The amount of space to be allocated is SIZE bytes (which
+;;; must be a multiple of the lisp object size).
+;;;
+;;; On other platforms (Non-PPC), if STACK-P is given, then allocation
+;;; occurs on the control stack (for dynamic-extent).  In this case,
+;;; you MUST also specify NODE, so that the appropriate compiler
+;;; policy can be used, and TEMP-TN, which is needed for work-space.
+;;; TEMP-TN MUST be a non-descriptor reg. FIXME: This is not yet
+;;; implemented on PPC. We should implement this and replace the
+;;; inline stack-based allocation that presently occurs in the
+;;; VOPs. The stack-p argument is ignored on PPC.
+;;;
+;;; Using trap instructions for not-very-exceptional situations, such as
+;;; allocating, is clever but not very convenient when using gdb to debug.
+;;; Set the :sigill-traps feature to use SIGILL instead of SIGTRAP.
+;;;
+(defun allocation (type size lowtag result-tn &key stack-p node temp-tn flag-tn)
+  (declare (ignore stack-p node))
+  (binding* ((imm-size (typep size '(unsigned-byte 15)))
+             ((region-base-tn field-offset)
+              (values thread-base-tn
+                      (if (or #+use-cons-region (eq type 'list))
+                          (ash thread-cons-tlab-slot word-shift)
+                          (ash thread-mixed-tlab-slot word-shift)))))
+
+    (unless imm-size ; Make temp-tn be the size
+      (if (numberp size)
+          (inst lr temp-tn size)
+          (move temp-tn size)))
+
+    (inst ld result-tn region-base-tn field-offset)
+    (inst ld flag-tn region-base-tn (+ field-offset n-word-bytes)) ; region->end_addr
+
+    ;; CAUTION: The C code depends on the exact order of
+    ;; instructions here.  In particular, immediately before the
+    ;; TW instruction must be an ADD or ADDI instruction, so it
+    ;; can figure out the size of the desired allocation and
+    ;; storing the new base pointer back to the allocation region
+    ;; must take one instruction.
+    (without-scheduling ()
+      ;; Now make result-tn point at the end of the object, to
+      ;; figure out if we overflowed the current region.
+      (if imm-size
+          (inst addi result-tn result-tn size)
+          (inst add result-tn result-tn temp-tn))
+
+     ;; result-tn points to the new end of the region.  Did we go past
+     ;; the actual end of the region?  If so, we need a full alloc.
+     ;; The C code depends on this exact form of instruction.  If
+     ;; either changes, you have to change the other appropriately!
+      (let ((ok (gen-label)))
+        (declare (ignorable ok))
+        #+sigill-traps
+        (progn (inst cmpld result-tn flag-tn)
+               (inst ble ok)
+               (inst mfmq temp-reg-tn) ; an illegal instructions
+               ;; KLUDGE: emit another ADD so that the sigtrap handler
+               ;; can behave just as if the trap happened at the TD.
+               (if imm-size
+                   (inst addi result-tn result-tn size)
+                   (inst add result-tn result-tn temp-tn)))
+        (if (eq type 'list)
+            (inst td :llt flag-tn result-tn)  ; trap if region.end < new_freeptr
+            (inst td :lgt result-tn flag-tn)) ; trap if new_freeptr > region.end
+        #+sigill-traps (emit-label ok))
+      ;; The C code depends on exactly 1 instruction here.
+      (inst std result-tn region-base-tn field-offset))
+
+    ;; Execution resumes here if the trap fires.
+    ;; At this point, result-tn points at the end of the object.
+    ;; Adjust to point to the beginning.
+    (cond (imm-size
+           (inst addi result-tn result-tn (+ (- size) lowtag)))
+          (t
+           (inst sub result-tn result-tn temp-tn)
+           ;; Set the lowtag appropriately
+           (inst ori result-tn result-tn lowtag)))))
+
+(defun align-csp (temp)
+  ;; is used for stack allocation of dynamic-extent objects
+  (storew null-tn csp-tn 0 0) ; store a known-good value (don't want wild pointers below CSP)
+  (inst addi temp csp-tn lowtag-mask)
+  (inst clrrdi csp-tn temp n-lowtag-bits))
 
 ;;;; LIST and LIST*
-(define-vop (list-or-list*)
-  (:args (things :more t))
+(define-vop (list)
+  (:args (things :more t :scs (any-reg descriptor-reg null control-stack)))
   (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:temporary (:scs (non-descriptor-reg)) alloc-temp)
-  (:info num)
+  (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
-  (:variant-vars star)
-  (:policy :safe)
   (:node-var node)
   #-gencgc (:ignore alloc-temp)
   (:generator 0
-    (cond ((zerop num)
-           (move result null-tn))
-          ((and star (= num 1))
-           (move result (tn-ref-tn things)))
-          (t
-           (macrolet
-               ((maybe-load (tn)
+    (macrolet ((maybe-load (tn)
                   (once-only ((tn tn))
                     `(sc-case ,tn
                        ((any-reg descriptor-reg null)
@@ -41,15 +122,13 @@
                        (control-stack
                         (load-stack-tn temp ,tn)
                         temp)))))
-             (let* ((dx-p (node-stack-allocate-p node))
-                    (cons-cells (if star (1- num) num))
-                    (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag :sync nil)
+      (let ((dx-p (node-stack-allocate-p node))
+            (alloc (* (pad-data-block cons-size) cons-cells)))
+        (pseudo-atomic (pa-flag :sync nil :elide-if dx-p)
                  (if dx-p
                      (progn
                        (align-csp res)
-                       (inst clrrdi res csp-tn n-lowtag-bits)
-                       (inst ori res res list-pointer-lowtag)
+                       (inst ori res csp-tn list-pointer-lowtag)
                        (inst addi csp-tn csp-tn alloc))
                      (allocation 'list alloc list-pointer-lowtag res
                                  :temp-tn alloc-temp
@@ -69,14 +148,7 @@
                              (maybe-load (tn-ref-tn (tn-ref-across things)))
                              null-tn)
                          ptr cons-cdr-slot list-pointer-lowtag))
-               (move result res)))))))
-
-(define-vop (list list-or-list*)
-  (:variant nil))
-
-(define-vop (list* list-or-list*)
-  (:variant t))
-
+        (move result res)))))
 
 ;;;; Special purpose inline allocators.
 
@@ -89,7 +161,7 @@
   (:translate make-fdefn)
   (:generator 37
     (with-fixed-allocation (result pa-flag temp fdefn-widetag fdefn-size)
-      (inst addi temp null-tn (make-fixup 'undefined-tramp :asm-routine-nil-offset))
+      (inst addi temp null-tn (make-fixup 'undefined-tramp :assembly-routine*))
       (storew name result fdefn-name-slot other-pointer-lowtag)
       (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
       (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))))
@@ -104,13 +176,12 @@
   (:generator 10
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
-      (pseudo-atomic (pa-flag)
+      (pseudo-atomic (pa-flag :elide-if stack-allocate-p)
         (if stack-allocate-p
             (progn
               (align-csp result)
-              (inst clrrdi result csp-tn n-lowtag-bits)
+              (inst ori result csp-tn fun-pointer-lowtag)
               (inst addi csp-tn csp-tn alloc-size)
-              (inst ori result result fun-pointer-lowtag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag)))
             (progn
               (allocation nil (pad-data-block size) fun-pointer-lowtag result
@@ -141,12 +212,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst li result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst addi result null-tn (make-fixup 'funcallable-instance-tramp :asm-routine-nil-offset))))
 
 (define-vop (fixed-alloc)
   (:args)

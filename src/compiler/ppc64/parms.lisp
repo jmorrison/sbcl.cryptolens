@@ -19,25 +19,19 @@
 (defconstant sb-assem:+inst-alignment-bytes+ 4)
 
 (defconstant +backend-fasl-file-implementation+ :ppc)
-  ;; On Linux, the ABI specifies the page size to be 4k-64k, use the
-  ;; maximum of that range. FIXME: it'd be great if somebody would
-  ;; find out whether using exact multiples of the page size actually
-  ;; matters in the few places where that's done, or whether we could
-  ;; just use 4k everywhere.
-(defconstant +backend-page-bytes+ #+linux 65536 #-linux 4096)
+;; Granularity at which memory is mapped
+(defconstant +backend-page-bytes+ 65536)
 
-;;; The size in bytes of GENCGC cards, i.e. the granularity at which
-;;; writes to old generations are logged.  With mprotect-based write
-;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The size in bytes of GENCGC pages, i.e. the granularity at which
+;;; threads claim memory from the global heap.
+(defconstant gencgc-page-bytes +backend-page-bytes+)
+;;; Granularity at which writes to old generations are logged.
+(defconstant cards-per-page 32)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 64)
@@ -45,33 +39,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 64)
-
-;;; flags for the generational garbage collector
-(defconstant pseudo-atomic-interrupted-flag 1)
-(defconstant pseudo-atomic-flag 4)
-
-(defconstant float-sign-shift 31)
-
-(defconstant single-float-bias 126)
-(defconstant-eqx single-float-exponent-byte (byte 8 23) #'equalp)
-(defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-(defconstant single-float-normal-exponent-min 1)
-(defconstant single-float-normal-exponent-max 254)
-(defconstant single-float-hidden-bit (ash 1 23))
-
-(defconstant double-float-bias 1022)
-(defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
-(defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
-(defconstant double-float-normal-exponent-min 1)
-(defconstant double-float-normal-exponent-max #x7FE)
-(defconstant double-float-hidden-bit (ash 1 20))
-
-(defconstant single-float-digits
-  (+ (byte-size single-float-significand-byte) 1))
-
-(defconstant double-float-digits
-  (+ (byte-size double-float-significand-byte) 32 1))
-
 
 (defconstant float-inexact-trap-bit (ash 1 0))
 (defconstant float-divide-by-zero-trap-bit (ash 1 1))
@@ -108,59 +75,13 @@
 
 ;;;; Where to put the different spaces.
 
-;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#-gencgc
-(progn
-  (defconstant read-only-space-start #x04000000)
-  (defconstant read-only-space-end   #x07ff8000)
-  (defconstant static-space-start    #x08000000)
-  (defconstant static-space-end      #x097fff00)
-
-  (defconstant linkage-table-space-start #x0a000000)
-  (defconstant linkage-table-space-end   #x0b000000))
-
-;;; While on gencgc we don't.
-#+gencgc (!gencgc-space-setup #x04000000
+(gc-space-setup #x04000000
                               :read-only-space-size 0
                               :dynamic-space-start #x1000000000)
 
-(defconstant linkage-table-growth-direction :up)
-(defconstant linkage-table-entry-size #+little-endian 28 #+big-endian 24)
+(defconstant alien-linkage-table-growth-direction :up)
+(defconstant alien-linkage-table-entry-size #+little-endian 28 #+big-endian 24)
 
-#+linux
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x4f000000)
-    (defparameter dynamic-0-space-end   #x66fff000)))
-
-#+netbsd
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x4f000000)
-    (defparameter dynamic-0-space-end   #x66fff000)))
-
-;;; Text and data segments start at #x01800000.  Range for randomized
-;;; malloc() starts #x20000000 (MAXDSIZ) after end of data seg and
-;;; extends 256 MB.  Use 512 - 64 MB for dynamic space so we can run
-;;; under default resource limits.
-;;; FIXME: MAXDSIZ is a kernel parameter, and can vary as high as 1GB.
-;;; These parameters should probably be tested under such a configuration,
-;;; as rare as it might or might not be.
-#+openbsd
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x4f000000)
-    (defparameter dynamic-0-space-end   #x5cfff000)))
-
-#+darwin
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x10000000)
-    (defparameter dynamic-0-space-end   #x3ffff000)))
 
 (defenum (:start 8)
   halt-trap
@@ -189,23 +110,5 @@
   #'equalp)
 
 (defconstant-eqx +static-fdefns+
-  #(length
-    two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    two-arg-<=
-    two-arg->=
-    two-arg-/=
-    eql
-    %negate
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    two-arg-eqv
-    two-arg-gcd
-    two-arg-lcm)
+    `#(two-arg-<= two-arg->= two-arg-/= ,@common-static-fdefns)
   #'equalp)

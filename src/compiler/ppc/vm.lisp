@@ -11,7 +11,7 @@
 
 (in-package "SB-VM")
 
-(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l) #'equalp)
+(defconstant-eqx +fixup-kinds+ #(:absolute :layout-id :b :ba :ha :l) #'equalp)
 
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
@@ -63,7 +63,7 @@
   (defreg bsp 14)
   (defreg cfp 15)
   (defreg csp 16)
-  (defreg alloc 17)
+  (defreg thread 17)
   (defreg null 18)
   (defreg code 19)
   (defreg cname 20)
@@ -76,19 +76,19 @@
   (defreg a3 27)
   (defreg l0 28)
   (defreg l1 29)
-  (defreg #-sb-thread l2 #+sb-thread thread 30)
+  (defreg l2 30)
   (defreg lip 31)
 
   (defregset non-descriptor-regs
       nl0 nl1 nl2 nl3 nl4 nl5 nl6 cfunc nargs nfp)
 
   (defregset descriptor-regs
-      fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 #-sb-thread l2 )
+      fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 l2)
 
   (defregset boxed-regs
       fdefn code cname lexenv ocfp lra
       a0 a1 a2 a3
-      l0 l1 #-sb-thread l2 #+sb-thread thread)
+      l0 l1 l2)
 
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
@@ -246,7 +246,6 @@
   (defregtn lip interior-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
-  (defregtn alloc any-reg)
   (defregtn lra descriptor-reg)
   (defregtn lexenv descriptor-reg)
 
@@ -271,7 +270,10 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc zero-sc-number)
@@ -309,7 +311,6 @@
                               :offset n))
           *register-arg-offsets*))
 
-#+sb-thread
 (defparameter thread-base-tn
   (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
                   :offset thread-offset))
@@ -333,49 +334,6 @@
       (non-descriptor-stack (format nil "NS~D" offset))
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed"))))
-
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node))
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((or (valid-funtype '(fixnum fixnum) '*)
-              (valid-funtype '((signed-byte 32) (signed-byte 32)) '*)
-              (valid-funtype '((unsigned-byte 32) (unsigned-byte 32)) '*))
-          (values :maybe nil))
-         (t (values :default nil))))
-      (logbitp
-       (cond
-         ((or (valid-funtype '((constant-arg (integer 0 29)) fixnum) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (signed-byte 32)) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (unsigned-byte 32)) '*))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         (t (values :default nil))))
-      ;; FIXME: can handle MIN and MAX here
-      (%ldb
-       (flet ((validp (type width)
-                (and (valid-funtype `((constant-arg (integer 1 29))
-                                      (constant-arg (mod ,width))
-                                      ,type)
-                                    'fixnum)
-                     (destructuring-bind (size posn integer)
-                         (sb-c::basic-combination-args node)
-                       (declare (ignore integer))
-                       (<= (+ (sb-c::lvar-value size)
-                              (sb-c::lvar-value posn))
-                           width)))))
-         (if (or (validp 'fixnum 29)
-                 (validp '(signed-byte 32) 32)
-                 (validp '(unsigned-byte 32) 32))
-             (values :transform '(lambda (size posn integer)
-                                  (%%ldb integer size posn)))
-             (values :default nil))))
-      (t (values :default nil)))))
 
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))

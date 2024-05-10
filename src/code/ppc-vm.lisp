@@ -6,6 +6,10 @@
   "Returns a string describing the type of the local machine."
   #-64-bit "PowerPC"
   #+64-bit "PowerPC64")
+
+(defun return-machine-address (scp)
+  (sap-int (context-lr scp)))
+
 
 
 ;;;; "Sigcontext" access functions, cut & pasted from x86-vm.lisp then
@@ -27,21 +31,22 @@
   (* long)
   (context (* os-context-t))
   (index int))
-#+nil
 (defun context-float-register (context index format)
   (declare (type (alien (* os-context-t)) context))
+  (error "context-float-register not working yet? ~S" (list context index format))
+  #+nil
   (coerce (deref (context-float-register-addr context index)) format))
-#+nil
 (defun %set-context-float-register (context index format new)
   (declare (type (alien (* os-context-t)) context))
+  (error "%set-context-float-register not working yet? ~S" (list context index format new))
+  #+nil
   (setf (deref (context-float-register-addr context index))
         (coerce new format)))
 
 ;;; Given a signal context, return the floating point modes word in
 ;;; the same format as returned by FLOATING-POINT-MODES.
 ;;;
-;;; FIXME: surely this must be accessible somewhere under Darwin?  Or
-;;; under NetBSD?
+;;; FIXME: surely this must be accessible under some other operating systems?
 #+linux
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
     (unsigned 32)

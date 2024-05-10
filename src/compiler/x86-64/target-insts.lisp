@@ -15,6 +15,31 @@
 
 (in-package "SB-X86-64-ASM")
 
+(defun sb-disassem::pre-decode (chunk dstate)
+  (let ((byte (ldb (byte 8 0) chunk)))
+    (case byte
+      ((#x64  ; FS:
+        #x65  ; GS:
+        #x66  ; operand size modifier
+        #x67  ; address size modifier
+        #xf0  ; LOCK
+        #xf2  ; REPNE or SSE inst
+        #xf3) ; REP or SSE inst
+       ;; If the next byte is a REX prefix, then strip it out, recording the 'wrxb'
+       ;; bits in the dstate, and return the chunk as if the REX byte were absent.
+       (let ((next (ldb (byte 8 8) chunk)))
+         (when (= (logand next #xf0) #x40)
+           (dstate-setprop dstate (logior +rex+ (logand next #b1111)))
+           (let ((new (logior byte (ash (ldb (byte 48 16) chunk) 8))))
+             (return-from sb-disassem::pre-decode (values new 1))))))))
+  (values chunk 0))
+
+(defmethod print-object ((reg reg) stream)
+  (if (or *print-escape* *print-readably*)
+      ;; cross-compiled DEFMETHOD can't use call-next-method
+      (default-structure-print reg stream *current-level-in-print*)
+      (write-string (reg-name reg) stream)))
+
 ;;; Return the operand size depending on the prefixes and width bit as
 ;;; stored in DSTATE.
 (defun inst-operand-size (dstate)
@@ -58,6 +83,9 @@
 (defun reg-imm-data (dchunk dstate) dchunk
   (aref (sb-disassem::dstate-filtered-values dstate) 4))
 
+;;; This structure is logically immutable, except for one problem:
+;;; the disassembler recycles instances of it (re-uses the same
+;;; one for each successive instruction). See DECODE-MOD-R/M.
 (defstruct (machine-ea (:copier nil)
                        (:constructor %make-machine-ea))
   ;; possible TODO: base,index,scale could be packed thusly in 13 bits:
@@ -149,7 +177,25 @@
    value (inst-operand-size-default-qword dstate) t stream dstate))
 
 (defun print-jmp-ea (value stream dstate)
-  (print-sized-reg/mem-default-qword value stream dstate))
+  (cond ((typep value 'machine-ea)
+         (print-mem-ref :ref value :qword stream dstate)
+         #+immobile-space
+         (when (and (null (machine-ea-base value))
+                    (null (machine-ea-index value)))
+           (let* ((v (- (sb-vm::static-call-entrypoint-vector) other-pointer-lowtag))
+                  (data (+ v (ash sb-vm:vector-data-offset sb-vm:word-shift)))
+                  (end (+ data (ash (length +static-fdefns+) sb-vm:word-shift))))
+             (when (<= data (machine-ea-disp value) (1- end))
+               (let ((i (ash (- (machine-ea-disp value) data) (- sb-vm:word-shift))))
+                 (note (lambda (stream) (prin1 (aref +static-fdefns+ i) stream)) dstate)
+                 (return-from print-jmp-ea)))
+             (let* ((v sb-fasl::*asm-routine-vector*)
+                    (a (logandc2 (get-lisp-obj-address v) sb-vm:lowtag-mask)))
+               (when (<= a (machine-ea-disp value) (1- (+ a (primitive-object-size v))))
+                 (let ((target (sap-ref-word (int-sap (machine-ea-disp value)) 0)))
+                   (maybe-note-assembler-routine target t dstate)))))))
+        ((null stream) (operand value dstate))
+        (t (write value :stream stream :escape nil))))
 
 (defun print-sized-byte-reg/mem (value stream dstate)
   (print-reg/mem-with-width value :byte t stream dstate))
@@ -165,7 +211,7 @@
   (princ16 value stream))
 
 (defun print-xmmreg (value stream dstate)
-  (let* ((reg (get-fpr
+  (let* ((reg (get-fpr :xmm
                            ;; FIXME: why are we seeing a value from the GPR
                            ;; prefilter instead of XMM prefilter here sometimes?
                            (etypecase value
@@ -181,24 +227,73 @@
       (print-mem-ref :ref value nil stream dstate)
       (print-xmmreg value stream dstate)))
 
-;;; Find the Lisp object, if any, called by a "CALL rel32offs"
-;;; instruction format and add it as an end-of-line comment.
-;;; Alternatively, the value might be an immediate operand to MOV,
-;;; which in general decodes as a signed integer. So ignore it
-;;; unless it looks like an address.
-#+immobile-space
-(defun maybe-note-lisp-callee (value dstate)
+;;; Guess whether VALUE is an immobile-space symbol or code blob by looking
+;;; at all code header constants. If it matches any constant, assume that it
+;;; is a use of the constant.  This has false positives of course,
+;;; as does MAYBE-NOTE-STATIC-SYMBOL and friends. Any random immediate value
+;;; used in an unboxed context, such as an ADD instruction,
+;;; can be wrongly construed as an address.
+;;; Note that for symbols we can match either the tagged pointer to it
+;;; OR the untagged address of the SYMBOL-VALUE slot.
+;;;
+;;; "static" in this usage implies "at a fixed address" - it could be
+;;; in static space or immobile space.
+;;;
+;;; TODO: probably should take an &OPTIONAL for ALLOW-INTERIOR-PTR to
+;;; reject false positives from instructions that don't access an object
+;;; except through a tagged pointer.
+(defun maybe-note-static-lispobj (value dstate &optional quote)
+  (when (maybe-note-static-symbol value dstate)
+    ;; Returning T prints VALUE using base 16
+    ;; (see the SIGNED-IMM-DATA printer, PRINT-IMM/ASM-ROUTINE)
+    ;; This should probably pass through the QUOTE option but it's not critical.
+    (return-from maybe-note-static-lispobj t))
+  (let ((code (seg-code (dstate-segment dstate)))
+        (adjusted-val (logior (- value (ash sb-vm:symbol-value-slot sb-vm:word-shift))
+                              sb-vm:other-pointer-lowtag))
+        (found-const)
+        (slot))
+    (when code
+      (loop for i downfrom (1- (code-header-words code)) to sb-vm:code-constants-offset
+            for const = (code-header-ref code i)
+            do (when (symbolp const)
+                 (let ((addr (get-lisp-obj-address const)))
+                   (cond ((eql addr value)
+                          (return (setq found-const const)))
+                         ((eql addr adjusted-val)
+                          (return (setq found-const const
+                                        slot sb-vm:symbol-value-slot)))))))
+      (unless found-const ; try static symbol's value slots
+        (dovector (symbol sb-vm:+static-symbols+)
+          (when (= (get-lisp-obj-address symbol) adjusted-val)
+            (return (setq found-const symbol
+                          slot sb-vm:symbol-value-slot)))))
+      (when found-const
+        (note (cond (slot
+                     (lambda (s) (format s "(SYMBOL-VALUE '~S)" found-const)))
+                    ((and (symbolp found-const) quote)
+                     (lambda (s) (write-char #\' s) (prin1 found-const s)))
+                    (t
+                     (lambda (s) (prin1 found-const s))))
+              dstate)
+        ;; Returning T prints in base 16 (see PRINT-IMM/ASM-ROUTINE)
+        (return-from maybe-note-static-lispobj t))))
+    #| This mysterious code seems to have no regression tests.
+       Comenting it out until I can figure out why it was in target-disassem
+    ;; Kludge: layout of STREAM, FILE-STREAM, and STRING-STREAM can be used
+    ;; as immediate operands without a corresponding boxed header constant.
+    ;; I think we always elide the boxed constant for builtin layouts,
+    ;; but these three have some slightly unusual codegen that causes a PUSH
+    ;; instruction to need some help to show its operand as a lisp object.
+    (dolist (thing (load-time-value (list (find-layout 'stream)
+                                          (find-layout 'file-stream)
+                                          (find-layout 'string-stream))
+                                    t))
+      (when (eql (get-lisp-obj-address thing) address)
+        (return-from found thing))))) |#
   (awhen (and (typep value 'word)
               (sb-disassem::find-code-constant-from-interior-pointer value dstate))
     (note (lambda (stream) (princ it stream)) dstate)))
-
-(defun print-imm/asm-routine (value stream dstate)
-  (cond ((not stream) (operand value dstate))
-        ((or #+immobile-space (maybe-note-lisp-callee value dstate)
-             (maybe-note-assembler-routine value nil dstate)
-             (maybe-note-static-symbol value dstate))
-         (princ16 value stream))
-        (t (princ value stream))))
 
 ;;; Return an instance of REG or MACHINE-EA.
 ;;; MOD and R/M are the extracted bits from the instruction's ModRM byte.
@@ -227,7 +322,7 @@
       (cond ((= mod #b11) ; register direct mode
              (case regclass
               (gpr (get-gpr :qword full-reg)) ; size is not really known here
-              (fpr (get-fpr full-reg))))
+              (fpr (get-fpr :xmm full-reg))))
             ((= r/m #b100) ; SIB byte - rex.b is "don't care"
              (let* ((sib (the (unsigned-byte 8) (read-suffix 8 dstate)))
                     (index-reg (extend +rex-x+ (ldb (byte 3 3) sib)))
@@ -258,9 +353,9 @@
     (sap-ref-word (int-sap addr) 0)))
 
 (define-load-time-global thread-slot-names
-    (let* ((slots (primitive-object-slots
-                   (find 'sb-vm::thread *primitive-objects*
-                         :key #'primitive-object-name)))
+    (let* ((slots (coerce (primitive-object-slots
+                           (sb-vm::primitive-object 'sb-vm::thread))
+                          'list))
            (a (make-array (1+ (slot-offset (car (last slots))))
                           :initial-element nil)))
       (dolist (slot slots a)
@@ -288,9 +383,12 @@
            (type (member nil :byte :word :dword :qword) width)
            (type (or null stream) stream)
            (type disassem-state dstate))
+  ;; If disassembling into the dstate, print nothing; just stash the operand.
   (when (null stream)
     (return-from print-mem-ref
       (operand (cons value width) dstate)))
+
+  ;; Unpack and print the pieces of the machine EA.
   (let ((base-reg (machine-ea-base value))
         (disp (machine-ea-disp value))
         (index-reg (machine-ea-index value))
@@ -300,6 +398,8 @@
       (princ '| PTR | stream))
     (when (dstate-getprop dstate +fs-segment+)
       (princ "FS:" stream))
+    (when (dstate-getprop dstate +gs-segment+)
+      (princ "GS:" stream))
     (write-char #\[ stream)
     (when base-reg
       (if (eql :rip base-reg)
@@ -321,18 +421,27 @@
              (princ disp stream))
             (firstp
              (princ16 disp stream)
-             ;; Avoid the MAYBE-NOTE- calls if we can.  A negative offset is never an
+             ;; Avoid the MAYBE-NOTE call if we can.  A negative offset is never an
              ;; absolute address as would be used for asm routines and static symbols.
-             (or (minusp disp)
-                 (maybe-note-assembler-routine disp nil dstate)
-                 ;; Static symbols coming from CELL-REF
-                 (maybe-note-static-symbol (+ disp (- other-pointer-lowtag n-word-bytes))
-                                           dstate)))
+             ;; FIRSTP implies lack of a base and index register.
+             (unless (minusp disp)
+               (or (maybe-note-static-symbol (+ disp (- other-pointer-lowtag
+                                                        (* n-word-bytes sb-vm:symbol-value-slot)))
+                                             dstate)
+                   (maybe-note-assembler-routine disp nil dstate))))
             (t
              (princ disp stream))))
     (write-char #\] stream)
+
+    ;; Always try to add an end-of-line comment about the EA.
+    ;; Assembler routines were already handled above (not really sure why)
+    ;; so now we have to figure out everything else.
+    #+sb-safepoint
+    (when (and (eql (machine-ea-base value) sb-vm::card-table-reg)
+               (eql (machine-ea-disp value) -8))
+      (return-from print-mem-ref (note "safepoint" dstate)))
+
     (when (and (eq (machine-ea-base value) :rip) (neq mode :compute))
-      ;; Always try to print the EA as a note
       (block nil
        (binding* ((seg (dstate-segment dstate))
                   (code (seg-code seg) :exit-if-null)
@@ -347,7 +456,13 @@
          ;; compilation to memory says it is all associated with
          ;; the symbol "lisp_jit_code" which is not useful.
          (when (plusp addr)
-           (or (unless (sb-kernel:immobile-space-addr-p addr)
+           (or (when (<= sb-vm:alien-linkage-table-space-start addr
+                         (+ sb-vm:alien-linkage-table-space-start
+                            (1- sb-vm:alien-linkage-table-space-size)))
+                 (let* ((index (sb-vm::alien-linkage-table-index-from-address addr))
+                        (name (sb-impl::alien-linkage-index-to-name index)))
+                   (note (lambda (s) (format s "&~A" name)) dstate)))
+               (unless (sb-kernel:immobile-space-addr-p addr)
                  (maybe-note-assembler-routine addr nil dstate))
                ;; Show the absolute address and maybe the contents.
                (note (format nil "[#x~x]~@[ = #x~x~]"
@@ -355,7 +470,20 @@
                              (case width
                               (:qword (unboxed-constant-ref dstate addr disp))))
                      dstate))))))
-    #+sb-thread
+
+    ;; Recognize "[Rbase+disp]" as an alien linkage table reference if Rbase was
+    ;; just loaded with the base address in the prior instruction.
+    (when (and (eql (machine-ea-base value)
+                    (car (sb-disassem::dstate-known-register-contents dstate)))
+               (eq (cdr (sb-disassem::dstate-known-register-contents dstate))
+                   'alien-linkage)
+               (not (machine-ea-index value))
+               (integerp (machine-ea-disp value)))
+      (let ((name (sb-impl::alien-linkage-index-to-name
+                   (floor (machine-ea-disp value) sb-vm:alien-linkage-table-entry-size))))
+        (note (lambda (s) (format s "&~A" name)) dstate)))
+    (setf (sb-disassem::dstate-known-register-contents dstate) nil)
+
     (flet ((guess-symbol (predicate)
              (binding* ((code-header (seg-code (dstate-segment dstate)) :exit-if-null)
                         (header-n-words (code-header-words code-header)))
@@ -363,7 +491,15 @@
                      for obj = (code-header-ref code-header word-num)
                      when (and (symbolp obj) (funcall predicate obj))
                      do (return obj)))))
+      (when (and (not base-reg) (not index-reg) disp)
+        (let ((addr (+ disp ; guess that DISP points to a symbol-value slot
+                       (- (ash sb-vm:symbol-value-slot sb-vm:word-shift))
+                       sb-vm:other-pointer-lowtag)))
+          (awhen (guess-symbol (lambda (s) (= (get-lisp-obj-address s) addr)))
+            (note (lambda (stream) (prin1 it stream)) dstate)
+            (return-from print-mem-ref))))
       ;; Try to reverse-engineer which thread-local binding this is
+      #+sb-thread
       (cond ((and disp ; Test whether disp looks aligned to an object header
                   (not (logtest (- disp 4) sb-vm:lowtag-mask))
                   (not base-reg) (not index-reg))
@@ -371,26 +507,33 @@
                     (symbol
                      (guess-symbol (lambda (s) (= (get-lisp-obj-address s) addr)))))
                (when symbol
-                 ;; Q: what's the difference between "tls_index:" and "tls:" (below)?
+                 ;; "tls_index:" is access to the half-sized slot within the
+                 ;; symbol header that provides an offset into TLS.
                  (note (lambda (stream) (format stream "tls_index: ~S" symbol))
                        dstate))))
-            ((and (not base-reg) (not index-reg) disp)
-             (let ((addr (+ disp ; guess that DISP points to a symbol-value slot
-                            (- (ash sb-vm:symbol-value-slot sb-vm:word-shift))
-                            sb-vm:other-pointer-lowtag)))
-               (awhen (guess-symbol (lambda (s) (= (get-lisp-obj-address s) addr)))
-                 (note (lambda (stream) (format stream "~A" it)) dstate))))
-            ((and (eql base-reg #.(tn-offset sb-vm::thread-base-tn))
-                  (not (dstate-getprop dstate +fs-segment+)) ; not system TLS
+            ;; thread slots
+            ((and (eql base-reg sb-vm::thread-reg)
+                  #+gs-seg (dstate-getprop dstate +gs-segment+)
+                  #-gs-seg (not (dstate-getprop dstate +fs-segment+)) ; not system TLS
                   (not index-reg) ; no index
-                  (typep disp '(integer 0 *)) ; positive displacement
+                  (typep disp '(integer -128 *)) ; valid displacement
                   (zerop (logand disp 7))) ; lispword-aligned
-             (let ((index (ash disp -3)))
-               (when (< index (length thread-slot-names))
-                 (awhen (aref thread-slot-names index)
-                   (return-from print-mem-ref
-                     (note (lambda (stream) (format stream "thread.~(~A~)" it))
-                           dstate)))))
+             (let* ((index (ash disp -3))
+                    (symbol (cond ((minusp index)
+                                   (let ((index (1- (- index))))
+                                     (when (array-in-bounds-p sb-vm::+thread-header-slot-names+ index)
+                                       (aref sb-vm::+thread-header-slot-names+ index))))
+                                  ((< index (length thread-slot-names))
+                                   (aref thread-slot-names index)))))
+               (when symbol
+                 (when (and (eq symbol 'sb-vm::alien-linkage-table-base)
+                            (eql (logandc2 (sb-disassem::dstate-inst-properties dstate) +rex-r+)
+                                 (logior +rex+ +rex-w+ +rex-b+)))
+                   (setf (sb-disassem::dstate-known-register-contents dstate)
+                         `(,(reg-num (regrm-inst-reg dchunk-zero dstate)) . alien-linkage)))
+                 (return-from print-mem-ref
+                   (note (lambda (stream) (format stream "thread.~(~A~)" symbol))
+                         dstate))))
              (let ((symbol (or (guess-symbol
                                 (lambda (s) (= (symbol-tls-index s) disp)))
                                ;; static symbols aren't in the code header
@@ -398,22 +541,29 @@
                                      :key #'symbol-tls-index))))
                (when symbol
                  (return-from print-mem-ref
+                   ;; "tls:" refers to the current value of the symbol in TLS
                    (note (lambda (stream) (format stream "tls: ~S" symbol))
-                         dstate)))))))))
+                         dstate)))))
+            ))))
 
 (defun lea-compute-label (value dstate)
   ;; If VALUE should be regarded as a label, return the address.
   ;; If not, just return VALUE.
   (if (and (typep value 'machine-ea) (eq (machine-ea-base value) :rip))
-      (+ (dstate-next-addr dstate) (machine-ea-disp value))
+      (let ((addr (+ (dstate-next-addr dstate) (machine-ea-disp value))))
+        (if (= (logand addr lowtag-mask) fun-pointer-lowtag)
+            (- addr fun-pointer-lowtag)
+            addr))
       value))
 
 ;; Figure out whether LEA should print its EA with just the stuff in brackets,
 ;; or additionally show the EA as either a label or a hex literal.
 (defun lea-print-ea (value stream dstate)
-  (let* ((width (inst-operand-size dstate))
-         (addr
-          (etypecase value
+  (let*
+      ((width (inst-operand-size dstate))
+       (ea)
+       (addr
+         (etypecase value
            (machine-ea
             ;; Indicate to PRINT-MEM-REF that this is not a memory access.
             (print-mem-ref :compute value width stream dstate)
@@ -431,7 +581,8 @@
             ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
             ;; because the EA was computed in a prefilter.
             ;; (the instruction format is known because LEA has exactly one format)
-            (print-mem-ref :compute (regrm-inst-r/m dchunk-zero dstate)
+            (print-mem-ref :compute (setf ea
+                                          (regrm-inst-r/m dchunk-zero dstate))
                            width stream dstate)
             value)
 
@@ -441,11 +592,27 @@
            (reg
             (print-reg-with-width value width stream dstate)
             nil))))
-
-    (when (and addr stream) ; no end-of-line comments if storing into dstate
-      (unless (maybe-note-assembler-routine addr nil dstate)
-        (note (lambda (s) (format s (if (stringp addr) "= ~A" "= #x~x") addr))
-              dstate)))))
+    (when stream
+      (cond ((stringp addr)             ; label
+             (note (lambda (s) (format s "= ~A" addr)) dstate))
+            ;; Local function
+            ((and ea
+                  (= (logand (+ (dstate-next-addr dstate) (machine-ea-disp ea))
+                             lowtag-mask)
+                      fun-pointer-lowtag)
+                  (let* ((seg (dstate-segment dstate))
+                         (code (seg-code seg))
+                         (offset (+ (sb-disassem::seg-initial-offset seg)
+                                    (dstate-next-offs dstate)
+                                    (- (machine-ea-disp ea)
+                                       fun-pointer-lowtag))))
+                    (loop for n below (code-n-entries code)
+                          do (when (= (%code-fun-offset code n) offset)
+                               (let ((fun (%code-entry-point code n)))
+                                 (note (lambda (stream) (prin1-quoted-short fun stream)) dstate))
+                               (return t))))))
+            (addr
+             (note (lambda (s) (format s "= #x~x" addr)) dstate))))))
 
 ;;;; interrupt instructions
 
@@ -489,23 +656,6 @@
                  (snarf-error-junk sap offset trap-number length-only)))
            trap stream dstate)))))))
 
-;;; Note: this really has nothing to do with the code fixups, and we're
-;;; merely utilizing PACK-CODE-FIXUP-LOCS to perform data compression.
-(defun sb-c::convert-alloc-point-fixups (code locs)
-  ;; Find the instruction which jumps over the profiling code,
-  ;; and record the offset, and not the instruction that makes the call
-  ;; to enable the counter. The instructions preceding the call comprise
-  ;; a test, jmp, and long nop. Luckily a long nop encoding never
-  ;; has the byte #xEB in it, so just scan backwards looking for that.
-  (pack-code-fixup-locs
-   (mapcar (lambda (loc)
-             (loop (cond ((zerop (decf loc))
-                          (bug "Failed to find allocation point"))
-                         ((eql (sap-ref-8 (code-instructions code) loc) #xEB)
-                          (return loc)))))
-           locs)
-   nil))
-
 ;;; Disassemble memory of CODE from START-ADDRESS for LENGTH bytes
 ;;; calling FUNCTION on each instruction that has a PC-relative operand.
 ;;; If supplied, PREDICATE is used to filter out some function invocations.
@@ -519,6 +669,7 @@
          (jmp-inst (find-inst #xE9 inst-space))
          (cond-jmp-inst (find-inst #x800f inst-space))
          (lea-inst (find-inst #x8D inst-space))
+         (mov-inst (find-inst #x8B inst-space))
          (address (get-lisp-obj-address code))
          (text-start (sap-int (code-instructions code)))
          (text-end (+ text-start (%code-text-size code)))
@@ -527,7 +678,7 @@
           (seg-length segment) length
           (seg-sap-maker segment) (lambda () sap))
     (map-segment-instructions
-     (lambda (dchunk inst)
+     (lambda (dchunk inst &aux (opcode (sap-ref-8 sap (dstate-cur-offs dstate))))
        (flet ((includep (target)
                 ;; Self-relative (to the code object) operands are ignored.
                 (and (or (< target address) (>= target text-end))
@@ -546,10 +697,10 @@
                   (when (includep operand)
                     (funcall function (+ (dstate-cur-offs dstate) 2)
                              operand inst))))
-               ((eq inst lea-inst)
-                ;; Computing the address of UNDEFINED-FDEFN and
-                ;; FUNCALLABLE-INSTANCE-TRAMP is done with LEA.
-                (aver (eql (sap-ref-8 sap (dstate-cur-offs dstate)) #x8D))
+               ((or (eq inst lea-inst)
+                    (and (eq inst mov-inst) (eql opcode #x8B)))
+                ;; Computing the address of UNDEFINED-FDEFN is done with LEA.
+                ;; Load from the alien linkage table can be done with MOV Rnn,[RIP-k].
                 (let ((modrm (sap-ref-8 sap (1+ (dstate-cur-offs dstate)))))
                   (when (= (logand modrm #b11000111) #b00000101) ; RIP-relative mode
                     (let ((operand (+ (signed-sap-ref-32

@@ -9,7 +9,7 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-CFLAGS += -arch i386 -g -Wall -O2 -fdollars-in-identifiers -fno-omit-frame-pointer
+CFLAGS += -arch i386 -g -Wall -fdollars-in-identifiers -fno-omit-frame-pointer
 
 LINKFLAGS += -arch i386
 ifdef SBCL_MACOSX_VERSION_MIN
@@ -32,7 +32,7 @@ ifdef LISP_FEATURE_SB_THREAD
   OS_LIBS += -lpthread
 endif
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-  OS_LIBS += -lz
+  OS_LIBS += -lzstd
 endif
 ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
   LIBSBCL = libsbcl.a
@@ -42,11 +42,4 @@ endif
 ASSEM_SRC = x86-assem.S
 ARCH_SRC = x86-arch.c
 
-CPPFLAGS += -no-cpp-precomp
-
 GC_SRC = fullcgc.c gencgc.c traceroot.c
-
-.PHONY: after-grovel-headers
-
-# Nothing to do.
-after-grovel-headers:

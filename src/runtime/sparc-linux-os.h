@@ -2,7 +2,7 @@
 #define _SPARC_LINUX_OS_H
 
 typedef struct sigcontext os_context_t;
-typedef unsigned long os_context_register_t;
+typedef unsigned int os_context_register_t;
 
 static inline os_context_t *arch_os_get_context(void **void_context)
 {
@@ -12,5 +12,7 @@ static inline os_context_t *arch_os_get_context(void **void_context)
 
 unsigned long os_context_fp_control(os_context_t *context);
 void os_restore_fp_control(os_context_t *context);
+
+#define OS_CONTEXT_PC(context) context->si_regs.pc
 
 #endif /* _SPARC_LINUX_OS_H */

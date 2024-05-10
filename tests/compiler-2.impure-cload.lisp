@@ -54,13 +54,13 @@
         (quux (1- n)))))
 
 (defun frob (x)
-  (setf (fdefinition x) (constantly 13)))
+  (setf (fdefinition x) (constantly -11)))
 
 (defun test ()
   (list (foo 1) (bar 1) (quux 1)))
 
 (assert (equal (test) '(0 0 0)))
-(assert (equal (test) '(13 13 13))) ; sanity check
+(assert (equal (test) '(-11 -11 -11))) ; sanity check
 
 ;;; Bug in 1.0.2 and 1.0.3, where the XEP was compiled with the wrong
 ;;; policy. (Test-case derived from code posted by alexander.ekart in
@@ -74,7 +74,7 @@
              (optimize (speed 3) (safety 3) (space 0) (debug 0)))
     (aref x y)))
 
-(assert-error (bubblesort (make-array 10) 9))
+(assert-error (bubblesort (eval '(make-array 10)) 9))
 
 (define-symbol-macro %trash% what)
 (locally

@@ -17,6 +17,11 @@
 (defun streamp (stream)
   (typep stream 'stream))
 
+;;; These would only be called from %%TYPEP given a built-in-classoid.
+;;; Ordinarily TYPEP on either one would be transformed.
+(defun sb-kernel::file-stream-p (x) (typep x 'file-stream))
+(defun sb-kernel::string-stream-p (x) (typep x 'string-stream))
+
 ;;; various (VECTOR FOO) type predicates, not implemented as simple
 ;;; widetag tests
 (macrolet
@@ -49,20 +54,22 @@
   "Return T if X is NIL, otherwise return NIL."
   (not object))
 
-;;; All the primitive type predicate wrappers share a parallel form..
+;;; All the primitive type predicate wrappers share a parallel form.
+;;; These aren't so much "wrappers" as they are the actual installed DEFUNs.
+;;; I supposed they "wrap" a vop or source-transform.
 (macrolet ((def-type-predicate-wrapper (pred)
-             (let* ((name (symbol-name pred))
-                    (stem (string-left-trim "%" (string-right-trim "P-" name)))
-                    (article (if (position (schar name 0) "AEIOU") "an" "a")))
-               `(defun ,pred (object)
-                  ;; Document the standardized predicates and not the internal ones.
-                  ,@(when (eql (sb-xc:symbol-package pred) *cl-package*)
+             `(defun ,pred (object)
+                ;; Document the standardized predicates and not the internal ones.
+                ,@(when (eq (sb-xc:symbol-package pred) *cl-package*)
+                    (let* ((name (symbol-name pred))
+                           (stem (string-left-trim "%" (string-right-trim "P-" name)))
+                           (article (if (position (schar name 0) "AEIOU") "an" "a")))
                       (list (format nil
                                     "Return true if OBJECT is ~A ~A, and NIL otherwise."
                                     article
-                                    stem)))
+                                    stem))))
                   ;; (falling through to low-level implementation)
-                  (,pred object)))))
+                (,pred object))))
   (def-type-predicate-wrapper array-header-p)
   (def-type-predicate-wrapper simple-array-header-p)
   (def-type-predicate-wrapper arrayp)
@@ -93,16 +100,22 @@
   (def-type-predicate-wrapper fixnump)
   (def-type-predicate-wrapper floatp)
   (def-type-predicate-wrapper functionp)
+  ;; SIMPLE-FUN-P is needed for constant folding in early warm load,
+  ;; and its absence would be obscured by the fact that
+  ;; CONSTANT-FUNCTION-CALL-P allows the call to fail.
+  (def-type-predicate-wrapper closurep)
+  (def-type-predicate-wrapper simple-fun-p)
   (def-type-predicate-wrapper integerp)
   (def-type-predicate-wrapper listp)
   (def-type-predicate-wrapper long-float-p)
-  #-(or x86 x86-64) (def-type-predicate-wrapper lra-p)
+  #-(or x86 x86-64 arm64 riscv) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
+  (sb-c::when-vop-existsp (:translate pointerp)
+    (def-type-predicate-wrapper pointerp))
   (def-type-predicate-wrapper rationalp)
   (def-type-predicate-wrapper ratiop)
   (def-type-predicate-wrapper realp)
-  (def-type-predicate-wrapper short-float-p)
   (def-type-predicate-wrapper single-float-p)
   #+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
   #+sb-simd-pack-256 (def-type-predicate-wrapper simd-pack-256-p)
@@ -116,10 +129,15 @@
   (def-type-predicate-wrapper system-area-pointer-p)
   (def-type-predicate-wrapper unbound-marker-p)
   (def-type-predicate-wrapper weak-pointer-p)
-  #-64-bit
-  (progn
-    (def-type-predicate-wrapper unsigned-byte-32-p)
+
+  (sb-c::when-vop-existsp (:translate signed-byte-8-p)
+    (def-type-predicate-wrapper signed-byte-8-p))
+  (sb-c::when-vop-existsp (:translate signed-byte-16-p)
+    (def-type-predicate-wrapper signed-byte-16-p))
+  (sb-c::when-vop-existsp (:translate signed-byte-32-p)
     (def-type-predicate-wrapper signed-byte-32-p))
+  #-64-bit
+  (def-type-predicate-wrapper unsigned-byte-32-p)
   #+64-bit
   (progn
     (def-type-predicate-wrapper unsigned-byte-64-p)
@@ -140,64 +158,10 @@
   (def-type-predicate-wrapper stringp)
   (def-type-predicate-wrapper vectorp))
 
-#+(or x86 x86-64 arm arm64)
-(defun fixnum-mod-p (x limit)
-  (and (fixnump x)
-       (<= 0 x limit)))
+(sb-c::when-vop-existsp (:translate car-eq-if-listp)
+  (defun car-eq-if-listp (value object)
+    (car-eq-if-listp value object)))
 
-;;; a vector that maps widetags to layouts, used for quickly finding
-;;; the layouts of built-in classes
-(define-load-time-global **primitive-object-layouts** nil)
-(declaim (type simple-vector **primitive-object-layouts**))
-(defun !pred-cold-init ()
-  ;; This vector is allocated in immobile space when possible. There isn't
-  ;; a way to do that from lisp, so it's special-cased in genesis.
-  #-immobile-space (setq **primitive-object-layouts** (make-array 256))
-  (map-into **primitive-object-layouts**
-            (lambda (name) (classoid-layout (find-classoid name)))
-            #.(let ((table (make-array 256 :initial-element 'sb-kernel::random-class)))
-                (dolist (x sb-kernel::+!built-in-classes+)
-                  (destructuring-bind (name &key codes &allow-other-keys) x
-                    (dolist (code codes)
-                      (setf (svref table code) name))))
-                (loop for i from sb-vm:list-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
-                      below 256
-                      do (setf (aref table i) 'cons))
-                (loop for i from sb-vm:even-fixnum-lowtag by (ash 1 sb-vm:n-fixnum-tag-bits)
-                      below 256
-                      do (setf (aref table i) 'fixnum))
-                table)))
-
-;;; Return the layout for an object. This is the basic operation for
-;;; finding out the "type" of an object, and is used for generic
-;;; function dispatch. The standard doesn't seem to say as much as it
-;;; should about what this returns for built-in objects. For example,
-;;; it seems that we must return NULL rather than LIST when X is NIL
-;;; so that GF's can specialize on NULL.
-;;; x86-64 has a vop that implements this without even needing to place
-;;; the vector of layouts in the constant pool of the containing code.
-#-(and compact-instance-header x86-64)
-(progn
-(declaim (inline layout-of))
-(defun layout-of (x)
-  (declare (optimize (speed 3) (safety 0)))
-  (cond ((%instancep x) (%instance-layout x))
-        ((funcallable-instance-p x) (%fun-layout x))
-        ;; Compiler can dump literal layouts, which handily sidesteps
-        ;; the question of when cold-init runs L-T-V forms.
-        ((null x) #.(find-layout 'null))
-        (t
-         ;; Note that WIDETAG-OF is slightly suboptimal here and could be
-         ;; improved - we've already ruled out some of the lowtags.
-         (svref (load-time-value **primitive-object-layouts** t)
-                (widetag-of x))))))
-
-(declaim (inline classoid-of))
-#-sb-xc-host
-(defun classoid-of (object)
-  "Return the class of the supplied object, which may be any Lisp object, not
-   just a CLOS STANDARD-OBJECT."
-  (layout-classoid (layout-of object)))
 
 ;;; Return the specifier for the type of object. This is not simply
 ;;; (TYPE-SPECIFIER (CTYPE-OF OBJECT)) because CTYPE-OF has different
@@ -234,7 +198,7 @@
            ((eq (sb-xc:symbol-package object) *keyword-package*) 'keyword)
            (t 'symbol)))
     (array
-     (let ((etype (specifier-type (array-element-type object))))
+     (let ((etype (sb-vm::array-element-ctype object)))
        ;; Obviously :COMPLEXP is known to be T or NIL, but it's not allowed to
        ;; return (NOT SIMPLE-ARRAY), so use :MAYBE in lieu of T.
        (type-specifier
@@ -247,23 +211,23 @@
     (simple-fun 'compiled-function)
     (t
      (let ((layout (layout-of object)))
-       (if (eq (get-lisp-obj-address layout) 0)
-            ;; An empty instance, e.g. created by with-output-to-string
-            'instance
-            (let* ((classoid (layout-classoid layout))
-                   (name (classoid-name classoid)))
-              (if (%instancep object)
-                  (case name
-                    (sb-alien-internals:alien-value
-                     `(alien
-                       ,(sb-alien-internals:unparse-alien-type
-                         (sb-alien-internals:alien-value-type object))))
-                    (t
-                     (let ((pname (classoid-proper-name classoid)))
-                       (if (classoid-p pname)
-                           (classoid-pcl-class pname)
-                           pname))))
-                  name)))))))
+       (when (= (get-lisp-obj-address layout) 0)
+         (return-from type-of
+           (if (functionp object) 'funcallable-instance 'instance)))
+       (let* ((classoid (layout-classoid layout))
+              (name (classoid-name classoid)))
+         ;; FIXME: should the first test be (not (or (%instancep) (%funcallable-instance-p)))?
+         ;; God forbid anyone makes anonymous classes of generic functions.
+         (cond ((not (%instancep object))
+                name)
+               ((eq name 'sb-alien-internals:alien-value)
+                `(alien ,(sb-alien-internals:unparse-alien-type
+                          (sb-alien-internals:alien-value-type object))))
+               (t
+                (let ((pname (classoid-proper-name classoid)))
+                  (if (classoid-p pname)
+                      (classoid-pcl-class pname)
+                      pname)))))))))
 
 ;;;; equality predicates
 
@@ -271,24 +235,9 @@
 (defun eq (obj1 obj2)
   "Return T if OBJ1 and OBJ2 are the same object, otherwise NIL."
   (eq obj1 obj2))
-;;; and this too, but it's only needed for backends on which
-;;; IR1 might potentially transform EQL into %EQL/INTEGER.
-#+integer-eql-vop
-(defun %eql/integer (obj1 obj2)
-  ;; This is just for constant folding, there's no real need to transform
-  ;; into the %EQL/INTEGER VOP. But it's confusing if it becomes identical to
-  ;; EQL, and then due to ICF we find that #'EQL => #<FUNCTION %EQL/INTEGER>.
-  ;; Type declarations don't suffice because we don't know which arg is an integer
-  ;; (if not both). We could ensure selection of the vop by using %PRIMITIVE.
-  ;; Anyway it suffices to disable type checking and pretend its the always
-  ;; the first arg that's an integer, but that won't work on the host because
-  ;; it might enforce the type since we can't portably unenforce after declaring.
-  #-sb-xc-host (declare (optimize (sb-c::type-check 0)))
-  (eql #+sb-xc-host obj1 #-sb-xc-host (the integer obj1) obj2))
 
 (declaim (inline %eql))
 (defun %eql (obj1 obj2)
-  "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   #+x86-64 (eql obj1 obj2) ; vop fully implements all cases of EQL
   #-x86-64 ; else this is the only full implementation of EQL
   (or (eq obj1 obj2)
@@ -310,8 +259,10 @@
              #+long-float
              (long-float eql)
              (bignum
-              #-integer-eql-vop (lambda (x y) (zerop (bignum-compare x y)))
-              #+integer-eql-vop eql) ; will become %eql/integer
+              #.(sb-c::if-vop-existsp (:named sb-vm::%eql/integer)
+                  'eql
+                  '(lambda (x y)
+                    (zerop (bignum-compare x y)))))
              (ratio
               (lambda (x y)
                 (and (eql (numerator x) (numerator y))
@@ -330,6 +281,7 @@
                      (eql (imagpart x) (imagpart y))))))))))
 
 (defun eql (x y)
+  "Return T if OBJ1 and OBJ2 represent the same object, otherwise NIL."
   ;; On x86-64, EQL is just an interpreter stub for a vop.
   ;; For others it's a call to the implementation of generic EQL.
   (#+x86-64 eql #-x86-64 %eql x y))
@@ -432,49 +384,96 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                      ((functionp test) (funcall test i x y))
                      (t)))))
 
-;;; Doesn't work on simple vectors
-(defun array-equalp (x y)
-  (declare (array x y))
-  (let ((rank (array-rank x)))
-    (and
-     (= rank (array-rank y))
-     (dotimes (axis rank t)
-       (unless (= (%array-dimension x axis)
-                  (%array-dimension y axis))
-         (return nil)))
-     (with-array-data ((x x) (start-x) (end-x) :force-inline t
-                                               :array-header-p t)
-       (with-array-data ((y y) (start-y) (end-y) :force-inline t
-                                                 :array-header-p t)
-         (declare (ignore end-y))
-         (let* ((reffers %%data-vector-reffers%%)
-                (getter-x (truly-the function (svref reffers (%other-pointer-widetag x))))
-                (getter-y (truly-the function (svref reffers (%other-pointer-widetag y)))))
-           (loop for x-i fixnum from start-x below end-x
-                 for y-i fixnum from start-y
-                 for x-el = (funcall getter-x x x-i)
-                 for y-el = (funcall getter-y y y-i)
-                 always (or (eq x-el y-el)
-                            (equalp x-el y-el)))))))))
-
-(defun vector-equalp (x y)
-  (declare (vector x y))
-  (let ((length (length x)))
-    (and (= length (length y))
-         (with-array-data ((x x) (start-x) (end-x) :force-inline t
-                                                   :check-fill-pointer t)
-           (with-array-data ((y y) (start-y) (end-y) :force-inline t
-                                                     :check-fill-pointer t)
-             (declare (ignore end-y))
-             (let* ((reffers %%data-vector-reffers%%)
-                    (getter-x (truly-the function (svref reffers (%other-pointer-widetag x))))
-                    (getter-y (truly-the function (svref reffers (%other-pointer-widetag y)))))
-               (loop for x-i fixnum from start-x below end-x
-                     for y-i fixnum from start-y
-                     for x-el = (funcall getter-x x x-i)
-                     for y-el = (funcall getter-y y y-i)
-                     always (or (eq x-el y-el)
-                                (equalp x-el y-el)))))))))
+(macrolet ((numericp (v)
+             (let ((widetags
+                    (map 'list #'sb-vm:saetp-typecode
+                         (remove-if (lambda (x)
+                                      (not (typep (sb-vm:saetp-ctype x) 'numeric-type)))
+                                    sb-vm:*specialized-array-element-type-properties*))))
+               `(%other-pointer-subtype-p ,v ',widetags)))
+           (compare-loop (typespec)
+             `(let ((x (truly-the (simple-array ,typespec 1) x))
+                    (y (truly-the (simple-array ,typespec 1) y)))
+                (loop for x-i fixnum from start-x below end-x
+                      for y-i fixnum from start-y
+                      always (= (aref x x-i) (aref y y-i))))))
+(defun array-equalp (a b)
+  (flet
+      ((data-vector-compare (x y start-x end-x start-y)
+         (declare (index start-x end-x start-y)
+                  (optimize (sb-c:insert-array-bounds-checks 0)))
+         (let ((xtag (%other-pointer-widetag (truly-the (simple-array * 1) x)))
+               (ytag (%other-pointer-widetag (truly-the (simple-array * 1) y))))
+           (case (if (= xtag ytag) xtag 0)
+             (#.sb-vm:simple-vector-widetag
+              (let ((x (truly-the simple-vector x))
+                    (y (truly-the simple-vector y)))
+                (loop for x-i fixnum from start-x below end-x
+                      for y-i fixnum from start-y
+                      always (let ((a (svref x x-i)) (b (svref y y-i)))
+                               (or (eq a b) (equalp a b))))))
+             ;; Special-case the important array types that would cause consing in aref.
+             ;; Though (UNSIGNED-BYTE 62) and (UNSIGNED-BYTE 63) arrays exist,
+             ;; I highly doubt that they occur anywhere except in contrived code
+             ;; that does nothing but test that those types exist. i.e. They are
+             ;; beyond worthless, and are frankly wasteful of space in array dispatch
+             ;; scenarios, or to put it mildy: I disagree with their existence per se.
+             #+64-bit (#.sb-vm:simple-array-unsigned-byte-64-widetag
+                       (compare-loop (unsigned-byte 64)))
+             #+64-bit (#.sb-vm:simple-array-signed-byte-64-widetag
+                       (compare-loop (signed-byte 64)))
+             #-64-bit (#.sb-vm:simple-array-unsigned-byte-32-widetag
+                       (compare-loop (unsigned-byte 32)))
+             #-64-bit (#.sb-vm:simple-array-signed-byte-32-widetag
+                       (compare-loop (signed-byte 32)))
+             ;; SINGLE-FLOAT wouldn't cons on 64-bit, but it should be treated
+             ;; no less efficiently than DOUBLE-FLOAT.
+             (#.sb-vm:simple-array-single-float-widetag
+              (compare-loop single-float))
+             (#.sb-vm:simple-array-double-float-widetag
+              (compare-loop double-float))
+             (#.sb-vm:simple-array-complex-single-float-widetag
+              (compare-loop (complex single-float)))
+             (#.sb-vm:simple-array-complex-double-float-widetag
+              (compare-loop (complex double-float)))
+             (t
+              (let* ((reffers %%data-vector-reffers%%)
+                     (getter-x (truly-the function (svref reffers xtag)))
+                     (getter-y (truly-the function (svref reffers ytag))))
+                ;; The arrays won't both be strings, because EQUALP has a case for that.
+                ;; If they're both numeric, use = as the test.
+                (if (and (numericp x) (numericp y))
+                    (loop for x-i fixnum from start-x below end-x
+                          for y-i fixnum from start-y
+                          always (= (funcall getter-x x x-i) (funcall getter-y y y-i)))
+                    ;; Everything else
+                    (loop for x-i fixnum from start-x below end-x
+                          for y-i fixnum from start-y
+                          for x-el = (funcall getter-x x x-i)
+                          for y-el = (funcall getter-y y y-i)
+                          always (or (eq x-el y-el)
+                                     (equalp x-el y-el))))))))))
+    (if (vectorp (truly-the array a))
+        (and (vectorp (truly-the array b))
+             (= (length a) (length b))
+             (with-array-data ((x a) (start-x) (end-x)
+                               :force-inline t :check-fill-pointer t)
+               (with-array-data ((y b) (start-y) (end-y)
+                                 :force-inline t :check-fill-pointer t)
+                 (declare (ignore end-y))
+                 (data-vector-compare x y start-x end-x start-y))))
+        (let ((rank (array-rank (truly-the array a))))
+          (and (= rank (array-rank (truly-the array b)))
+               (dotimes (axis rank t)
+                 (unless (= (%array-dimension a axis)
+                            (%array-dimension b axis))
+                   (return nil)))
+               (with-array-data ((x a) (start-x) (end-x)
+                                 :force-inline t :array-header-p t)
+                 (with-array-data ((y b) (start-y) (end-y)
+                                   :force-inline t :array-header-p t)
+                   (declare (ignore end-y))
+                   (data-vector-compare x y start-x end-x start-y)))))))))
 
 (defun equalp (x y)
   "Just like EQUAL, but more liberal in several respects.
@@ -497,22 +496,15 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                               (layout-flags layout))
                      (eq (%instance-layout y) layout)
                      (funcall (layout-equalp-impl layout) x y)))))
-        ((and (simple-vector-p x) (simple-vector-p y))
-         (let ((len (length x)))
-           (and (= len (length y))
-                (loop for i below len ; somewhat faster than the generic loop
-                      always (let ((a (svref x i)) (b (svref y i)))
-                               (or (eq a b) (equalp a b)))))))
-        ((and (bit-vector-p x) (bit-vector-p y))
-         (bit-vector-= x y))
-        ((vectorp x)
-         (and (vectorp y)
-              (vector-equalp x y)))
         ((arrayp x)
          (and (arrayp y)
-              (array-equalp x y)))
+              ;; string-equal is nearly 2x the speed of array-equalp for comparing strings
+              (cond ((and (stringp x) (stringp y)) (string-equal x y))
+                    ((and (bit-vector-p x) (bit-vector-p y)) (bit-vector-= x y))
+                    (t (array-equalp x y)))))
         (t nil)))
 
+#-sb-show ;; I don't know why these tests crash with #+sb-show
 (let ((test-cases `(($0.0 $-0.0 t)
                     ($0.0 $1.0 nil)
                     ;; There is no cross-compiler #C reader macro.
@@ -532,4 +524,14 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
              (bresult (if result 1 0))
              (expected-bresult (if expected-result 1 0)))
         (unless (= bresult expected-bresult)
+          ;; If a test fails, there's a chance of getting into a recursive error here
+          ;; because, among other things, *BASE-CHAR-NAME-ALIST* has not been filled in,
+          ;; so then you're get into an error printing#(#\h #\E #\l #\l #\o).
+          ;; Hopefully the write-string calls will work though.
+          (progn
+            (write-string "test failed: ")
+            (write (get-lisp-obj-address x) :base 16 :radix t)
+            (write-char #\space)
+            (write (get-lisp-obj-address y) :base 16 :radix t)
+            (terpri))
           (error "failed test (EQUALP ~S ~S)" x y))))))

@@ -30,10 +30,6 @@
   (:results)
   (:generator 1
     (storew value object offset lowtag)))
-
-(define-vop (init-slot set-slot)
-  (:info name dx-p offset lowtag)
-  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -52,11 +48,10 @@
   (:save-p :compute-only)
   (:temporary (:scs (descriptor-reg) :from (:argument 0)) obj-temp))
 
-;;; With Symbol-Value, we check that the value isn't the trap object.  So
-;;; Symbol-Value of NIL is NIL.
+;;; With Symbol-Value, we check that the value isn't the trap object.
 ;;;
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symeval)
+  (:translate symbol-value)
   (:generator 9
     (move obj-temp object)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
@@ -65,14 +60,12 @@
       (inst b :eq err-lab))))
 
 ;;; Like CHECKED-CELL-REF, only we are a predicate to see if the cell is bound.
-(define-vop (boundp-frob)
+(define-vop (boundp)
   (:args (object :scs (descriptor-reg)))
   (:conditional)
   (:info target not-p)
   (:policy :fast-safe)
-  (:temporary (:scs (descriptor-reg)) value))
-
-(define-vop (boundp boundp-frob)
+  (:temporary (:scs (descriptor-reg)) value)
   (:translate boundp)
   (:generator 9
     (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -82,34 +75,33 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symeval))
+  (:translate symbol-value))
+
+;;; On unithreaded builds these are just copies of the non-global versions.
+(define-vop (%set-symbol-global-value set))
+(define-vop (symbol-global-value symbol-value)
+  (:translate symbol-global-value))
+(define-vop (fast-symbol-global-value fast-symbol-value)
+  (:translate symbol-global-value))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; car slot, so we have to strip off the two low bits to make sure
-    ;; it is a fixnum.  The lowtag selection magic that is required to
-    ;; ensure this is explained in the comment in objdef.lisp
-    (loadw temp symbol symbol-hash-slot other-pointer-lowtag)
-    (inst bic res temp fixnum-tag-mask)))
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    ;; Clear the 3 highest bits, ensuring the result is positive fixnum
+    (inst bic res res #xE0000000)))
 
-;;; On unithreaded builds these are just copies of the non-global versions.
-(define-vop (%set-symbol-global-value set))
-(define-vop (symbol-global-value symbol-value)
-  (:translate sym-global-val))
-(define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate sym-global-val))
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst mov res (lsr res 3)))) ; shift out the 3 pseudorandom bits
 
 ;;;; Fdefinition (fdefn) objects.
-
-(define-vop (fdefn-fun cell-ref)
-  (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
@@ -128,12 +120,10 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((closure-tramp-fixup (gen-label)))
       (assemble (:elsewhere)
@@ -144,16 +134,14 @@
       (inst mov :eq lip function)
       (inst load-from-label :ne lip lip closure-tramp-fixup)
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-      (move result function))))
+      (storew function fdefn fdefn-fun-slot other-pointer-lowtag))))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
   (:translate fdefn-makunbound)
-  (:args (fdefn :scs (descriptor-reg) :target result))
+  (:args (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (interior-reg)) lip)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((undefined-tramp-fixup (gen-label)))
       (assemble (:elsewhere)
@@ -161,9 +149,7 @@
         (inst word (make-fixup 'undefined-tramp :assembly-routine)))
       (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
       (inst load-from-label temp lip undefined-tramp-fixup)
-      (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (move result fdefn))))
-
+      (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag))))
 
 
 ;;;; Binding and Unbinding.
@@ -234,9 +220,9 @@
   closure-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %closure-index-ref)
 
-(define-full-setter set-funcallable-instance-info *
-  funcallable-instance-info-offset fun-pointer-lowtag
-  (descriptor-reg any-reg null) * %set-funcallable-instance-info)
+(define-full-setter %closure-index-set *
+  closure-info-offset fun-pointer-lowtag
+  (descriptor-reg any-reg null) * %closure-index-set)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
@@ -252,7 +238,8 @@
 (define-vop (closure-init)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
-  (:info offset)
+  (:info offset dx)
+  (:ignore dx)
   (:generator 4
     (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
@@ -263,9 +250,6 @@
     (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; Value Cell hackery.
-
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))
@@ -293,8 +277,49 @@
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (descriptor-reg any-reg) * code-header-ref)
 
-(define-full-setter code-header-set * 0 other-pointer-lowtag
-  (descriptor-reg any-reg null) * code-header-set)
+(define-vop (code-header-set)
+  (:translate code-header-set)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp #+gencgc card)
+  #+gencgc (:temporary (:scs (interior-reg)) lip)
+  #+gencgc (:temporary (:sc non-descriptor-reg) pa-flag)
+  (:generator 10
+    #+cheneygc
+    (progn  (inst sub temp index other-pointer-lowtag)
+            (inst str value (@ object temp)))
+    #+gencgc
+    (let ((mask-fixup-label (gen-label))
+          (table-fixup-label (gen-label)))
+      (inst load-from-label temp lip mask-fixup-label)
+      (inst ldr temp (@ temp))
+      (inst ldr temp (@ temp))
+      (pseudo-atomic (pa-flag)
+        ;; Compute card mark index
+        (inst mov card (lsr object gencgc-card-shift))
+        (inst and card card temp)
+        ;; Load mark table base
+        (inst load-from-label temp lip table-fixup-label)
+        (inst ldr temp (@ temp))
+        (inst ldr temp (@ temp))
+        ;; Touch the card mark byte.
+        (inst strb null-tn (@ temp card))
+        ;; set 'written' flag in the code header
+        ;; If two threads get here at the same time, they'll write the same byte.
+        (let ((byte (- #+little-endian 3 other-pointer-lowtag)))
+          (inst ldrb temp (@ object byte))
+          (inst orr temp temp #x40)
+          (inst strb temp (@ object byte)))
+        (inst sub temp index other-pointer-lowtag)
+        (inst str value (@ object temp)))
+      (assemble (:elsewhere)
+        (emit-label mask-fixup-label)
+        (inst word (make-fixup "gc_card_table_mask" :foreign-dataref))
+        (emit-label table-fixup-label)
+        (inst word (make-fixup "gc_card_mark" :foreign-dataref))))))
 
 ;;;; raw instance slot accessors
 
@@ -311,11 +336,9 @@
                           `((inst ,instruction value (@ object offset))))
                     ,@(when move-result
                         `((,move-macro result value))))))
-         (let ((ref-vop (symbolicate "RAW-INSTANCE-REF/" name))
-               (set-vop (symbolicate "RAW-INSTANCE-SET/" name)))
            `(progn
-              (define-vop (,ref-vop)
-                (:translate ,(symbolicate "%" ref-vop))
+              (define-vop ()
+                (:translate ,(symbolicate "%RAW-INSTANCE-REF/" name))
                 (:policy :fast-safe)
                 (:args (object :scs (descriptor-reg))
                        (index :scs (any-reg)))
@@ -325,18 +348,16 @@
                 (:temporary (:scs (non-descriptor-reg)) offset)
                 ,@(when use-lip '((:temporary (:scs (interior-reg)) lip)))
                 (:generator 5 ,@(emit-generator ref-inst nil)))
-              (define-vop (,set-vop)
-                (:translate ,(symbolicate "%" set-vop))
+              (define-vop ()
+                (:translate ,(symbolicate "%RAW-INSTANCE-SET/" name))
                 (:policy :fast-safe)
                 (:args (object :scs (descriptor-reg))
                        (index :scs (any-reg))
-                       (value :scs (,value-sc) :target result))
+                       (value :scs (,value-sc)))
                 (:arg-types * positive-fixnum ,value-primtype)
-                (:results (result :scs (,value-sc)))
-                (:result-types ,value-primtype)
                 (:temporary (:scs (non-descriptor-reg)) offset)
                 ,@(when use-lip '((:temporary (:scs (interior-reg)) lip)))
-                (:generator 5 ,@(emit-generator set-inst t))))))))
+                (:generator 5 ,@(emit-generator set-inst nil)))))))
   (define-raw-slot-vops word ldr str unsigned-num unsigned-reg)
   (define-raw-slot-vops signed-word ldr str signed-num signed-reg)
   (define-raw-slot-vops single flds fsts single-float single-reg

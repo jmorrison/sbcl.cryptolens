@@ -19,37 +19,6 @@
 ;;; a compound object.
 (defconstant +max-hash-depthoid+ 4)
 
-;; Return a number that increments by 1 for each word-pair allocation,
-;; barring complications such as exhaustion of the current page.
-;; The result is guaranteed to be a positive fixnum.
-(declaim (inline address-based-counter-val))
-(defun address-based-counter-val ()
-  (let ((word
-         ;; threads imply gencgc. use the per-thread alloc region pointer
-         #+sb-thread
-         (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-alloc-region-slot))
-         #+(and (not sb-thread) cheneygc)
-         (sap-int (dynamic-space-free-pointer))
-         ;; dynamic-space-free-pointer increments only when a page is full.
-         ;; Using boxed_region directly is finer-grained.
-         #+(and (not sb-thread) gencgc)
-         (sb-sys:sap-ref-word (sb-sys:int-sap sb-vm::boxed-region) 0)))
-    ;; counter should increase by 1 for each cons cell allocated
-    (ash word (- (1+ sb-vm:word-shift)))))
-
-;;; Return some bits that are dependent on the next address that will be
-;;; allocated, mixed with the previous state (in case addresses get recycled).
-;;; This algorithm, used for stuffing a hash-code into instances of CTYPE
-;;; subtypes and generic functions, is simpler than RANDOM.
-;;; I don't know whether it is more random or less random than a PRNG,
-;;; but it's faster.
-(defun quasi-random-address-based-hash (state mask)
-  (declare (type (simple-array (and fixnum unsigned-byte) (1)) state))
-  ;; Ok with multiple threads - No harm, no foul.
-  (logand (setf (aref state 0) (mix (address-based-counter-val) (aref state 0)))
-          mask))
-
-
 ;;; This is an out-of-line callable entrypoint that the compiler can
 ;;; transform SXHASH into when hashing a non-simple string.
 (defun %sxhash-string (x)
@@ -90,10 +59,11 @@
 ;;; that's what I'm going with.
 ;;;
 (defun %instance-sxhash (instance)
-  ;; to avoid consing in fmix
-  (declare (inline #+64-bit murmur3-fmix64 #-64-bit murmur3-fmix32))
-  ;; FIXME: this special case might be removable, but there are callers
-  ;; of sxhash on layouts due to the expansion of TYPECASE.
+  ;; LAYOUT must not acquire an extra slot for the stable hash,
+  ;; because the bitmap length is derived from the instance length.
+  ;; It would probably be simple to eliminate this as a special case
+  ;; by ensuring that instances of LAYOUT commence life with a trailing
+  ;; hash slot and the SB-VM:HASH-SLOT-PRESENT-FLAG set.
   (when (typep instance 'layout)
     ;; This might be wrong if the clos-hash was clobbered to 0
     (return-from %instance-sxhash (layout-clos-hash instance)))
@@ -110,8 +80,7 @@
                    #+sb-thread (%primitive sb-vm::set-instance-hashed instance))
                  (get-lisp-obj-address instance))))
     ;; perturb the address
-    (logand (#+64-bit murmur3-fmix64 #-64-bit murmur3-fmix32 addr)
-            most-positive-fixnum)))
+    (murmur-hash-word/+fixnum addr)))
 
 (declaim (inline instance-sxhash))
 (defun instance-sxhash (instance)
@@ -119,13 +88,8 @@
                (instance-header-word (truly-the instance instance)))
       ;; easy case: 1 word beyond the apparent length is a word added
       ;; by GC (which may have resized the object, but we don't need to know).
-      (%instance-ref instance (%instance-length instance))
+      (truly-the hash-code (%instance-ref instance (%instance-length instance)))
       (%instance-sxhash instance)))
-
-;;; Object must be pinned to use this.
-(defmacro fsc-instance-trailer-hash (fin)
-  `(sap-ref-32 (int-sap (get-lisp-obj-address ,fin))
-               (- (+ (* 5 sb-vm:n-word-bytes) 4) sb-vm:fun-pointer-lowtag)))
 
 ;;; Return a pseudorandom number that was assigned on allocation.
 ;;; FIN is a STANDARD-FUNCALLABLE-INSTANCE but we don't care to type-check it.
@@ -135,15 +99,19 @@
 ;;; due to a change in the definition of a method-combination.
 (declaim (inline fsc-instance-hash))
 (defun fsc-instance-hash (fin)
-  (cond #+x86-64
-        ((= (logand (function-header-word (truly-the function fin)) #xFF00)
-            (ash 5 sb-vm:n-widetag-bits)) ; KLUDGE: 5 data words implies 2 raw words
-         ;; get the upper 4 bytes of wordindex 5
-         (with-pinned-objects (fin) (fsc-instance-trailer-hash fin)))
-        (t
-         (truly-the hash-code
-          (sb-pcl::standard-funcallable-instance-hash-code
-           (truly-the sb-pcl::standard-funcallable-instance fin))))))
+  (truly-the hash-code
+   #+executable-funinstances
+   (with-pinned-objects (fin)
+     (let ((hash (sb-vm::compact-fsc-instance-hash
+                  (truly-the sb-pcl::standard-funcallable-instance fin))))
+       ;; There is not more entropy imparted by doing a mix step on a value that had
+       ;; at most 32 bits of randomness, but this makes more of the bits vary.
+       ;; Some uses of the hash might expect the high bits to have randomness in them.
+       ;; This returns a positive fixnum to conform with the requirement on SXHASH.
+       (murmur-hash-word/+fixnum hash)))
+   #-executable-funinstances
+   (sb-pcl::standard-funcallable-instance-hash-code
+    (truly-the sb-pcl::standard-funcallable-instance fin))))
 
 (declaim (inline integer-sxhash))
 (defun integer-sxhash (x)
@@ -196,27 +164,22 @@
            (mix-chunk (word)
              `(setq result (word-mix ,word result)))
            (mix-remaining (word)
-             ;; N-BITS-REMAINING is between 1 inclusive and N-WORD-BITS exclusive
-             (let ((mask
-                    #+little-endian ; if all except 1 bit remain, right-shift by 1, etc
-                    `(ash most-positive-word (- n-bits-remaining sb-vm:n-word-bits))
-                    #+big-endian ; same, except left-shift (modularly)
-                    `(logand most-positive-word
-                             (ash most-positive-word
-                                  (- sb-vm:n-word-bits n-bits-remaining)))))
-               `(setq result (word-mix (logand ,word ,mask) result)))))
+             ;; In the current implementation of bit operations, they may leave random
+             ;; bits in an ignored suffix of bits, hence the need for a masking operation.
+             ;; (See examples above DEF-BIT-ARRAY-OP)
+             ;; N-BITS-REMAINING is between 1 inclusive and N-WORD-BITS exclusive.
+             ;; Produce a mask of 1s spanning the remaining bits, which would be
+             ;; (- n-word-bits n-bits-remaining) and logically AND it with word.
+             ;; The mask is equal mod N-WORD-BITS to (- n-bits-remaining).
+             ;; SHIFT-TOWARDS-START clips the shift count explicitly if the CPU doesn't.
+             `(mix-chunk (logand (shift-towards-start most-positive-word
+                                                      (- n-bits-remaining))
+                                 ,word))))
 (defun %sxhash-simple-bit-vector (x)
   (with-hash (result (length (truly-the simple-bit-vector x)))
     (multiple-value-bind (n-full-words n-bits-remaining) (floor (length x) sb-vm:n-word-bits)
       (dotimes (i n-full-words) (mix-chunk (%vector-raw-bits x i)))
       (when (plusp n-bits-remaining)
-        ;; FIXME: Do we really have to mask off bits of the final word?
-        ;; I don't think so, given that remaining bits are invariantly zero.
-        ;; Maybe this has to do with stack-allocated vectors?
-        ;; Either that, or it anticipates a change wherein we do not always
-        ;; prezero unboxed vectors unless :INITIAL-ELEMENT was specified.
-        ;; (i.e. you'd get random bytes, and so the only known good bits/bytes
-        ;; would appear where you had performed a SETF on them)
         (mix-remaining (%vector-raw-bits x n-full-words))))
     (logand result sb-xc:most-positive-fixnum)))
 (defun %sxhash-bit-vector (bit-vector)
@@ -280,7 +243,14 @@
              (%sxhash-simple-bit-vector (copy-seq bit-vector))))))))
 
 ;;; To avoid "note: Return type not fixed values ..."
+;;; PATHNAME-SXHASH can't easily be placed in pathname.lisp because that file
+;;; depends on LOGICAL-HOST but the definition of LOGICAL-HOST is complicated
+;;; and seems to belong where it is, in target-pathname.lisp, though maybe not.
 (declaim (ftype (sfunction (t) hash-code) pathname-sxhash))
+
+(defun sap-hash (x)
+  ;; toss in a LOGNOT so that (the word a) and (int-sap a) hash differently
+  (murmur-hash-word/+fixnum (logand (lognot (sap-int x)) most-positive-word)))
 
 (defun sxhash (x)
   ;; profiling SXHASH is hard, but we might as well try to make it go
@@ -299,8 +269,7 @@
   ;;    so we should pick off SYMBOL sooner than INSTANCE as well.
   ;;  * INSTANCE (except for PATHNAME) doesn't recurse anyway - in fact
   ;;    it is particularly dumb (by design), so performing that test later
-  ;;    doesn't incur much of a penalty. And our users probably know that
-  ;;    SXHASH on instance doesn't really do anything.
+  ;;    doesn't incur much of a penalty.
   ;; Anyway, afaiu, the code below was previously ordered by gut feeling
   ;; rather than than actual measurement, so having any rationale for ordering
   ;; is better than having no rationale. And as a further comment observes,
@@ -345,236 +314,230 @@
                 (logxor 72185131
                         (sxhash (char-code x)))) ; through DEFTRANSFORM
                (funcallable-instance
-                (if (layout-for-pcl-obj-p (%fun-layout x))
+                (if (logtest (layout-flags (%fun-layout x)) +pcl-object-layout-flag+)
                     ;; We have a hash code, so might as well use it.
                     (fsc-instance-hash x)
                     ;; funcallable structure, not funcallable-standard-object
                     9550684))
+               (system-area-pointer (sap-hash x))
                (t 42))))
     (sxhash-recurse x +max-hash-depthoid+)))
 
 ;;;; the PSXHASH function
 
-;;; To avoid "note: Return type not fixed values ..."
-(declaim (ftype (sfunction (number) hash-code) number-psxhash))
-
 ;;; like SXHASH, but for EQUALP hashing instead of EQUAL hashing
+(macrolet ((hash-float (type key)
+             ;; Floats that represent integers must hash as the integer would.
+             (let ((lo (symbol-value (package-symbolicate :sb-kernel 'most-negative-fixnum- type)))
+                   (hi (symbol-value (package-symbolicate :sb-kernel 'most-positive-fixnum- type)))
+                   (bignum-hash (symbolicate 'sxhash-bignum- type)))
+               `(let ((key ,key))
+                  (declare (inline float-infinity-p))
+                  (cond (;; This clause allows FIXNUM-sized integer
+                         ;; values to be handled without consing.
+                         (<= ,lo key ,hi)
+                         (multiple-value-bind (q r) (truly-the fixnum (floor (the (,type ,lo ,hi) key)))
+                           (if (zerop (the ,type r))
+                               (sxhash q)
+                               (sxhash (coerce key 'double-float)))))
+                        ((float-infinity-p key)
+                         ;; {single,double}-float infinities are EQUALP
+                         (if (minusp key)
+                             (sxhash sb-ext:single-float-negative-infinity)
+                             (sxhash sb-ext:single-float-positive-infinity)))
+                        #+64-bit
+                        (t
+                         (,bignum-hash key))
+                        #-64-bit
+                        (t
+                         ,(if (eq type 'double-float)
+                              `(multiple-value-bind (q r) (floor key)
+                                 (if (zerop (the ,type r))
+                                     (sxhash q)
+                                     (sxhash key)))
+                              `(,bignum-hash key))))))))
 (defun psxhash (key)
   (declare (optimize speed))
   (labels
-    ((array-psxhash (key depthoid)
-       (declare (type array key))
-       (declare (type (integer 0 #.+max-hash-depthoid+) depthoid))
-       (if (vectorp key)
-           ;; VECTORs have to be treated specially because ANSI specifies
-           ;; that we must respect fill pointers.
-           (let ((result 572539))
-             (declare (type hash-code result))
-             (mixf result (length key))
-             (when (plusp depthoid)
-               (decf depthoid)
-               (macrolet ((traverse (element-hasher)
-                            `(dotimes (i (length key))
-                               (declare (type index i))
-                               (mixf result
-                                     ,(ecase element-hasher
-                                        (character `(char-code (char-upcase (aref key i))))
-                                        (integer `(sxhash (aref key i)))
-                                        (number `(number-psxhash (aref key i)))
-                                        (:default `(%psxhash (aref key i) depthoid)))))))
-                 (typecase key
-                   ;; There are two effects from the typecase:
-                   ;;  1. using a specialized array reffer
-                   ;;  2. dispatching to a specific hash function
-                   (simple-base-string (traverse character))           ; both effects
-                   ((simple-array character (*)) (traverse character)) ; ""
-                   (simple-vector (traverse :default))                 ; effect #1 only
-                   ((simple-array (unsigned-byte 8) (*)) (traverse integer)) ; both effects
-                   ;; this seems arbitrary. I think (simple-array word (*)) is more popular!
-                   ((simple-array fixnum (*)) (traverse integer))      ; both effects
-                   (string (traverse character))                       ; effect #2 only
-                   ((vector t) (traverse :default)) ; weed out non-simple T vector from final case
-                   (t (traverse number)))))         ; all else - effect #2 only
-             result)
-           ;; Any other array can be hashed by working with its underlying
-           ;; one-dimensional physical representation.
-           (let ((result 60828))
-             (declare (type fixnum result))
-             (dotimes (i (array-rank key))
-               (mixf result (%array-dimension key i)))
-             (when (plusp depthoid)
-               (decf depthoid)
-               (with-array-data ((key key) (start) (end))
-                 (let ((getter (truly-the function (svref %%data-vector-reffers%%
-                                                          (%other-pointer-widetag key)))))
-                   (loop for i from start below end
-                         do (mixf result (%psxhash (funcall getter key i) depthoid))))))
-             result)))
-     (structure-object-psxhash (key depthoid)
-       ;; Compute a PSXHASH for KEY. Salient points:
-       ;; * It's not enough to use the bitmap to figure out how to mix in raw slots.
-       ;;   The floating-point types all need special treatment. And we want to avoid
-       ;;   consing, so we can't very well call PSXHASH.
-       ;; * Even though PSXHASH requires that numerically equal numbers have the same
-       ;;   hash e.g. 12 and 12d0 and #c(12d0 0d0) all hash the same, structures can
-       ;;   weaken that restriction: instances are EQUAL only if they are of the same
-       ;;   type and slot-for-slot EQUAL. So a float in a raw slot can't be EQUAL
-       ;;   to a word in a different raw slot. In fact we don't even require that
-       ;;   SINGLE- and DOUBLE-float hash the same for a given numerical value,
-       ;;   because a raw slot can't hold either/or. But -0 and +0 must hash the same.
-       (declare (type structure-object key))
-       (declare (type (integer 0 #.+max-hash-depthoid+) depthoid))
-       (macrolet ((rsd-index+1 (dsd)
-                    ;; Return 0 if the DSD is not raw, otherwise 1+ the index into
-                    ;; *RAW-SLOT-DATA*. This is exactly the low 3 bits of DSD-BITS.
-                    `(truly-the (mod ,(1+ (length sb-kernel::*raw-slot-data*)))
-                                (ldb (byte 3 0) (sb-kernel::dsd-bits ,dsd))))
-                  (raw-cases ()
-                    (flet ((1+index-of (type)
-                             (1+ (position type sb-kernel::*raw-slot-data*
-                                           :key #'sb-kernel::raw-slot-data-raw-type)))
-                           (mix-float (val zero)
-                             `(let ((x ,val))
-                                (mixf result (sxhash (if (= x ,zero) ,zero x))))))
-                      ;; This compiles to a jump table if supported
-                      `(case rsd-index+1
-                        ((,(1+index-of 'word) ,(1+index-of 'sb-vm:signed-word))
-                         ;; Access as unsigned. +X and -X hash differently because
-                         ;; of 2's complement, so disregarding the sign bit is fine.
-                         (mixf result (logand (%raw-instance-ref/word key i)
-                                              most-positive-fixnum)))
-                        (,(1+index-of 'single-float)
-                         ,(mix-float '(%raw-instance-ref/single key i) $0f0))
-                        (,(1+index-of 'double-float)
-                         ,(mix-float '(%raw-instance-ref/double key i) $0d0))
-                        (,(1+index-of 'sb-kernel:complex-single-float)
-                         (let ((cplx (%raw-instance-ref/complex-single key i)))
-                           ,(mix-float '(realpart cplx) $0f0)
-                           ,(mix-float '(imagpart cplx) $0f0)))
-                        (,(1+index-of 'sb-kernel:complex-double-float)
-                         (let ((cplx (%raw-instance-ref/complex-double key i)))
-                           ,(mix-float '(realpart cplx) $0d0)
-                           ,(mix-float '(imagpart cplx) $0d0)))))))
-         (let* ((layout (%instance-layout key))
-                (result (layout-clos-hash layout)))
-           (declare (type fixnum result))
+      ((data-vector-hash (data start end depthoid)
+         (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+         (let ((result 572539))
+           (declare (type hash-code result))
            (when (plusp depthoid)
-             (let ((max-iterations depthoid)
-                   (depthoid (1- depthoid)))
-               (declare (index max-iterations))
-               (if (/= (layout-bitmap layout) +layout-all-tagged+)
-                   (let ((slots (dd-slots (layout-dd layout))))
-                     (loop (unless slots (return))
-                           (let* ((slot (pop slots))
-                                  (rsd-index+1 (rsd-index+1 slot))
-                                  (i (dsd-index slot)))
-                             (cond ((= rsd-index+1 0) ; non-raw
-                                    (mixf result (%psxhash (%instance-ref key i) depthoid))
-                                    (if (zerop (decf max-iterations)) (return)))
-                                   (t
-                                    ;; Don't decrement MAX-ITERATIONS.
-                                    ;; These can't cause unbounded work.
-                                    (raw-cases))))))
-                   (let ((len (%instance-length key))
-                         ;; Don't mix in LAYOUT (if it takes a slot) because it was the seed value.
-                         (i sb-vm:instance-data-start))
-                     (declare (index i))
-                     (loop (when (>= i len) (return))
-                           (mixf result (%psxhash (%instance-ref key i) depthoid))
-                           (incf i)
-                           (if (zerop (decf max-iterations)) (return)))))))
-           result)))
-     (%psxhash (key depthoid)
-       (typecase key
-         (array (array-psxhash key depthoid))
-         (structure-object
-          (cond ((hash-table-p key)
-                 ;; This is a purposely not very strong hash so that it does not make any
-                 ;; distinctions that EQUALP does not make. Computing a hash of the k/v pair
-                 ;; vector would incorrectly take insertion order into account.
-                 (mix (mix 103924836 (hash-table-count key))
-                      (sxhash (hash-table-test key))))
-                ((pathnamep key) (pathname-sxhash key))
-                (t
-                 (structure-object-psxhash key depthoid))))
-         (list
-          (cond ((null key)
-                 (the fixnum 480929))
-                ((eql depthoid 0)
-                 (the fixnum 779578))
-                (t
-                 (let ((depthoid (1- (truly-the (integer 0 #.+max-hash-depthoid+)
-                                                depthoid))))
-                   (mix (%psxhash (car key) depthoid)
-                        (%psxhash (cdr key) depthoid))))))
-         (number (number-psxhash key))
-         (character (char-code (char-upcase key)))
-         (t (sxhash key)))))
+             (decf depthoid)
+             (macrolet ((traverse (et &aux (elt '(aref data i)))
+                          `(let ((data (truly-the (simple-array ,et (*)) data)))
+                             (loop for i fixnum from (truly-the fixnum start)
+                                   below (truly-the fixnum end)
+                                   do (mixf result
+                                            ,(case et
+                                               ((t) `(%psxhash ,elt depthoid))
+                                               ((base-char character)
+                                                `(char-code (char-upcase ,elt)))
+                                               (single-float `(sfloat-psxhash ,elt))
+                                               (double-float `(dfloat-psxhash ,elt))
+                                               ;; the remaining types are integers and complex numbers.
+                                               ;; COMPLEX will cons here, as will word-sized
+                                               ;; integers. Nothing else should though.
+                                               (t `(sxhash ,elt)))))))) ; xformed
+               (typecase data
+                 ;; There are two effects of this typecase:
+                 ;;  1. using an optimized array reader
+                 ;;  2. dispatching to a type-specific hash function
+                 (simple-vector (traverse t)) ; effect #1 only
+                 (simple-base-string (traverse base-char)) ; both effects
+                 #+sb-unicode (simple-character-string (traverse character))  ; both
+                 ((simple-array single-float (*)) (traverse single-float)) ; and so on
+                 ((simple-array double-float (*)) (traverse double-float))
+                 ;; (SIMPLE-ARRAY WORD (*)) would be helpful to avoid consing,
+                 ;; but there is no SXHASH transform on word-sized integers.
+                 ;; It might be possible to do something involving WORD-MIX.
+                 ((simple-array fixnum (*)) (traverse fixnum))
+                 (t
+                  (let ((getter (svref %%data-vector-reffers%% (%other-pointer-widetag data))))
+                    (loop for i fixnum from (truly-the fixnum start) below (truly-the fixnum end)
+                          do (mixf result (number-psxhash (funcall getter data i)))))))))
+             result))
+       (structure-object-psxhash (key depthoid)
+         ;; Compute a PSXHASH for KEY. Salient points:
+         ;; * It's not enough to use the bitmap to figure out how to mix in raw slots.
+         ;;   The floating-point types all need special treatment. And we want to avoid
+         ;;   consing, so we can't very well call PSXHASH.
+         ;; * Even though PSXHASH requires that numerically equal numbers have the same
+         ;;   hash e.g. 12 and 12d0 and #c(12d0 0d0) all hash the same, structures can
+         ;;   weaken that restriction: instances are EQUAL only if they are of the same
+         ;;   type and slot-for-slot EQUAL. So a float in a raw slot can't be EQUAL
+         ;;   to a word in a different raw slot. In fact we don't even require that
+         ;;   SINGLE- and DOUBLE-float hash the same for a given numerical value,
+         ;;   because a raw slot can't hold either/or. But -0 and +0 must hash the same.
+         (declare (type structure-object key))
+         (declare (type (integer 0 #.+max-hash-depthoid+) depthoid))
+         (macrolet ((rsd-index+1 (dsd)
+                      ;; Return 0 if the DSD is not raw, otherwise 1+ the index into
+                      ;; *RAW-SLOT-DATA*. This is exactly the low 3 bits of DSD-BITS.
+                      `(truly-the (mod ,(1+ (length sb-kernel::*raw-slot-data*)))
+                         (ldb (byte 3 0) (sb-kernel::dsd-bits ,dsd))))
+                    (raw-cases ()
+                      (flet ((1+index-of (type)
+                               (1+ (position type sb-kernel::*raw-slot-data*
+                                             :key #'sb-kernel::raw-slot-data-raw-type)))
+                             (mix-float (val zero)
+                               `(let ((x ,val))
+                                  (mixf result (sxhash (if (= x ,zero) ,zero x))))))
+                        ;; This compiles to a jump table if supported
+                        `(case rsd-index+1
+                           ((,(1+index-of 'word) ,(1+index-of 'sb-vm:signed-word))
+                            ;; Access as unsigned. +X and -X hash differently because
+                            ;; of 2's complement, so disregarding the sign bit is fine.
+                            (mixf result (logand (%raw-instance-ref/word key i)
+                                                 most-positive-fixnum)))
+                           (,(1+index-of 'single-float)
+                            ,(mix-float '(%raw-instance-ref/single key i) $0f0))
+                           (,(1+index-of 'double-float)
+                            ,(mix-float '(%raw-instance-ref/double key i) $0d0))
+                           (,(1+index-of 'sb-kernel:complex-single-float)
+                            (let ((cplx (%raw-instance-ref/complex-single key i)))
+                              ,(mix-float '(realpart cplx) $0f0)
+                              ,(mix-float '(imagpart cplx) $0f0)))
+                           (,(1+index-of 'sb-kernel:complex-double-float)
+                            (let ((cplx (%raw-instance-ref/complex-double key i)))
+                              ,(mix-float '(realpart cplx) $0d0)
+                              ,(mix-float '(imagpart cplx) $0d0)))))))
+           (let* ((layout (%instance-layout key))
+                  (result (layout-clos-hash layout)))
+             (declare (type fixnum result))
+             (when (plusp depthoid)
+               (let ((depthoid (1- depthoid))
+                     (dd (layout-dd layout)))
+                 (if (/= (sb-kernel::dd-bitmap dd) +layout-all-tagged+)
+                     (let ((slots (dd-slots dd)))
+                       (loop (unless slots (return))
+                             (let* ((slot (pop slots))
+                                    (rsd-index+1 (rsd-index+1 slot))
+                                    (i (dsd-index slot)))
+                               (cond ((= rsd-index+1 0) ; non-raw
+                                      (mixf result (%psxhash (%instance-ref key i) depthoid)))
+                                     (t
+                                      (raw-cases))))))
+                     (let ((len (%instance-length key))
+                           ;; Don't mix in LAYOUT (if it takes a slot) because it was the seed value.
+                           (i sb-vm:instance-data-start))
+                       (declare (index i))
+                       (loop (when (>= i len) (return))
+                             (mixf result (%psxhash (%instance-ref key i) depthoid))
+                             (incf i))))))
+             result)))
+       (sfloat-psxhash (key)
+         (declare (single-float key))
+         (hash-float single-float key))
+       (dfloat-psxhash (key)
+         (declare (double-float key))
+         (hash-float double-float key))
+       (number-psxhash (key)
+         (declare (type number key)
+                  (muffle-conditions compiler-note))
+         (macrolet ((hash-complex (hasher)
+                      `(if (zerop (imagpart key))
+                           (,hasher (realpart key))
+                           ;; I'm not sure what the point of an additional mix step
+                           ;; with a constant was. Maybe trying to get it not to hash
+                           ;; like a ratio whose num/den are equal to the real and imag
+                           ;; parts of a complex number? That seems silly.
+                           ;; But sure, let's do something like it, but simpler.
+                           ;; (It might hash like a cons of these integers anyway)
+                           (logand (lognot (mix (,hasher (realpart key)) (,hasher (imagpart key))))
+                                   most-positive-fixnum))))
+           (etypecase key
+             (integer (sxhash key))
+             (single-float (sfloat-psxhash key))
+             (double-float (dfloat-psxhash key))
+             (rational (if (and (<= most-negative-double-float
+                                    key
+                                    most-positive-double-float)
+                                (= (coerce key 'double-float) key))
+                           (sxhash (coerce key 'double-float))
+                           ;; a rational for which '=' does not return T when compared
+                           ;; to itself cast as double-float need to have the same hash
+                           ;; as any float. That's why this case is legitimate.
+                           (sxhash key)))
+             ((complex double-float) (hash-complex dfloat-psxhash))
+             ((complex single-float) (hash-complex sfloat-psxhash))
+             ((complex rational)     (hash-complex number-psxhash)))))
+       (%psxhash (key depthoid)
+         (typecase key
+           (array
+            (if (vectorp key)
+                (with-array-data ((a key) (start) (end) :force-inline t :check-fill-pointer t)
+                  (mix (data-vector-hash a start end depthoid) (length key)))
+                (with-array-data ((a key) (start) (end) :force-inline t :array-header-p t)
+                  (let ((result (data-vector-hash a start end depthoid)))
+                    (dotimes (i (array-rank key) result)
+                      (mixf result (%array-dimension key i)))))))
+           (structure-object
+            (cond ((hash-table-p key)
+                   ;; This is a purposely not very strong hash so that it does not make any
+                   ;; distinctions that EQUALP does not make. Computing a hash of the k/v pair
+                   ;; vector would incorrectly take insertion order into account.
+                   (mix (mix 103924836 (hash-table-count key))
+                        (sxhash (hash-table-test key))))
+                  ((pathnamep key) (pathname-sxhash key))
+                  (t
+                   (structure-object-psxhash key depthoid))))
+           (list
+            (cond ((null key)
+                   (the fixnum 480929))
+                  ((eql depthoid 0)
+                   (the fixnum 779578))
+                  (t
+                   (let ((depthoid (1- (truly-the (integer 0 #.+max-hash-depthoid+)
+                                                  depthoid))))
+                     (mix (%psxhash (car key) depthoid)
+                          (%psxhash (cdr key) depthoid))))))
+           (number (number-psxhash key))
+           (character (char-code (char-upcase key)))
+           (t (sxhash key)))))
     (%psxhash key +max-hash-depthoid+)))
-
-(defun number-psxhash (key)
-  (declare (type number key)
-           (explicit-check)
-           (muffle-conditions compiler-note)
-           (optimize speed))
-  (flet ((sxhash-double-float (val)
-           (declare (type double-float val))
-           ;; FIXME: Check to make sure that the DEFTRANSFORM kicks in and the
-           ;; resulting code works without consing. (In Debian cmucl 2.4.17,
-           ;; it didn't.)
-           (sxhash val)))
-    (macrolet ((hash-float (type key)
-                 (let ((lo (coerce most-negative-fixnum type))
-                       (hi (coerce most-positive-fixnum type)))
-                   `(let ((key ,key))
-                      (cond ( ;; This clause allows FIXNUM-sized integer
-                             ;; values to be handled without consing.
-                             (<= ,lo key ,hi)
-                             (multiple-value-bind (q r)
-                                 (floor (the (,type ,lo ,hi) key))
-                               (if (zerop (the ,type r))
-                                   (sxhash q)
-                                   (sxhash-double-float
-                                    (coerce key 'double-float)))))
-                            ((float-infinity-p key)
-                             ;; {single,double}-float infinities are EQUALP
-                             (if (minusp key)
-                                 (sxhash sb-ext:single-float-negative-infinity)
-                                 (sxhash sb-ext:single-float-positive-infinity)))
-                            (t
-                             (multiple-value-bind (q r) (floor key)
-                               (if (zerop (the ,type r))
-                                   (sxhash q)
-                                   (sxhash-double-float
-                                    (coerce key 'double-float)))))))))
-               (hash-complex (&optional (hasher '(number-psxhash)))
-                 `(if (zerop (imagpart key))
-                      (,@hasher (realpart key))
-                      (let ((result 330231))
-                        (declare (type fixnum result))
-                        (mixf result (,@hasher (realpart key)))
-                        (mixf result (,@hasher (imagpart key)))
-                        result))))
-     (etypecase key
-       (integer (sxhash key))
-       (float (macrolet ()
-                (etypecase key
-                  (single-float (hash-float single-float key))
-                  (double-float (hash-float double-float key))
-                  #+long-float
-                  (long-float (error "LONG-FLOAT not currently supported")))))
-       (rational (if (and (<= most-negative-double-float
-                              key
-                              most-positive-double-float)
-                          (= (coerce key 'double-float) key))
-                     (sxhash-double-float (coerce key 'double-float))
-                     (sxhash key)))
-       ((complex double-float)
-        (hash-complex (hash-float double-float)))
-       ((complex single-float)
-        (hash-complex (hash-float single-float)))
-       ((complex rational)
-        (hash-complex))))))
+) ; end MACROLET
 
 ;;; Semantic equivalent of SXHASH, but better-behaved for function names.
 ;;; It performs more work by not cutting off as soon in the CDR direction.
@@ -603,20 +566,3 @@
 
 ;;; Not needed post-build
 (clear-info :function :inlining-data '%sxhash-simple-substring)
-
-(defun show-hashed-instances ()
-  (flet ((foo (legend pred)
-           (format t "~&Instances in ~a state:~%" legend)
-           (sb-vm:map-allocated-objects pred :all)))
-    (foo "HASHED+MOVED"
-         (lambda (obj type size)
-           (declare (ignore size))
-           (when (and (= type sb-vm:instance-widetag)
-                      (logbitp 9 (instance-header-word obj)))
-             (format t "~x ~s~%" (get-lisp-obj-address obj) obj))))
-    (foo "HASHED (unmoved)"
-         (lambda (obj type size)
-           (declare (ignore size))
-           (when (and (= type sb-vm:instance-widetag)
-                      (= (ldb (byte 2 8) (instance-header-word obj)) 1))
-             (format t "~x ~s~%" (get-lisp-obj-address obj) obj))))))

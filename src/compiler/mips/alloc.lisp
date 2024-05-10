@@ -10,28 +10,41 @@
 ;;;; files for more information.
 
 (in-package "SB-VM")
+
+(defun allocation (type size result lowtag temps &key stackp)
+  (cond (stackp
+         (align-csp (car temps) (cadr temps))
+         (inst or result csp-tn lowtag)
+         (inst add csp-tn size))
+        (t
+         (let ((end-addr (car temps))
+               (new-freeptr (cadr temps))
+               (region-offset (if (eq type 'list)
+                                  cons-region-offset
+                                  mixed-region-offset)))
+           (without-scheduling ()
+             (inst lw result null-tn (- region-offset nil-value-offset))
+             (inst lw end-addr null-tn (+ 4 (- region-offset nil-value-offset)))
+             (inst add new-freeptr result size)
+             (inst tltu end-addr new-freeptr
+                   (logior (if (eq type 'list) #x100 0) (reg-tn-encoding result)))
+             (inst sw new-freeptr null-tn (- region-offset nil-value-offset))
+             (unless (= lowtag 0)
+               (inst or result lowtag)))))))
 
 ;;;; LIST and LIST*
-(define-vop (list-or-list*)
-  (:args (things :more t))
+(define-vop (list)
+  (:args (things :more t :scs (any-reg descriptor-reg zero null control-stack)))
   (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
-  (:info num)
+  (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
-  (:variant-vars star)
-  (:policy :safe)
   (:node-var node)
   (:generator 0
-    (cond ((zerop num)
-           (move result null-tn))
-          ((and star (= num 1))
-           (move result (tn-ref-tn things)))
-          (t
-           (macrolet
-               ((store-car (tn list &optional (slot cons-car-slot))
+    (macrolet ((store-car (tn list &optional (slot cons-car-slot))
                   `(let ((reg
                           (sc-case ,tn
                             ((any-reg descriptor-reg zero null)
@@ -40,17 +53,11 @@
                              (load-stack-tn temp ,tn)
                              temp))))
                      (storew reg ,list ,slot list-pointer-lowtag))))
-             (let* ((dx-p (node-stack-allocate-p node))
-                    (cons-cells (if star (1- num) num))
-                    (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag :extra (if dx-p 0 alloc))
-                 (when dx-p
-                   (align-csp res))
-                 (inst srl res (if dx-p csp-tn alloc-tn) n-lowtag-bits)
-                 (inst sll res n-lowtag-bits)
-                 (inst or res list-pointer-lowtag)
-                 (when dx-p
-                   (inst addu csp-tn alloc))
+      (let ((dx-p (node-stack-allocate-p node))
+            (alloc (* (pad-data-block cons-size) cons-cells)))
+        (pseudo-atomic (pa-flag :elide-if dx-p)
+                 (allocation 'list alloc res list-pointer-lowtag
+                             `(,pa-flag ,temp) :stackp dx-p)
                  (move ptr res)
                  (dotimes (i (1- cons-cells))
                    (store-car (tn-ref-tn things) ptr)
@@ -67,13 +74,7 @@
                         (storew null-tn ptr
                                 cons-cdr-slot list-pointer-lowtag)))
                  (aver (null (tn-ref-across things)))
-                 (move result res))))))))
-
-(define-vop (list list-or-list*)
-  (:variant nil))
-
-(define-vop (list* list-or-list*)
-  (:variant t))
+                 (move result res))))))
 
 ;;;; Special purpose inline allocators.
 
@@ -87,6 +88,7 @@
               positive-fixnum)
   (:temporary (:sc non-descriptor-reg) bytes)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
+  (:temporary (:sc non-descriptor-reg) temp)
   (:results (result :scs (descriptor-reg) :from :load))
   (:policy :fast-safe)
   (:generator 100
@@ -95,8 +97,7 @@
     (inst srl bytes n-lowtag-bits)
     (inst sll bytes n-lowtag-bits)
     (pseudo-atomic (pa-flag)
-      (inst or result alloc-tn other-pointer-lowtag)
-      (inst addu alloc-tn bytes)
+      (allocation type bytes result other-pointer-lowtag `(,pa-flag ,temp))
       (storew type result 0 other-pointer-lowtag)
       (storew length result vector-length-slot other-pointer-lowtag))))
 
@@ -118,8 +119,8 @@
     (inst srl bytes n-lowtag-bits)
     (inst sll bytes n-lowtag-bits)
     ;; FIXME: It would be good to check for stack overflow here.
-    (pseudo-atomic (pa-flag)
-      (align-csp temp)
+    (pseudo-atomic (pa-flag) ; FIXME: why pseudo-atomic on stack?
+      (align-csp temp pa-flag)
       (inst or result csp-tn other-pointer-lowtag)
       (inst addu temp csp-tn (* vector-data-offset n-word-bytes))
       (inst addu csp-tn bytes)
@@ -130,7 +131,7 @@
         (storew zero-tn temp 0)
         (inst bne temp csp-tn loop)
         (inst addu temp n-word-bytes))
-      (align-csp temp))))
+      (align-csp temp pa-flag)))) ; why do it again???
 
 (define-vop (make-fdefn)
   (:policy :fast-safe)
@@ -156,15 +157,9 @@
   (:generator 10
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
-      (pseudo-atomic (pa-flag :extra (if stack-allocate-p 0 alloc-size))
-        (cond (stack-allocate-p
-               (align-csp result)
-               (inst srl result csp-tn n-lowtag-bits)
-               (inst addu csp-tn alloc-size))
-              (t
-               (inst srl result alloc-tn n-lowtag-bits)))
-        (inst sll result n-lowtag-bits)
-        (inst or result fun-pointer-lowtag)
+      (pseudo-atomic (pa-flag :elide-if stack-allocate-p)
+        (allocation closure-widetag alloc-size result fun-pointer-lowtag
+                    `(,pa-flag ,temp) :stackp stack-allocate-p)
         (inst li temp (logior (ash (1- size) n-widetag-bits)
                               closure-widetag))
         (storew temp result 0 fun-pointer-lowtag)
@@ -190,12 +185,6 @@
   (:generator 1
     (inst li result unbound-marker-widetag)))
 
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst li result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
-
 (define-vop (fixed-alloc)
   (:args)
   (:info name words type lowtag stack-allocate-p)
@@ -204,23 +193,15 @@
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:generator 4
-    (pseudo-atomic (pa-flag :extra (if stack-allocate-p
-                                       0
-                                       (pad-data-block words)))
+    (pseudo-atomic (pa-flag)
       (cond (stack-allocate-p
-             (align-csp result)
+             (align-csp result pa-flag)
              (inst or result csp-tn lowtag)
              (inst addu csp-tn (pad-data-block words)))
             (t
-             ;; The pseudo-atomic bit in alloc-tn is set.  If the
-             ;; lowtag also has a 1 bit in the same position, we're all
-             ;; set.  Otherwise, we need to subtract the pseudo-atomic
-             ;; bit.
-             (inst or result alloc-tn (if (logbitp 0 lowtag) lowtag
-                                                             (1- lowtag)))))
-      (when type
-        (inst li temp (logior (ash (1- words) (length-field-shift type)) type))
-        (storew temp result 0 lowtag)))))
+             (allocation type (pad-data-block words) result lowtag `(,pa-flag ,temp))))
+      (inst li temp (compute-object-header words type))
+      (storew temp result 0 lowtag))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
@@ -229,7 +210,7 @@
   (:ignore name stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (any-reg)) bytes)
-  (:temporary (:scs (non-descriptor-reg)) header)
+  (:temporary (:scs (non-descriptor-reg)) header temp)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:generator 6
     (inst addu bytes extra (* (1+ words) n-word-bytes))
@@ -243,7 +224,5 @@
            (inst srl bytes bytes n-lowtag-bits)
            (inst sll bytes bytes n-lowtag-bits)))
     (pseudo-atomic (pa-flag)
-      (inst or result alloc-tn lowtag)
-      (storew header result 0 lowtag)
-      (inst addu alloc-tn alloc-tn bytes))))
-
+      (allocation type bytes result lowtag `(,pa-flag ,temp))
+      (storew header result 0 lowtag))))

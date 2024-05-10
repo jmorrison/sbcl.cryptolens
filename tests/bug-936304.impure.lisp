@@ -11,9 +11,11 @@
   (let* ((x (make-array (truncate #-sb-safepoint (* 0.2 (dynamic-space-size))
                                   #+sb-safepoint (* 0.1 (dynamic-space-size))
                                   sb-vm:n-word-bytes))))
+    (setf (elt x 0) t)
     (elt x 0)))
 
-(with-test (:name :bug-936304)
+(with-test (:name :bug-936304
+                  :skipped-on :gc-stress)
   (gc :full t)
   (assert (eq :ok (handler-case
                        (progn

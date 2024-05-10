@@ -1,6 +1,5 @@
 #include "os.h"
-#include "gencgc-alloc-region.h"
-#include "genesis/thread.h"
+#include "thread.h"
 #include <signal.h>
 
 int arch_os_thread_init(struct thread __attribute__((unused)) *thread) {
@@ -11,9 +10,6 @@ int arch_os_thread_cleanup(struct thread __attribute__((unused)) *thread) {
     return 1;
 }
 
-os_context_register_t *os_context_pc_addr(os_context_t *context) {
-    return (os_context_register_t *)&context->uc_mcontext.rip;
-}
 os_context_register_t *os_context_sp_addr(os_context_t *context) {
     return (os_context_register_t *)&context->uc_mcontext.rsp;
 }
@@ -46,10 +42,10 @@ os_restore_fp_control(os_context_t *context)
     // just guessing here
 
     /* reset exception flags and restore control flags on SSE2 FPU */
-    unsigned int temp = (context->uc_mcontext.fpu.mxcsr) & ~0x3F;
+    unsigned int temp = (context->uc_mcontext.fpu.fp_fxsave.mxcsr) & ~0x3F;
     asm ("ldmxcsr %0" : : "m" (temp));
     /* same for x87 FPU. */
-    asm ("fldcw %0" : : "m" (context->uc_mcontext.fpu.control));
+    asm ("fldcw %0" : : "m" (context->uc_mcontext.fpu.fp_fxsave.control));
 }
 
 void

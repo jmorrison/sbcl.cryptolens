@@ -20,7 +20,7 @@
 ;;; This should be put into composite-immediate-instruction, but that
 ;;; macro is too scary.
 (defun load-repeating-pattern (dest val)
-  (declare (type (signed-byte 32) val))
+  (declare (type (unsigned-byte 32) val))
   (inst mov dest (ldb (byte 8 0) val))
   (inst orr dest dest (mask-field (byte 8 8) val))
   (inst orr dest dest (lsl dest 16)))
@@ -57,7 +57,15 @@
       (null
        (move y null-tn))
       (symbol
-       (load-symbol y val)))))
+       (load-symbol y val))
+      (structure-object
+       (if (eq val sb-lockless:+tail+)
+           ;; same comment as for LOAD-SYMBOL - how is this guaranteed
+           ;; to be GC-safe ? Because we always ignore static-space pointers ?
+           (composite-immediate-instruction add y null-tn
+             (- lockfree-list-tail-value-offset
+                nil-value-offset))
+           (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
   ((immediate)

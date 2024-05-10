@@ -15,7 +15,10 @@
 ;;;  - garbage_collect: no SP known for thread 0x802bea000 (OS 34367133952)
 ;;;  - failed AVER: (NOT (SB-THREAD::AVL-FIND ADDR SB-THREAD::OLD))
 
-#+(or (not sb-thread) freebsd) (sb-ext:exit :code 104)
+#+(or (not sb-thread) freebsd) (invoke-restart 'run-tests::skip-file)
+
+(setf (generation-number-of-gcs-before-promotion 0) 5)
+(setf (generation-number-of-gcs-before-promotion 1) 3)
 
 #+win32
 (with-scratch-file (solib "dll")
@@ -39,10 +42,10 @@
       (sb-alien:load-shared-object solib)))
 
 ;;;; Just exercise a ton of calls from 1 thread
-(sb-alien::define-alien-callback perftestcb int () 0)
+(define-alien-callable perftestcb int () 0)
 (defun trivial-call-test (n)
   (with-alien ((testfun (function int system-area-pointer int) :extern "minimal_perftest"))
-    (alien-funcall testfun (alien-sap perftestcb) n)))
+    (alien-funcall testfun (alien-sap (alien-callable-function 'perftestcb)) n)))
 (time (trivial-call-test 200000))
 
 ;;;;
@@ -56,7 +59,7 @@
 (defglobal *print-greetings-and-salutations* (or #+linux t))
 
 (defglobal *semaphore* nil)
-(sb-alien::define-alien-callback testcb int ((arg1 c-string) (arg2 double))
+(define-alien-callable testcb int ((arg1 c-string) (arg2 double))
   (when *semaphore* (sb-thread:signal-semaphore *semaphore*))
   (let ((cell (assoc sb-thread:*current-thread* *seen-threads*))
         (result (floor (* (length arg1) arg2))))
@@ -110,23 +113,18 @@
                 (loop
                  (gc)
                  (incf *n-gcs*)
-                 (sleep .0001)
+                 (sleep .0005)
                  (sb-thread:barrier (:read))
                  (if (not *keepon*) (return)))))))
           (start (get-internal-real-time)))
       (setq *keepon* t)
       (with-alien ((testfun (function int system-area-pointer int int)
                             :extern "call_thing_from_threads"))
-        (assert (eql (alien-funcall testfun (alien-sap testcb) n-threads n-calls)
+        (assert (eql (alien-funcall testfun (alien-sap (alien-callable-function 'testcb)) n-threads n-calls)
                      1)))
       (setq *keepon* nil)
       (sb-thread:barrier (:write))
       (let ((stop (get-internal-real-time)))
-        #+darwin
-        (with-alien ((count int :extern "sigwait_bug_mitigation_count"))
-          (when (plusp count)
-            (format t "Bug mitigation strategy applied ~D time~:P~%" count)
-            (setf count 0)))
         (sb-thread:join-thread watchdog-thread)
         (when gc-thr
           (sb-thread:join-thread gc-thr)
@@ -154,11 +152,11 @@
   (f 5 5 200 t))
 
 ;;; The next test hasn't been made to run on windows, but should.
-#+win32 (exit :code 104)
+#+win32 (invoke-restart 'run-tests::skip-file)
 
 ;;; Check that you get an error trying to join a foreign thread
 (defglobal *my-foreign-thread* nil)
-(sb-alien::define-alien-callback tryjointhis int ()
+(define-alien-callable tryjointhis int ()
   (setq *my-foreign-thread* sb-thread:*current-thread*)
   (dotimes (i 10)
     (write-char #\.) (force-output)
@@ -168,28 +166,30 @@
 (defun tryjoiner ()
   (setq *my-foreign-thread* nil)
   (sb-int:dx-let ((pthread (make-array 1 :element-type 'sb-vm:word)))
-    (alien-funcall
-     (extern-alien "pthread_create"
-                   (function int system-area-pointer unsigned
-                             system-area-pointer unsigned))
-     (sb-sys:vector-sap pthread) 0 (alien-sap tryjointhis) 0)
-    (format t "Alien pthread is ~x~%" (aref pthread 0))
-    (let (found)
-      (loop
-        (setq found *my-foreign-thread*)
-        (when found (return))
-        (sleep .05))
-      (format t "Got ~s~%" found)
-      (let ((result (handler-case (sb-thread:join-thread found)
-                      (sb-thread:join-thread-error () 'ok))))
-        (when (eq result 'ok)
-          ;; actually join it to avoid resource leak
-          (alien-funcall
-           (extern-alien "pthread_join" (function int unsigned unsigned))
-           (aref pthread 0)
-           0))
-        (format t "Pthread joined ~s~%" found)
-        result))))
+    (sb-sys:with-pinned-objects (pthread)
+      (alien-funcall
+       (extern-alien "pthread_create"
+                     (function int system-area-pointer unsigned
+                               system-area-pointer unsigned))
+       (sb-sys:vector-sap pthread) 0 (alien-sap (alien-callable-function 'tryjointhis)) 0)
+      (format t "Alien pthread is ~x~%" (aref pthread 0))
+      (let (found)
+        (loop
+         (setq found *my-foreign-thread*)
+         (when found (return))
+         (sleep .05))
+        (format t "Got ~s~%" found)
+        (let ((result (handler-case (sb-thread:join-thread found)
+                        (sb-thread:join-thread-error () 'ok))))
+          (when (eq result 'ok)
+            ;; actually join it to avoid resource leak
+            (assert (zerop
+                     (alien-funcall
+                      (extern-alien "pthread_join" (function int unsigned unsigned))
+                      (aref pthread 0)
+                      0))))
+          (format t "Pthread joined ~s~%" found)
+          result)))))
 
 (with-test (:name :try-join-foreign-thread)
   (assert (eq (tryjoiner) 'ok)))

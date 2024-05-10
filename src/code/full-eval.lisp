@@ -77,8 +77,8 @@
          :format-arguments format-arguments))
 
 (defmacro nconc-2 (a b)
-  (let ((tmp (sb-xc:gensym))
-        (tmp2 (sb-xc:gensym)))
+  (let ((tmp (gensym))
+        (tmp2 (gensym)))
     `(let ((,tmp ,a)
            (,tmp2 ,b))
        (if ,tmp
@@ -113,7 +113,7 @@
                              (cdr (assoc (car binding) new-symbol-expansions))))
                  (cons (car binding)
                        :bogus))))
-    (let ((lexenv (sb-c::internal-make-lexenv
+    (let ((lexenv (make-eval-lexenv
                    (nconc-2 (mapcar #'to-native-funs new-funs)
                             (sb-c::lexenv-funs old-lexenv))
                    (nconc-2 (mapcar #'to-native-vars new-vars)
@@ -194,7 +194,7 @@
 
 (defun make-null-environment ()
   (%make-env nil nil nil nil nil nil nil nil
-             (sb-c::internal-make-lexenv
+             (make-eval-lexenv
               nil nil nil
               nil nil nil nil nil nil nil
               sb-c::*policy*
@@ -323,14 +323,20 @@
            (let*-like-bindings nil))
       (cond
         ((< arguments-present required-length)
-         (ip-error "~@<Too few arguments in ~S to satisfy lambda list ~S.~:@>"
+         (ip-error (sb-format:tokens
+                    "~@<Too few arguments in ~S to satisfy lambda list ~
+                     ~/sb-impl:print-lambda-list/.~:@>")
                    arguments lambda-list))
         ((and (not (or rest-p keyword-p)) keywords-present-p)
-         (ip-error "~@<Too many arguments in ~S to satisfy lambda list ~S.~:@>"
+         (ip-error (sb-format:tokens
+                    "~@<Too many arguments in ~S to satisfy lambda list ~
+                     ~/sb-impl:print-lambda-list/.~:@>")
                    arguments lambda-list))
         ((and keyword-p keywords-present-p
               (oddp (- arguments-present non-keyword-arguments)))
-         (ip-error "~@<Odd number of &KEY arguments in ~S for ~S.~:@>"
+         (ip-error (sb-format:tokens
+                    "~@<Odd number of &KEY arguments in ~S for ~
+                     /sb-impl:print-lambda-list/.~:@>")
                    arguments lambda-list)))
       (dotimes (i required-length)
         (push (cons (pop required) (pop arguments)) let-like-bindings))
@@ -356,7 +362,9 @@
             (loop for (key value) on keyword-plist by #'cddr doing
                   (when (and (not (eq key :allow-other-keys))
                              (not (member key keyword :key #'keyword-key)))
-                    (ip-error "~@<Unknown &KEY argument ~S in ~S for ~S.~:@>"
+                    (ip-error (sb-format:tokens
+                               "~@<Unknown &KEY argument ~S in ~S for ~
+                                ~/sb-impl:print-lambda-list/.~:@>")
                               key original-arguments lambda-list))))
           (dolist (keyword-spec keyword)
             (let ((supplied (getf keyword-plist (keyword-key keyword-spec)
@@ -565,6 +573,8 @@
         (cond
           ((and (symbolp name) (macro-function name))
            (values (macro-function name) :macro))
+          ((typep name '(cons (eql sb-pcl::slot-accessor)))
+           (sb-pcl::ensure-accessor name))
           (t (values (%coerce-name-to-fun name) :function))))))
 
 ;;; Return true if EXP is a lambda form.
@@ -600,6 +610,23 @@
            (setf declarations (append declarations (cdar form))))
           (t (return (values form documentation declarations lambda-list))))
         finally (return (values nil documentation declarations lambda-list))))
+
+(defun make-interpreted-function
+      (&key name lambda-list env declarations documentation body source-location
+            (debug-lambda-list lambda-list))
+    (let ((function (%make-interpreted-function
+                     name name lambda-list debug-lambda-list env
+                     declarations documentation body source-location)))
+      (setf (%funcallable-instance-fun function)
+            #'(lambda (&rest args)
+                (interpreted-apply function args)))
+      function))
+
+(defmethod print-object ((obj interpreted-function) stream)
+  (print-unreadable-object (obj stream
+                            :identity (not (interpreted-function-name obj)))
+    (format stream "~A ~A" '#:interpreted-function
+            (interpreted-function-name obj))))
 
 ;;; Create an interpreted function from the lambda-form EXP evaluated
 ;;; in the environment ENV.
@@ -999,11 +1026,14 @@
 ;;; we special-case the macro.
 (defun eval-with-pinned-objects (args env)
   (program-destructuring-bind (values &body body) args
-    (if (null values)
-        (eval-progn body env)
-        (sb-sys:with-pinned-objects ((%eval (car values) env))
-          (eval-with-pinned-objects (cons (cdr values) body) env)))))
+    (let ((sb-vm::*pinned-objects*
+           ;; NCONC is ok because MAPCAR makes a fresh list
+           (nconc (mapcar (lambda (x) (%eval x env)) values)
+                  sb-vm::*pinned-objects*)))
+      (eval-progn body env))))
 
+(defparameter *eval-level* -1)
+(defparameter *eval-verbose* nil)
 (defvar *eval-dispatch-functions* nil)
 
 ;;; Dispatch to the appropriate EVAL-FOO function based on the contents of EXP.

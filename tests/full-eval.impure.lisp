@@ -11,8 +11,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-(or sb-eval sb-fasteval)
-(sb-ext:exit :code 104)
+#-(or sb-eval sb-fasteval) (invoke-restart 'run-tests::skip-file)
 
 (setf sb-ext:*evaluator-mode* :interpret)
 
@@ -112,7 +111,7 @@
 (with-test (:name :inline-fun-captures-decl :fails-on (not :sb-fasteval))
   (assert (equal (sb-int:fun-name-inline-expansion 'some-inline-fun)
                  '(sb-c:lambda-with-lexenv
-                   (:declare ((muffle-conditions compiler-note))) (x)
+                   ((declare (muffle-conditions compiler-note))) (x)
                    (block some-inline-fun (- x))))))
 
 (defun typecase-test (node)
@@ -126,3 +125,31 @@
 
 (with-test (:name :interpreted-type-constraint)
   (assert (eq (typecase-test (sb-kernel:find-layout 'cons)) 'winner)))
+
+(defclass a-class ()
+  ((x :initform 123)))
+
+(defun a-class-x-0 (a)
+  (slot-value a 'x))
+
+(defmethod a-class-x-1 ((a a-class))
+  (slot-value a 'x))
+
+(defmethod a-class-x-2 ((a a-class))
+  (let ((%a a))
+    (slot-value %a 'x)))
+
+(defmethod a-class-x-3 ((a t))
+  (slot-value a 'x))
+
+(with-test (:name (slot-value defun))
+  (assert (= (a-class-x-0 (make-instance 'a-class)) 123)))
+
+(with-test (:name (slot-value defmethod))
+  (assert (= (a-class-x-1 (make-instance 'a-class)) 123)))
+
+(with-test (:name (slot-value defmethod let))
+  (assert (= (a-class-x-2 (make-instance 'a-class)) 123)))
+
+(with-test (:name (slot-value defmethod t))
+  (assert (= (a-class-x-3 (make-instance 'a-class)) 123)))

@@ -502,20 +502,6 @@
                   (eval `(let (,@(mapcar 'list vars vals))
                       ,read-form)))))))
 
-(let ((foo (cons :foo nil)))
-  (defun cas-foo (old new)
-    (cas (cdr foo) old new)))
-
-(defcas foo () cas-foo)
-
-(with-test (:name :cas-and-macroexpansion)
-  (assert (not (cas (foo) nil t)))
-  (assert (eq t (cas (foo) t nil)))
-  (symbol-macrolet ((bar (foo)))
-    (assert (not (cas bar nil :ok)))
-    (assert (eq :ok (cas bar :ok nil)))
-    (assert (not (cas bar nil t)))))
-
 (with-test (:name :atomic-push
             :skipped-on (not :sb-thread))
   (let ((store (cons nil nil))
@@ -553,16 +539,26 @@
                      (atomic-pop (symbol-value 'x))))))
       1)))
 
-#+x86-64 ; missing symbol sb-vm::signed-sap-cas-32 otherwise
-(with-test (:name :cas-sap-ref
-            :skipped-on :interpreter)
-  (let ((v (make-array 2 :element-type '(signed-byte 32)
-                         :initial-element -1)))
-    (let ((old (sb-sys:%primitive sb-vm::signed-sap-cas-32
-                                  (sb-sys:vector-sap v)
-                                  0 -1 1)))
-      (assert (= old -1))
-      (assert (eql (aref v 0) 1)))))
+(defclass cas-fsc (generic-function)
+  ((a :initform 2))
+  (:metaclass sb-mop:funcallable-standard-class))
+
+(with-test (:name :cas-funcallable-instance)
+  (let ((x (make-instance 'cas-fsc)))
+    (assert
+     (= (funcall (compile nil
+                          `(lambda (x)
+                             (cas (slot-value x 'a) 0 1)))
+                 x)
+        2))
+    (assert (eql (slot-value x 'a) 2))
+    (assert
+     (= (funcall (compile nil
+                          `(lambda (x)
+                             (cas (slot-value x 'a) 2 3)))
+                 x)
+        2))
+    (assert (eql (slot-value x 'a) 3))))
 
 (in-package "SB-VM")
 
@@ -605,7 +601,7 @@
     t))
 
 (test-util:with-test (:name :wide-compare-and-exchange
-                      :skipped-on (or :interpreter (not (or :x86 :x86-64))))
+                      :skipped-on (not (or :x86 :x86-64)))
   (multiple-value-bind (a b c d) (%cpu-identification 0 0)
     (declare (ignore b c d))
     ;; paranoidly check for whether we can execute function ID 1
@@ -617,3 +613,88 @@
                (and #+x86(logbitp 8 d) #+x86-64(logbitp 13 c)
                     (test-wide-cmpxchg))))
         (format t "Double-width compare-and-swap NOT TESTED~%"))))
+
+(test-util:with-test (:name :cas-sap-ref-smoke-test
+                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+  (let ((data (make-array 1 :element-type 'sb-vm:word)))
+    (sb-sys:with-pinned-objects (data)
+      (let ((sap (sb-sys:vector-sap data)))
+        ;; It's important to exercise an initial value that has lots of bits on,
+        ;; because I made at least two mistakes in the x86-64 lispword-sized vop:
+        ;;  1. it was using a :dword move where it should have used a :qword
+        ;;  2. it was emitting constants as bignums instead of inline raw constants
+        (macrolet ((test (signedp nbits newval
+                          &aux (ref (symbolicate (if signedp "SIGNED-" "")
+                                                 "SAP-REF-" nbits))
+                               (init (if signedp -1
+                                         (ldb (byte nbits 0) most-positive-word))))
+                     `(progn
+                        ;; (format t "Testing ~a with initial bits ~x~%" ',ref ,init)
+                        (setf (,ref sap 0) ,init)
+                        (let ((old (cas (,ref sap 0) 0 5)))
+                          (assert (eql old ,init)) ; actual old
+                          (assert (eql (,ref sap 0) ,init))) ; memory should not have changed
+                        (let ((old (cas (,ref sap 0) ,init ,newval)))
+                          (assert (eql old ,init)) ; actual old
+                          (assert (eql (,ref sap 0) ,newval)))))) ; should have changed
+          (test nil 64 #xdeadc0fefe00)
+          (test t   64 most-negative-fixnum)
+          (test nil 32 #xbabab00e)
+          #-ppc64 (test nil 16 #xfafa) ; gets "illegal instruction" if unimplemented
+          #-ppc64 (test nil 8 #xbb)
+          )
+        ;; SAP-REF-SAP
+        (setf (aref data 0) 0)
+        (let ((old (cas (sap-ref-sap sap 0) (int-sap 1) (int-sap #xffff))))
+          (assert (sb-sys:sap= old (int-sap 0))) ; actual old
+          (assert (sb-sys:sap= (sap-ref-sap sap 0) (int-sap 0)))) ; memory should not have changed
+        (let ((old (cas (sap-ref-sap sap 0) (int-sap 0) (int-sap sb-ext:most-positive-word))))
+          (assert (sb-sys:sap= old (int-sap 0)))
+          (assert (sb-sys:sap= (sap-ref-sap sap 0) (int-sap sb-ext:most-positive-word))))
+        ;; SAP-REF-LISPOBJ
+        (setf (aref data 0) sb-vm:nil-value)
+        (let ((old (cas (sap-ref-lispobj sap 0) t '*print-base*)))
+          (assert (eq old nil)) ; actual old
+          (assert (eq (sap-ref-lispobj sap 0) nil))) ; memory should not have changed
+        (let ((old (cas (sap-ref-lispobj sap 0) nil t)))
+          (assert (eq old nil))
+          (assert (eq (sap-ref-lispobj sap 0) t)))))))
+
+(test-util:with-test (:name :cas-sap-ref-stress-test
+                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+  (let ((data (make-array 1 :element-type 'sb-vm:word
+                             :initial-element 0)))
+    (sb-sys:with-pinned-objects (data)
+      (let ((sap (sb-sys:vector-sap data))
+            (n-threads 3)
+            (n-increments 100000)
+            (threads))
+        (flet ((increment ()
+                 (let ((fails 0))
+                   (dotimes (i n-increments fails)
+                     (let ((old (sap-ref-32 sap 0)))
+                       (loop
+                          (let ((actual (cas (sap-ref-32 sap 0) old (1+ old))))
+                            (if (eq actual old) (return))
+                            (incf fails)
+                            (setq old actual))))))))
+          (dotimes (i n-threads)
+            (push (sb-thread:make-thread #'increment) threads))
+          (mapc 'sb-thread:join-thread threads)
+          (assert (= (sap-ref-32 sap 0) (* n-threads n-increments))))))))
+
+(define-alien-variable "small_generation_limit" (signed 8))
+;; PPC64 shouldn't fail, but depending on the CPU revision it might not
+;; have the needed instruction, and I don't know how to test for it.
+;; And surely it doesn't really depend on endian-ness, but the machine
+;; that I'm testing on which is little-endian passes the test.
+#+(and sb-thread (or x86-64 (and ppc64 little-endian)))
+(progn
+(defun cas-an-alien-byte (x y) (cas small-generation-limit x y))
+(compile 'cas-an-alien-byte)
+(test-util:with-test (:name :cas-alien)
+  (assert (= small-generation-limit 1))
+  (assert (= (cas-an-alien-byte 0 5) 1))
+  (assert (= (cas-an-alien-byte 1 6) 1))
+  (assert (= small-generation-limit 6))
+  (setf small-generation-limit 1)))

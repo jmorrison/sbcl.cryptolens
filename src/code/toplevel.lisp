@@ -132,11 +132,11 @@ means to wait indefinitely.")
 ;;; cancelation points (system and C library calls) which check for cancelation,
 ;;; perform whatever cleanups were pushed by pthread_cleanup_push() and then stop.
 ;;;
-;;; P.S. To see that #+sb-thruption is no magic fix - suppose you have a stack
+;;; P.S. To see that #+sb-safepoint is no magic fix - suppose you have a stack
 ;;; with Lisp -> C -> -> Lisp where C acquired a resource and the currently
 ;;; top-of-stack Lisp function took a safepoint trap. It would be fine if all it
 ;;; wanted to do was GC, but is not safe in general.
-;;; Hence #+sb-thruption paints a dangerously attractive veneer over an unsafe
+;;; Hence #+sb-safepoint paints a dangerously attractive veneer over an unsafe
 ;;; concept, making it more subtly bad instead of very obviously bad.
 ;;;
 ;;; So this is a bad default. Bad bad bad. But it's backward-compatible.
@@ -381,7 +381,13 @@ any non-negative real number."
                    (*debug-io* (make-two-way-stream *stdin* *stderr*))
                    (*standard-input* *stdin*)
                    (*standard-output* *stdout*)
-                   (*error-output* *stderr*))
+                   (*error-output* *stderr*)
+                   ;; Compile/load messages from the language implementation
+                   ;; are not really what one would expect from a script. And
+                   ;; these messages are printed on stdout interfere when
+                   ;; scripts are used as part as a UNIX pipeline.
+                   (*compile-verbose* nil)
+                   (*load-verbose* nil))
                (load stream :verbose nil :print nil)))))
     (handling-end-of-the-world
       (if (eq t script)
@@ -401,6 +407,14 @@ any non-negative real number."
           control-string
           args)
   (exit :code 1))
+
+
+(defconstant-eqx +runtime-options+
+  #("--noinform" "--core" "--help" "--version" "--dynamic-space-size"
+    "--control-stack-size" "--tls-limit"
+    "--debug-environment" "--disable-ldb" "--lose-on-corruption"
+    "--end-runtime-options" "--merge-core-pages" "--no-merge-core-pages")
+  #'equalp)
 
 ;;; the default system top level function
 (defun toplevel-init ()
@@ -497,6 +511,9 @@ any non-negative real number."
                    ((string= option "--end-toplevel-options")
                     (pop-option)
                     (return))
+                   ((find option +runtime-options+ :test #'string=)
+                    (startup-error "C runtime option ~a in the middle of Lisp options."
+                                   option))
                    (t
                     ;; Anything we don't recognize as a toplevel
                     ;; option must be the start of user-level
@@ -549,9 +566,9 @@ any non-negative real number."
                                                  (pathname it))
                                              :if-does-not-exist nil)
                        (cond (stream
-                              (dx-flet ((thunk ()
-                                          (load-as-source stream :context kind)))
-                                (sb-fasl::call-with-load-bindings #'thunk stream)))
+                              (sb-fasl::call-with-load-bindings
+                               (lambda (stream kind) (load-as-source stream :context kind))
+                               stream kind stream))
                              (specified-pathname
                               (cerror "Ignore missing init file"
                                       "The specified ~A file ~A was not found."

@@ -131,8 +131,8 @@
                                         (make-result-state))))))
 
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb-c::constant-lvar-p type))
-  (let* ((type (sb-c::lvar-value type))
+  (aver (sb-c:constant-lvar-p type))
+  (let* ((type (sb-c:lvar-value type))
          (env (make-null-lexenv))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
@@ -231,10 +231,9 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:temporary (:scs (non-descriptor-reg)) addr)
   (:generator 2
-    (inst li addr (make-fixup foreign-symbol :foreign-dataref))
-    (loadw res addr)))
+    (inst li res (make-fixup foreign-symbol :foreign-dataref))
+    (loadw res res)))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg) :target cfunc)
@@ -251,8 +250,8 @@
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
-      ;; (linkage-table-entry-address 0) is "call-into-c" in mips-assem.S
-      (inst lw tramp null-tn (- (linkage-table-entry-address 0) nil-value))
+      ;; (alien-linkage-table-entry-address 0) is "call-into-c" in mips-assem.S
+      (inst lw tramp null-tn (- (alien-linkage-table-entry-address 0) nil-value))
       (inst nop)
       (inst jal tramp)
       (inst move cfunc function)
@@ -362,8 +361,9 @@ and a pointer to the arguments."
                         (incf words-processed)
                         (incf offset n-word-bytes))
                       (when gprs
-                        (loop repeat words
+                        (loop
                           for gpr = (pop gprs)
+                          repeat words
                           when gpr do
                             (inst sw gpr nsp-tn offset)
                           do

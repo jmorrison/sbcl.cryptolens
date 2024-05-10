@@ -18,11 +18,6 @@
 ;;; context.
 (define-thread-local *ignored-package-locks* :invalid)
 
-;; This proclamation avoids a ton of style warnings due to so many calls
-;; that get cross-compiled prior to compiling "target-package.lisp"
-(declaim (ftype (sfunction ((or symbol list) &optional (or string function) &rest t) t)
-                assert-symbol-home-package-unlocked))
-
 (defmacro with-single-package-locked-error ((&optional kind thing &rest format)
                                             &body body)
   (with-unique-names (topmost)
@@ -47,9 +42,3 @@
                 ,@body)
            (when ,topmost
              (setf *ignored-package-locks* :invalid)))))))
-
-(defmacro without-package-locks (&body body)
-  "Ignores all runtime package lock violations during the execution of
-body. Body can begin with declarations."
-  `(let ((*ignored-package-locks* t))
-    ,@body))

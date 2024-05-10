@@ -307,7 +307,8 @@ PROCESS."
   "Hand SIGNAL to PROCESS. If WHOM is :PID, use the kill Unix system call. If
    WHOM is :PROCESS-GROUP, use the killpg Unix system call. If WHOM is
    :PTY-PROCESS-GROUP deliver the signal to whichever process group is
-   currently in the foreground."
+   currently in the foreground.
+   Returns T if successful, otherwise returns NIL and error number (two values)."
   (let ((pid (ecase whom
                ((:pid :process-group)
                 (process-pid process))
@@ -405,8 +406,11 @@ status slot."
 
 ;;;; RUN-PROGRAM and close friends
 
-;;; list of file descriptors to close when RUN-PROGRAM exits due to an error
-(defvar *close-on-error* nil)
+;;; list of file descriptors and streams to close when RUN-PROGRAM
+;;; exits due to an error
+(defvar *close-fds-on-error* nil)
+;;; Separate from fds to ensure the finalizer and all the buffers are cleared too.
+(defvar *close-streams-on-error* nil)
 
 ;;; list of file descriptors to close when RUN-PROGRAM returns in the parent
 (defvar *close-in-parent* nil)
@@ -492,13 +496,13 @@ status slot."
       (multiple-value-bind
             (master slave name)
           (find-a-pty)
-        (push master *close-on-error*)
+        (push master *close-fds-on-error*)
         (push slave *close-in-parent*)
         (when (streamp pty)
           (multiple-value-bind (new-fd errno) (sb-unix:unix-dup master)
             (unless new-fd
               (error "couldn't SB-UNIX:UNIX-DUP ~W: ~A" master (strerror errno)))
-            (push new-fd *close-on-error*)
+            (push new-fd *close-fds-on-error*)
             (copy-descriptor-to-stream new-fd pty cookie external-format)))
         (values name
                 (make-fd-stream master :input t :output t
@@ -543,7 +547,10 @@ status slot."
         ;; Copy string.
         (copy-ub8-to-system-area octets 0 string-sap 0 size)
         ;; NULL-terminate it
-        (system-area-ub8-fill 0 string-sap size 4)
+        ;; (As it says up top: "assume 4 byte is enough for everyone.")
+        (let ((sap (sap+ string-sap size)))
+          (setf (sap-ref-8 sap 0) 0 (sap-ref-8 sap 1) 0
+                (sap-ref-8 sap 2) 0 (sap-ref-8 sap 3) 0))
         ;; Put the pointer in the vector.
         (setf (sap-ref-sap vec-sap vec-index-offset) string-sap)
         ;; Advance string-sap for the next string.
@@ -589,6 +596,20 @@ status slot."
   (envp (* c-string))
   (pty-name c-string)
   (channel (array int 2))
+  (dir c-string)
+  (preserve-fds (* int)))
+
+#+os-provides-posix-spawn
+(define-alien-routine pspawn
+     int
+  (program c-string)
+  (argv (* c-string))
+  (stdin int)
+  (stdout int)
+  (stderr int)
+  (search int)
+  (envp (* c-string))
+  (pty-name c-string)
   (dir c-string)
   (preserve-fds (* int)))
 
@@ -719,7 +740,8 @@ status slot."
                       directory
                       preserve-fds
                       #+win32 (escape-arguments t)
-                      #+win32 (window nil))
+                      #+win32 (window nil)
+                      #+os-provides-posix-spawn use-posix-spawn) ;; experimental
   "RUN-PROGRAM creates a new process specified by PROGRAM.
 ARGS is a list of strings to be passed literally to the new program.
 In POSIX environments, this list becomes the array supplied as the second
@@ -833,7 +855,7 @@ Users Manual for details about the PROCESS structure.
     (error "can't specify :ENV and :ENVIRONMENT simultaneously"))
   (let* (;; Clear various specials used by GET-DESCRIPTOR-FOR to
          ;; communicate cleanup info.
-         *close-on-error*
+         *close-fds-on-error*
          *close-in-parent*
          *handlers-installed*
          ;; Establish PROC at this level so that we can return it.
@@ -882,11 +904,13 @@ Users Manual for details about the PROCESS structure.
                                       output cookie
                                       :direction :output
                                       :if-exists if-output-exists
+                                      :if-does-not-exist :create
                                       :external-format external-format)
                (with-fd-and-stream-for ((stderr error-stream)  :error
                                         error cookie
                                         :direction :output
                                         :if-exists if-error-exists
+                                        :if-does-not-exist :create
                                         :external-format external-format)
                  ;; Make sure we are not notified about the child
                  ;; death before we have installed the PROCESS
@@ -894,59 +918,76 @@ Users Manual for details about the PROCESS structure.
                  (let (child #+win32 handle)
                    (with-environment (environment-vec environment
                                       :null (not (or environment environment-p)))
-                     (with-alien (#-win32 (channel (array int 2)))
-                       (with-open-pty ((pty-name pty-stream) (pty cookie))
-                         (setf (values child #+win32 handle)
-                               #+win32
-                               (with-system-mutex (*spawn-lock*)
-                                 (sb-win32::mswin-spawn
-                                  progname
-                                  args
-                                  stdin stdout stderr
-                                  search environment-vec directory
-                                  window
-                                  preserve-fds))
-                               #-win32
-                               (let ((preserve-fds
-                                       (and preserve-fds
-                                            (sort (coerce-or-copy preserve-fds
-                                                                  '(simple-array (signed-byte #.(alien-size int)) (*)))
-                                                  #'<))))
-                                 (with-pinned-objects (preserve-fds)
-                                   (with-args (args-vec args)
-                                     (with-system-mutex (*spawn-lock*)
-                                       (spawn progname args-vec
-                                              stdin stdout stderr
-                                              (if search 1 0)
-                                              environment-vec pty-name
-                                              channel
-                                              directory
-                                              (if preserve-fds
-                                                  (vector-sap preserve-fds)
-                                                  (int-sap 0))))))))
-                         (unless (minusp child)
-                           #-win32
-                           (setf child (wait-for-exec child channel))
-                           (unless (minusp child)
-                             (setf proc
-                                   (make-process
-                                    :input input-stream
-                                    :output output-stream
-                                    :error error-stream
-                                    :status-hook status-hook
-                                    :cookie cookie
-                                    #-win32 :pty #-win32 pty-stream
-                                    :%status :running
-                                    :pid child
-                                    #+win32 :copiers #+win32 *handlers-installed*
-                                    #+win32 :handle #+win32 handle))
-                             (with-active-processes-lock ()
-                               (push proc *active-processes*))
-                             ;; In case a sigchld signal was missed
-                             ;; when the process wasn't on
-                             ;; *active-processes*
-                             (unless wait
-                               (get-processes-status-changes)))))))
+                     (with-open-pty ((pty-name pty-stream) (pty cookie))
+                       #+win32
+                       (setf (values child handle)
+                             (with-system-mutex (*spawn-lock*)
+                               (sb-win32::mswin-spawn
+                                progname
+                                args
+                                stdin stdout stderr
+                                search environment-vec directory
+                                window
+                                preserve-fds)))
+                       #-win32
+                       (let ((preserve-fds
+                               (and preserve-fds
+                                    (sort (coerce-or-copy preserve-fds
+                                                          '(simple-array (signed-byte #.(alien-size int)) (*)))
+                                          #'<))))
+                         (with-pinned-objects (preserve-fds)
+                           (with-args (args-vec args)
+                             (with-system-mutex (*spawn-lock*)
+                               (cond #+os-provides-posix-spawn
+                                     (use-posix-spawn
+                                      (setf child
+                                            (pspawn progname args-vec
+                                                    stdin stdout stderr
+                                                    (if search 1 0)
+                                                    environment-vec pty-name
+                                                    directory
+                                                    (if preserve-fds
+                                                        (vector-sap preserve-fds)
+                                                        (int-sap 0)))))
+                                     (t
+                                      (with-alien ((channel (array int 2)))
+                                        (multiple-value-bind (readfd writefd) (sb-unix:unix-pipe)
+                                          (if (null readfd) ; writefd = errno when it fails
+                                              (file-perror nil writefd "Error creating pipe")
+                                              (setf (deref channel 0) readfd
+                                                    (deref channel 1) writefd)))
+                                        (setf child
+                                              (spawn progname args-vec
+                                                     stdin stdout stderr
+                                                     (if search 1 0)
+                                                     environment-vec pty-name
+                                                     channel
+                                                     directory
+                                                     (if preserve-fds
+                                                         (vector-sap preserve-fds)
+                                                         (int-sap 0))))
+                                        (unless (minusp child)
+                                          (setf child (wait-for-exec child channel))))))))))
+                       (unless (minusp child)
+                         (setf proc
+                               (make-process
+                                :input input-stream
+                                :output output-stream
+                                :error error-stream
+                                :status-hook status-hook
+                                :cookie cookie
+                                #-win32 :pty #-win32 pty-stream
+                                :%status :running
+                                :pid child
+                                #+win32 :copiers #+win32 *handlers-installed*
+                                #+win32 :handle #+win32 handle))
+                         (with-active-processes-lock ()
+                           (push proc *active-processes*))
+                         ;; In case a sigchld signal was missed
+                         ;; when the process wasn't on
+                         ;; *active-processes*
+                         (unless wait
+                           (get-processes-status-changes)))))
                    ;; Report the error outside the lock.
                    (case child
                      (-1
@@ -961,8 +1002,10 @@ Users Manual for details about the PROCESS structure.
       (dolist (fd *close-in-parent*)
         (sb-unix:unix-close fd))
       (unless proc
-        (dolist (fd *close-on-error*)
+        (dolist (fd *close-fds-on-error*)
           (sb-unix:unix-close fd))
+        (dolist (stream *close-streams-on-error*)
+          (close stream :abort t))
         #-win32
         (dolist (handler *handlers-installed*)
           (remove-fd-handler handler)))
@@ -1030,19 +1073,8 @@ Users Manual for details about the PROCESS structure.
              (loop
                 (unless handler
                   (return))
-                (multiple-value-bind
-                      (result readable/errno)
-                    (sb-unix:unix-select (1+ descriptor)
-                                         (ash 1 descriptor)
-                                         0 0 0)
-                  (cond ((null result)
-                         (if (eql sb-unix:eintr readable/errno)
-                             (return)
-                             (error "~@<Couldn't select on sub-process: ~
-                                        ~2I~_~A~:>"
-                                    (strerror readable/errno))))
-                        ((zerop result)
-                         (return))))
+                (unless (sb-unix:unix-simple-poll descriptor :input 0)
+                  (return))
                 (multiple-value-bind (count errno)
                     (with-pinned-objects (buf)
                       (sb-unix:unix-read descriptor
@@ -1178,26 +1210,26 @@ Users Manual for details about the PROCESS structure.
                      (eq direction :output))
                (case direction
                  (:input
-                    (push read-fd *close-in-parent*)
-                    (push write-fd *close-on-error*)
-                    (let ((stream (make-fd-stream write-fd :output t
+                  (push read-fd *close-in-parent*)
+                  (let ((stream (make-fd-stream write-fd :output t
                                                          :element-type :default
-                                                         :external-format
-                                                         external-format)))
-                      (values read-fd stream)))
+                                                         :external-format external-format
+                                                         :auto-close t)))
+                    (push stream *close-streams-on-error*)
+                    (values read-fd stream)))
                  (:output
-                    (push read-fd *close-on-error*)
-                    (push write-fd *close-in-parent*)
-                    (let ((stream (make-fd-stream read-fd :input t
-                                                         :element-type :default
-                                                         :external-format
-                                                         external-format)))
-                      (values write-fd stream)))
+                  (push write-fd *close-in-parent*)
+                  (let ((stream (make-fd-stream read-fd :input t
+                                                        :element-type :default
+                                                        :external-format external-format
+                                                        :auto-close t)))
+                    (push stream *close-streams-on-error*)
+                    (values write-fd stream)))
                  (t
-                    (sb-unix:unix-close read-fd)
-                    (sb-unix:unix-close write-fd)
-                    (fail "Direction must be either :INPUT or :OUTPUT, not ~S."
-                           direction)))))
+                  (sb-unix:unix-close read-fd)
+                  (sb-unix:unix-close write-fd)
+                  (fail "Direction must be either :INPUT or :OUTPUT, not ~S."
+                        direction)))))
             ((or (pathnamep object) (stringp object))
              ;; GET-DESCRIPTOR-FOR uses &allow-other-keys, so rather
              ;; than munge the &rest list for OPEN, just disable keyword
@@ -1311,23 +1343,27 @@ Users Manual for details about the PROCESS structure.
                   (setf (sb-win32::inheritable-handle-p write-fd) t)
                   (copy-descriptor-to-stream read-fd object cookie
                                              external-format)
-                  (push read-fd *close-on-error*)
+                  (push read-fd *close-fds-on-error*)
                   (push write-fd *close-in-parent*)
                   (return (values write-fd nil)))))))
           (t
            (fail "invalid option: ~S" object))))))
 
-#+(or linux sunos haiku)
+#+(or (and linux (not android)) sunos haiku)
 (defun software-version ()
   "Return a string describing version of the supporting software, or NIL
   if not available."
   (or sb-sys::*software-version*
       (setf sb-sys::*software-version*
-            (string-trim '(#\newline)
-                         (%with-output-to-string (stream)
+            (possibly-base-stringize
+             #+linux
+             (with-open-file (f "/proc/sys/kernel/osrelease") (read-line f))
+             #-linux
+             (string-trim '(#\newline)
+                          (%with-output-to-string (stream)
                            (run-program "/bin/uname"
                                         ;; "-r" on haiku just prints "1"
                                         ;; but "-v" prints some detail.
                                         #+haiku '("-v")
                                         #-haiku '("-r")
-                                        :output stream))))))
+                                        :output stream)))))))

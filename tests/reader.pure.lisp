@@ -11,6 +11,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(with-test (:name :random-describe)
+  (describe sb-impl::*empty-extended-char-table* (make-broadcast-stream)))
+
 (with-test (:name (:reader symbol :escape))
   (assert (equal (symbol-name '#:|fd\sA|) "fdsA")))
 
@@ -335,7 +338,7 @@
       (set-syntax-from-char #\! #\! rt)
       (assert (eq '!! (maybe-bang))))))
 
-(with-test (:name :read-in-package-syntax)
+(with-test (:name :read-in-package-syntax :skipped-on :sb-devel)
   (assert (equal '(sb-c::a (sb-kernel::x sb-kernel::y) sb-c::b)
                  (read-from-string "sb-c::(a sb-kernel::(x y) b)")))
   (assert (equal '(cl-user::yes-this-is-sbcl)
@@ -367,21 +370,23 @@
 ;;  - calling SUBSEQ for package names
 ;;  - multiple-value-call in WITH-CHAR-MACRO-RESULT
 ;;  - the initial cons cell in READ-LIST
-(with-test (:name :read-does-not-cons-per-se :skipped-on :interpreter)
-  (flet ((test-reading (string)
-           (let ((s (make-string-input-stream string)))
-             (read s) ; once outside the loop, to make A-SYMBOL
-             (ctu:assert-no-consing
-              (progn (file-position s 0)
-                     (read s))
-              40000))
-           ;; WITH-INPUT-FROM-STRING doesn't heap-allocate a stream
-           (ctu:assert-no-consing
-            (with-input-from-string (s string)
-              (opaque-identity s)))
-           ;; READ-FROM-STRING doesn't heap-allocate a stream
-           (ctu:assert-no-consing
-            (read-from-string string))))
+(defun test-reader-consing (string)
+  (let ((s (make-string-input-stream string)))
+    (read s) ; once outside the loop, to make A-SYMBOL
+    (ctu:assert-no-consing
+     (progn (file-position s 0)
+            (read s))
+     40000))
+  ;; WITH-INPUT-FROM-STRING doesn't heap-allocate a stream
+  (ctu:assert-no-consing
+   (with-input-from-string (s string)
+     (opaque-identity s)))
+  ;; READ-FROM-STRING doesn't heap-allocate a stream
+  (ctu:assert-no-consing
+   (read-from-string string)))
+(compile 'test-reader-consing)
+
+(with-test (:name :read-does-not-cons-per-se)
     ;; These each used to produce at least 20 MB of garbage,
     ;; a result of using 128-character (= 512 bytes for Unicode) buffers.
     ;; Now we use exactly one buffer, or maybe two for package + symbol-name.
@@ -396,13 +401,24 @@
     ;; impossible to cons 1 byte per run.
     ;; If this still fails, it might be due to somebody changing the
     ;; backend-page-bytes to exceed 32KB. Not sure what to do about that.
-    #+64-bit (test-reading "4.0s0")
-    (test-reading "COMMON-LISP-USER::A-SYMBOL")
-    (test-reading "()")
-    (test-reading "#\\-") ; should not copy the token buffer
+    #+64-bit (test-reader-consing "4.0s0")
+    (test-reader-consing "()")
     ;; *READ-SUPPRESS* avoids creation of lists
-    (test-reading "#-sbcl(a (b c (d (e) (f) g)) h i j . x . y baz) 5")
-    ))
+    (test-reader-consing "#-sbcl(a (b c (d (e) (f) g)) h i j . x . y baz) 5"))
+(with-test (:name :read-symbol-does-not-cons-per-se
+            :fails-on (or :arm :ppc)) ; no idea why. does it vary by #+/-sb-thread?
+  (test-reader-consing "COMMON-LISP-USER::A-SYMBOL"))
+(when (let ((s (find-symbol "ALLOCATE-VECTOR-ON-NUMBER-STACK" "SB-VM")))
+        (and s (gethash s sb-c::*backend-parsed-vops*)))
+  (push :simulated-dx-strings *features*))
+;;; For NAME-CHAR not to cons, the platform must either support DX allocation
+;;; of strings on the control stack, or simulate it via number stack strings.
+;;; Lacking either, we acquire a string buffer from a global buffer pool.
+;;; Pushing a buffer back onto the global pool creates one cons cell,
+;;; in which case this test makes 1 cons per iteration.
+(with-test (:name :name-char-does-not-cons
+            :skipped-on (not (or :c-stack-is-control-stack :simulated-dx-strings)))
+  (test-reader-consing "#\\-"))
 
 (with-test (:name :sharp-left-paren-empty-list)
   (assert (read-from-string "#0()")) ; edge case that works
@@ -415,9 +431,14 @@
                 (sb-int:simple-reader-error () :win))
               :win)))
 
+(with-test (:name :sharp-star-default-fill :skipped-on :sbcl)
+  ;; can't assert anything about bits beyond the supplied ones
+  (let ((bv (opaque-identity #*11)))
+    (assert (= (sb-kernel:%vector-raw-bits bv 0) 3))))
+
 ;;; The WITH-FAST-READ-BYTE macro accidentally left the package lock
 ;;; of FAST-READ-BYTE disabled during its body.
-(with-test (:name :fast-read-byte-package-lock)
+(with-test (:name :fast-read-byte-package-lock :skipped-on :sb-devel)
   (let ((fun
          ;; Suppress the compiler output to avoid noise when running the
          ;; test. (There are a warning and an error about the package

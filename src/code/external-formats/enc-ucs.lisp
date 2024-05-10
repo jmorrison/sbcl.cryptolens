@@ -85,8 +85,8 @@
 
 ;;; Conversion to UCS-2{LE,BE}
 (declaim (inline char->ucs-2le))
-(defun char->ucs-2le (char dest string pos)
-  (declare (optimize speed (safety 0))
+(defun char->ucs-2le (char dest string pos replacement)
+  (declare (optimize speed #.*safety-0*)
            (type (array (unsigned-byte 8) (*)) dest))
   (let ((code (char-code char)))
     (if (< code #x10000)
@@ -96,14 +96,14 @@
           (declare (inline add-byte))
           (add-byte (ldb (byte 8 0) code))
           (add-byte (ldb (byte 8 8) code)))
-        (let ((replacement (encoding-error :ucs-2le string pos)))
+        (let ((replacement (encoding-error :ucs-2le replacement string pos)))
           (declare (type (simple-array (unsigned-byte 8) (*)) replacement))
           (dotimes (i (length replacement))
             (vector-push-extend (aref replacement i) dest))))))
 
 (declaim (inline char->ucs-2be))
-(defun char->ucs-2be (char dest string pos)
-  (declare (optimize speed (safety 0))
+(defun char->ucs-2be (char dest string pos replacement)
+  (declare (optimize speed #.*safety-0*)
            (type (array (unsigned-byte 8) (*)) dest))
   (let ((code (char-code char)))
     (if (< code #x10000)
@@ -113,33 +113,33 @@
           (declare (inline add-byte))
           (add-byte (ldb (byte 8 8) code))
           (add-byte (ldb (byte 8 0) code)))
-        (let ((replacement (encoding-error :ucs-2be string pos)))
+        (let ((replacement (encoding-error :ucs-2be replacement string pos)))
           (declare (type (simple-array (unsigned-byte 8) (*)) replacement))
           (dotimes (i (length replacement))
             (vector-push-extend (aref replacement i) dest))))))
 
-(defun string->ucs-2le (string sstart send additional-space)
-  (declare (optimize speed (safety 0))
+(defun string->ucs-2le (string sstart send additional-space replacement)
+  (declare (optimize speed #.*safety-0*)
            (type simple-string string)
            (type array-range sstart send additional-space))
   (let ((array (make-array (* 2 (+ additional-space (- send sstart)))
                            :element-type '(unsigned-byte 8)
                            :fill-pointer 0 :adjustable t)))
     (loop for i from sstart below send
-          do (char->ucs-2le (char string i) array string i))
+          do (char->ucs-2le (char string i) array string i replacement))
     (dotimes (i (* 2 additional-space))
       (vector-push-extend 0 array))
     (coerce array '(simple-array (unsigned-byte 8) (*)))))
 
-(defun string->ucs-2be (string sstart send additional-space)
-  (declare (optimize speed (safety 0))
+(defun string->ucs-2be (string sstart send additional-space replacement)
+  (declare (optimize speed #.*safety-0*)
            (type simple-string string)
            (type array-range sstart send additional-space))
   (let ((array (make-array (* 2 (+ additional-space (- send sstart)))
                            :element-type '(unsigned-byte 8)
                            :fill-pointer 0 :adjustable t)))
     (loop for i from sstart below send
-          do (char->ucs-2be (char string i) array string i))
+          do (char->ucs-2be (char string i) array string i replacement))
     (dotimes (i (* 2 additional-space))
       (vector-push-extend 0 array))
     (coerce array '(simple-array (unsigned-byte 8) (*)))))
@@ -163,7 +163,7 @@
         (name-be (make-od-name 'simple-get-ucs-2be-char accessor)))
     `(progn
       (defun ,name-le (array pos bytes)
-        (declare (optimize speed (safety 0))
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range pos)
                  (type (integer 1 4) bytes)
@@ -178,7 +178,7 @@
                (declare (inline cref))
                (code-char (dpb (cref 1) (byte 8 8) (cref 0))))))
       (defun ,name-be (array pos bytes)
-        (declare (optimize speed (safety 0))
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range pos)
                  (type (integer 1 4) bytes)
@@ -198,8 +198,8 @@
   (let ((name-le (make-od-name 'ucs-2le->string accessor))
         (name-be (make-od-name 'ucs-2be->string accessor)))
     `(progn
-      (defun ,name-le (array astart aend)
-        (declare (optimize speed (safety 0))
+      (defun ,name-le (array astart aend replacement)
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range astart aend))
         (let ((string (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
@@ -209,14 +209,20 @@
                        (,(make-od-name 'bytes-per-ucs-2le-character accessor) array pos aend)
                      (declare (type (or null string) invalid))
                      (aver (null invalid))
-                     (vector-push-extend
-                      (,(make-od-name 'simple-get-ucs-2le-char accessor)
-                        array pos bytes)
-                      string)
+                     (if (<= (+ pos bytes) aend)
+                         (vector-push-extend
+                          (,(make-od-name 'simple-get-ucs-2le-char accessor)
+                            array pos bytes)
+                          string)
+                         (let ((instead
+                                (decoding-error array pos aend :ucs-2le replacement
+                                                'octet-decoding-error pos)))
+                           (dotimes (i (length instead))
+                             (vector-push-extend (char instead i) string))))
                      (incf pos bytes)))
-          string))
-      (defun ,name-be (array astart aend)
-        (declare (optimize speed (safety 0))
+          (copy-seq string)))
+      (defun ,name-be (array astart aend replacement)
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range astart aend))
         (let ((string (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
@@ -226,12 +232,18 @@
                        (,(make-od-name 'bytes-per-ucs-2be-character accessor) array pos aend)
                      (declare (type (or null string) invalid))
                      (aver (null invalid))
-                     (vector-push-extend
-                      (,(make-od-name 'simple-get-ucs-2be-char accessor)
-                        array pos bytes)
-                      string)
+                     (if (<= (+ pos bytes) aend)
+                         (vector-push-extend
+                          (,(make-od-name 'simple-get-ucs-2be-char accessor)
+                            array pos bytes)
+                          string)
+                         (let ((instead
+                                (decoding-error array pos aend :ucs-2be replacement
+                                                'octet-decoding-error pos)))
+                           (dotimes (i (length instead))
+                             (vector-push-extend (char instead i) string))))
                      (incf pos bytes)))
-          string)))))
+          (copy-seq string))))))
 
 (instantiate-octets-definition define-ucs-2->string)
 
@@ -244,7 +256,8 @@
   2
   (code-char (sap-ref-16le sap head))
   ucs-2le->string-aref
-  string->ucs-2le)
+  string->ucs-2le
+  :char-encodable-p (< (char-code |ch|) #x10000))
 
 (define-external-format/variable-width (:ucs-2be :ucs2be) t
   (code-char #xfffd)
@@ -255,11 +268,12 @@
   2
   (code-char (sap-ref-16be sap head))
   ucs-2be->string-aref
-  string->ucs-2be)
+  string->ucs-2be
+ :char-encodable-p (< (char-code |ch|) #x10000))
 
 (declaim (inline char->ucs-4le))
 (defun char->ucs-4le (char dest string pos)
-  (declare (optimize speed (safety 0))
+  (declare (optimize speed #.*safety-0*)
            (type (array (unsigned-byte 8) (*)) dest)
            (ignore string pos))
   (let ((code (char-code char)))
@@ -274,7 +288,7 @@
 
 (declaim (inline char->ucs-4be))
 (defun char->ucs-4be (char dest string pos)
-  (declare (optimize speed (safety 0))
+  (declare (optimize speed #.*safety-0*)
            (type (array (unsigned-byte 8) (*)) dest)
            (ignore string pos))
   (let ((code (char-code char)))
@@ -287,10 +301,11 @@
       (add-byte (ldb (byte 8 8) code))
       (add-byte (ldb (byte 8 0) code)))))
 
-(defun string->ucs-4le (string sstart send additional-space)
-  (declare (optimize speed (safety 0))
+(defun string->ucs-4le (string sstart send additional-space replacement)
+  (declare (optimize speed #.*safety-0*)
            (type simple-string string)
-           (type array-range sstart send additional-space))
+           (type array-range sstart send additional-space)
+           (ignore replacement))
   (let ((array (make-array (* 4 (+ additional-space (- send sstart)))
                            :element-type '(unsigned-byte 8)
                            :fill-pointer 0 :adjustable t)))
@@ -300,10 +315,11 @@
       (vector-push-extend 0 array))
     (coerce array '(simple-array (unsigned-byte 8) (*)))))
 
-(defun string->ucs-4be (string sstart send additional-space)
-  (declare (optimize speed (safety 0))
+(defun string->ucs-4be (string sstart send additional-space replacement)
+  (declare (optimize speed #.*safety-0*)
            (type simple-string string)
-           (type array-range sstart send additional-space))
+           (type array-range sstart send additional-space)
+           (ignore replacement))
   (let ((array (make-array (* 4 (+ additional-space (- send sstart)))
                            :element-type '(unsigned-byte 8)
                            :fill-pointer 0 :adjustable t)))
@@ -331,8 +347,8 @@
   (let ((name-le (make-od-name 'simple-get-ucs-4le-char accessor))
         (name-be (make-od-name 'simple-get-ucs-4be-char accessor)))
     `(progn
-      (defun ,name-le (array pos bytes)
-        (declare (optimize speed (safety 0))
+      (defun ,name-le (array pos bytes replacement)
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range pos)
                  (type (integer 1 4) bytes))
@@ -349,10 +365,10 @@
                                       (dpb (cref 1) (byte 8 8) (cref 0))))))))
           (if (< code char-code-limit)
               (code-char code)
-              (decoding-error array pos (+ pos bytes) :ucs-4le
+              (decoding-error array pos (+ pos bytes) :ucs-4le replacement
                               'octet-decoding-error pos))))
-      (defun ,name-be (array pos bytes)
-        (declare (optimize speed (safety 0))
+      (defun ,name-be (array pos bytes replacement)
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range pos)
                  (type (integer 1 4) bytes))
@@ -368,19 +384,19 @@
                                       (dpb (cref 2) (byte 8 8) (cref 3))))))))
           (if (< code char-code-limit)
               (code-char code)
-              (decoding-error array pos (+ pos bytes) :ucs-4be
+              (decoding-error array pos (+ pos bytes) :ucs-4be replacement
                               'octet-decoding-error pos)))))))
 
 (eval-when (:compile-toplevel)
-  (sb-xc:proclaim '(muffle-conditions compiler-note)))
+  (proclaim '(muffle-conditions compiler-note)))
 (instantiate-octets-definition define-simple-get-ucs4-character)
 
 (defmacro define-ucs-4->string (accessor type)
   (let ((name-le (make-od-name 'ucs-4le->string accessor))
         (name-be (make-od-name 'ucs-4be->string accessor)))
     `(progn
-      (defun ,name-le (array astart aend)
-        (declare (optimize speed (safety 0))
+      (defun ,name-le (array astart aend replacement)
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range astart aend))
         (let ((string (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
@@ -390,15 +406,19 @@
                        (,(make-od-name 'bytes-per-ucs-4le-character accessor) array pos aend)
                      (declare (type (or null string) invalid))
                      (aver (null invalid))
-                     (let ((thing (,(make-od-name 'simple-get-ucs-4le-char accessor) array pos bytes)))
+                     (let ((thing
+                            (if (<= (+ pos bytes) aend)
+                                (,(make-od-name 'simple-get-ucs-4le-char accessor) array pos bytes replacement)
+                                (decoding-error array pos aend :ucs-4le replacement
+                                                'octet-decoding-error pos))))
                        (typecase thing
                          (character (vector-push-extend thing string))
                          (string (dotimes (i (length thing))
                                    (vector-push-extend (char thing i) string)))))
                      (incf pos bytes)))
-          string))
-      (defun ,name-be (array astart aend)
-        (declare (optimize speed (safety 0))
+          (copy-seq string)))
+      (defun ,name-be (array astart aend replacement)
+        (declare (optimize speed #.*safety-0*)
                  (type ,type array)
                  (type array-range astart aend))
         (let ((string (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
@@ -408,13 +428,17 @@
                        (,(make-od-name 'bytes-per-ucs-4be-character accessor) array pos aend)
                      (declare (type (or null string) invalid))
                      (aver (null invalid))
-                     (let ((thing (,(make-od-name 'simple-get-ucs-4be-char accessor) array pos bytes)))
+                     (let ((thing
+                            (if (<= (+ pos bytes) aend)
+                                (,(make-od-name 'simple-get-ucs-4be-char accessor) array pos bytes replacement)
+                                (decoding-error array pos aend :ucs-4be replacement
+                                                'octet-decoding-error pos))))
                        (typecase thing
                          (character (vector-push-extend thing string))
                          (string (dotimes (i (length thing))
                                    (vector-push-extend (char thing i) string)))))
                      (incf pos bytes)))
-          string)))))
+          (copy-seq string))))))
 
 (instantiate-octets-definition define-ucs-4->string)
 

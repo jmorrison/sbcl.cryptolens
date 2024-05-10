@@ -24,16 +24,27 @@
 (declaim (type list sb-xc:*features*))
 (defvar sb-xc:*features*)
 
-(defun target-platform-keyword (&optional (features sb-xc:*features*))
+(defun target-platform-keyword (&aux (features sb-xc:*features*))
   (let ((arch (intersection '(:arm :arm64 :mips :ppc :ppc64 :riscv :sparc :x86 :x86-64)
                             features)))
     (cond ((not arch) (error "No architecture selected"))
           ((> (length arch) 1) (error "More than one architecture selected")))
     (car arch)))
 
+(defun compatible-vector-raw-bits () ; T if the host and target match on word size and endianness
+  (flet ((endianness (features)
+           (let ((result (intersection '(:little-endian :big-endian) features)))
+             ;; some lisp implementation may not have little-endian / big-endian
+             ;; features which shouldn't trigger that assert
+             (assert (or (not result) (and result (not (cdr result)))))
+             (car result)))
+         (wordsize (features)
+           (if (member :64-bit features) 64 32)))
+    (and (eq (endianness sb-xc:*features*) (endianness cl:*features*))
+         (= (wordsize sb-xc:*features*) (wordsize cl:*features*)))))
+
 ;;; Not necessarily the logical place to define BACKEND-ASM-PACKAGE-NAME,
-;;; but a convenient one, because sb-xc:*features* needs to have been
-;;; DEFVARed, and because 'chill' loads this and only this file.
+;;; but a convenient one.
 (defun backend-assembler-target-name ()
   (let ((keyword (target-platform-keyword)))
     (case keyword
@@ -42,23 +53,19 @@
 (defun backend-asm-package-name ()
   (concatenate 'string "SB-" (string (backend-assembler-target-name)) "-ASM"))
 
-;;; We should never call this with a selector of :HOST any more,
-;;; but I'm keeping it in case of emergency.
-;;; SB-XC:*FEATURES* might not be bound yet when computing derived features.
-(defun featurep (feature &optional (list sb-xc:*features*))
+;;; Like the real FEATUREP but using SB-XC:*FEATURES* instead of CL:*FEATURES*
+(defun target-featurep (feature)
   (etypecase feature
     (symbol
      (if (string= feature "SBCL")
          (error "Testing SBCL as a target feature is obviously bogus")
-         (member feature list :test #'eq)))
-    (cons (flet ((subfeature-in-list-p (subfeature)
-                   (featurep subfeature list)))
-            (ecase (first feature)
-              (:or  (some  #'subfeature-in-list-p (rest feature)))
-              (:and (every #'subfeature-in-list-p (rest feature)))
-              (:not (destructuring-bind (subexpr) (cdr feature)
-                      (not (subfeature-in-list-p subexpr)))))))))
-(compile 'featurep)
+         (member feature sb-xc:*features* :test #'eq)))
+    (cons (ecase (first feature)
+            (:or  (some  #'target-featurep (rest feature)))
+            (:and (every #'target-featurep (rest feature)))
+            (:not (destructuring-bind (subexpr) (cdr feature)
+                    (not (target-featurep subexpr))))))))
+(compile 'target-featurep)
 
 (defun read-targ-feature-expr (stream sub-character infix-parameter)
   (when infix-parameter
@@ -66,7 +73,7 @@
   (if (char= (if (let* ((*package* (find-package "KEYWORD"))
                         (*read-suppress* nil)
                         (feature (read stream t nil t)))
-                   (featurep feature))
+                   (target-featurep feature))
                  #\+ #\-)
              sub-character)
       (read stream t nil t)
@@ -86,19 +93,6 @@
                            (funcall 'read-target-float stream char))
                      t ; non-terminating so that symbols may contain a dollar sign
                      *xc-readtable*)
-
-;;;; variables like SB-XC:*FEATURES* but different
-
-;;; This variable is declared here (like SB-XC:*FEATURES*) so that
-;;; things like chill.lisp work (because the variable has properties
-;;; similar to SB-XC:*FEATURES*, and chill.lisp was set up to work
-;;; for that). For an explanation of what it really does, look
-;;; elsewhere.
-;;; FIXME: Can we just assign SB-C:*BACKEND-SUBFEATURES* directly?
-;;; (This has nothing whatsoever to do with the so-called "shebang" reader)
-(export '*shebang-backend-subfeatures*)
-(declaim (type list *shebang-backend-subfeatures*))
-(defvar *shebang-backend-subfeatures*)
 
 ;;;; string checker, for catching non-portability early
 

@@ -12,26 +12,18 @@
 (in-package "SB-VM")
 
 ;;;; LIST and LIST*
-(define-vop (list-or-list*)
-  (:args (things :more t))
+(define-vop (list)
+  (:args (things :more t :scs (any-reg descriptor-reg zero null control-stack)))
   (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:scs (non-descriptor-reg)) alloc-temp)
-  (:info num)
+  (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
-  (:variant-vars star)
-  (:policy :safe)
   (:node-var node)
   (:generator 0
-    (cond ((zerop num)
-           (move result null-tn))
-          ((and star (= num 1))
-           (move result (tn-ref-tn things)))
-          (t
-           (macrolet
-               ((maybe-load (tn)
+    (macrolet ((maybe-load (tn)
                   (once-only ((tn tn))
                     `(sc-case ,tn
                        ((any-reg descriptor-reg zero null)
@@ -39,10 +31,9 @@
                        (control-stack
                         (load-stack-tn temp ,tn)
                         temp)))))
-             (let* ((dx-p (node-stack-allocate-p node))
-                    (cons-cells (if star (1- num) num))
-                    (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic ()
+      (let ((dx-p (node-stack-allocate-p node))
+            (alloc (* (pad-data-block cons-size) cons-cells)))
+        (pseudo-atomic (temp)
                  (allocation 'list alloc list-pointer-lowtag res
                              :stack-p dx-p
                              :temp-tn alloc-temp)
@@ -61,14 +52,7 @@
                              (maybe-load (tn-ref-tn (tn-ref-across things)))
                              null-tn)
                          ptr cons-cdr-slot list-pointer-lowtag))
-               (move result res)))))))
-
-(define-vop (list list-or-list*)
-  (:variant nil))
-
-(define-vop (list* list-or-list*)
-  (:variant t))
-
+        (move result res)))))
 
 ;;;; Special purpose inline allocators.
 
@@ -95,7 +79,7 @@
   (:generator 10
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
-      (pseudo-atomic ()
+      (pseudo-atomic (temp)
         (allocation nil alloc-size fun-pointer-lowtag result
                     :stack-p stack-allocate-p
                     :temp-tn temp)
@@ -123,12 +107,6 @@
   (:generator 1
     (inst li result unbound-marker-widetag)))
 
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst li result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
-
 (define-vop (fixed-alloc)
   (:args)
   (:info name words type lowtag stack-allocate-p)
@@ -136,14 +114,11 @@
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 4
-    ;; I don't see why fixed allocations need to be pseudo-atomic.
-    ;; The other precisely GC'd backends have it this way.
-    (pseudo-atomic ()
+    (pseudo-atomic (temp)
       (allocation nil (pad-data-block words) lowtag result :temp-tn temp
                   :stack-p stack-allocate-p)
-        (when type
-          (inst li temp (logior (ash (1- words) (length-field-shift type)) type))
-          (storew temp result 0 lowtag)))))
+        (inst li temp (compute-object-header words type))
+        (storew temp result 0 lowtag))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
@@ -164,6 +139,6 @@
           (t
            (inst add header header (+ (ash -2 (length-field-shift type)) type))
            (inst and bytes (lognot lowtag-mask))))
-    (pseudo-atomic ()
+    (pseudo-atomic (temp)
       (allocation nil bytes lowtag result :temp-tn temp)
       (storew header result 0 lowtag))))

@@ -12,7 +12,29 @@
 (in-package "SB-IMPL")
 
 
-;;;; Destructing-bind
+;;;; DEFMACRO
+
+;;; Inform the cross-compiler how to expand SB-XC:DEFMACRO (= DEFMACRO)
+;;; and supporting macros using the already defined host macros until
+;;; this file is itself cross-compiled.
+#+sb-xc-host
+(flet ((defmacro-using-host-expander (name)
+         (setf (macro-function name)
+               (lambda (form env)
+                 (declare (ignore env))
+                 ;; Since SB-KERNEL:LEXENV isn't compatible with the host,
+                 ;; just pass NIL. The expansion correctly captures a non-null
+                 ;; environment, but the expander doesn't need it.
+                 (funcall (cl:macro-function name) form nil)))))
+  (defmacro-using-host-expander 'sb-xc:defmacro)
+  (defmacro-using-host-expander 'named-ds-bind)
+  (defmacro-using-host-expander 'binding*)
+  (defmacro-using-host-expander 'sb-xc:deftype)
+  ;; FIXME: POLICY doesn't support DEFMACRO, but we need it ASAP.
+  (defmacro-using-host-expander 'sb-c:policy))
+
+
+;;;; Destructuring-bind
 
 (sb-xc:defmacro destructuring-bind (lambda-list expression &body body
                                                            &environment env)
@@ -49,7 +71,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   (let (dx-decls)
     (dolist (form decl-forms)
       (dolist (expr (cdr form))
-        (when (eq (car expr) 'dynamic-extent)
+        (when (typep expr '(cons (eql dynamic-extent)))
           (setf dx-decls (union dx-decls (cdr expr))))))
     (unless dx-decls
       (return-from extract-dx-args nil))
@@ -91,7 +113,7 @@ tree structure resulting from the evaluation of EXPRESSION."
               entry-points
               (not (member name entry-points :test #'equal))))))
 
-(flet ((defun-expander (env name lambda-list body snippet)
+(flet ((defun-expander (env name lambda-list body snippet &optional source-form)
   (multiple-value-bind (forms decls doc) (parse-body body t)
     ;; Maybe kill docstring, but only under the cross-compiler.
     #+(and (not sb-doc) sb-xc-host) (setq doc nil)
@@ -110,7 +132,7 @@ tree structure resulting from the evaluation of EXPRESSION."
                   ;; a full inline expansion depending on the lexical environment.
                   ((save-inline-expansion-p name)
                   ;; we want to attempt to inline, so complain if we can't
-                   (cond ((sb-c:maybe-inline-syntactic-closure lambda env))
+                   (cond ((sb-c:inline-syntactic-closure-lambda lambda env))
                          (t
                           (#+sb-xc-host warn
                            #-sb-xc-host sb-c:maybe-compiler-notify
@@ -125,46 +147,47 @@ tree structure resulting from the evaluation of EXPRESSION."
         (setq inline-thing (list 'quote inline-thing)))
       (when (and extra-info (not (keywordp extra-info)))
         (setq extra-info (list 'quote extra-info)))
-      `(progn
-         (eval-when (:compile-toplevel)
-           (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
-         ,(if (block-compilation-non-entry-point name)
-              `(progn
-                 ;; Tell the compiler to convert the lambda without
-                 ;; referencing it, so no stray reference stays around
-                 ;; and find-initial-dfo works correctly.
-                 (sb-c::%fun-name-leaf ,named-lambda)
-                 ',name)
-              `(%defun ',name ,named-lambda
-                       ,@(when (or inline-thing extra-info) `(,inline-thing))
-                       ,@(when extra-info `(,extra-info))))
-         ;; This warning, if produced, comes after the DEFUN happens.
-         ;; When compiling, there's no real difference, but when interpreting,
-         ;; if there is a handler for style-warning that nonlocally exits,
-         ;; it's wrong to have skipped the DEFUN itself, since if there is no
-         ;; function, then the warning ought not to have been issued at all.
-         ,@(when (typep name '(cons (eql setf)))
-             `((eval-when (:compile-toplevel :execute)
-                 (sb-c::warn-if-setf-macro ',name))
-               ',name)))))))
+      (let ((definition
+              (if (block-compilation-non-entry-point name)
+                  `(progn
+                     (sb-c::%refless-defun ,named-lambda)
+                     ',name)
+                  `(%defun ',name ,named-lambda
+                           ,@(when (or inline-thing extra-info) `(,inline-thing))
+                           ,@(when extra-info `(,extra-info))))))
+       `(progn
+          (eval-when (:compile-toplevel)
+            (sb-c:%compiler-defun ',name t ,inline-thing ,extra-info))
+          ,(if source-form
+               `(sb-c::with-source-form ,source-form ,definition)
+               definition)
+          ;; This warning, if produced, comes after the DEFUN happens.
+          ;; When compiling, there's no real difference, but when interpreting,
+          ;; if there is a handler for style-warning that nonlocally exits,
+          ;; it's wrong to have skipped the DEFUN itself, since if there is no
+          ;; function, then the warning ought not to have been issued at all.
+          ,@(when (typep name '(cons (eql setf)))
+              `((eval-when (:compile-toplevel :execute)
+                  (sb-c::warn-if-setf-macro ',name))
+                ',name))))))))
 
 ;;; This is one of the major places where the semantics of block
-;;; compilation is handled.  Substitution for global names is totally
-;;; inhibited if (block-compile *compilation*) is NIL.  And if
+;;; compilation is handled. Substitution for global names is totally
+;;; inhibited if (block-compile *compilation*) is NIL. And if
 ;;; (block-compile *compilation*) is true and entry points are
 ;;; specified, then we don't install global definitions for non-entry
 ;;; functions (effectively turning them into local lexical functions.)
   (sb-xc:defmacro defun (&environment env name lambda-list &body body)
     "Define a function at top level."
-    (check-designator name defun)
+    (check-designator name 'defun #'legal-fun-name-p "function name")
     #+sb-xc-host
     (unless (cl:symbol-package (fun-name-block-name name))
       (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
     (defun-expander env name lambda-list body nil))
 
   ;; extended defun as used by defstruct
-  (sb-xc:defmacro sb-c:xdefun (&environment env name snippet lambda-list &body body)
-    (defun-expander env name lambda-list body snippet)))
+  (sb-xc:defmacro sb-c:xdefun (&environment env name snippet source-form lambda-list &body body)
+    (defun-expander env name lambda-list body snippet source-form)))
 
 ;;;; DEFCONSTANT, DEFVAR and DEFPARAMETER
 
@@ -173,17 +196,16 @@ tree structure resulting from the evaluation of EXPRESSION."
   compiled into code. If the variable already has a value, and this is not
   EQL to the new value, the code is not portable (undefined behavior). The
   third argument is an optional documentation string for the variable."
-  (check-designator name defconstant)
+  (check-designator name 'defconstant)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (sb-c::%defconstant ',name ,value (sb-c:source-location)
-                         ,@(and docp `(',doc)))))
+     (%defconstant ',name ,value (sb-c:source-location)
+                   ,@(and docp `(',doc)))))
 
 
 (declaim (ftype (sfunction (symbol t &optional t t) null)
                 about-to-modify-symbol-value))
 ;;; the guts of DEFCONSTANT
-
-(defun sb-c::%defconstant (name value source-location &optional (doc nil docp))
+(defun %defconstant (name value source-location &optional (doc nil docp))
   #+sb-xc-host (declare (ignore doc docp))
   (unless (symbolp name)
     (error "The constant name is not a symbol: ~S" name))
@@ -211,7 +233,16 @@ tree structure resulting from the evaluation of EXPRESSION."
                 ;; Non-continuable error.
                 (about-to-modify-symbol-value name 'defconstant)
                 (let ((old (symbol-value name)))
-                  (unless (eql value old)
+                  (unless (or (eql value old)
+                              ;; SAPs behave like numbers but yet EQL doesn't work on them,
+                              ;; special case it.
+                              ;; Nobody will notices that the constant
+                              ;; is not EQ, since it can be copied at
+                              ;; any time anyway.
+                              #-sb-xc-host
+                              (and (system-area-pointer-p old)
+                                   (system-area-pointer-p value)
+                                   (sap= old value)))
                     (multiple-value-bind (ignore aborted)
                         (with-simple-restart (abort "Keep the old value.")
                           (cerror "Go ahead and change the value."
@@ -221,13 +252,16 @@ tree structure resulting from the evaluation of EXPRESSION."
                                   :new-value value))
                       (declare (ignore ignore))
                       (when aborted
-                        (return-from sb-c::%defconstant name))))))
+                        (return-from %defconstant name))))))
             (warn "redefining a MAKUNBOUND constant: ~S" name)))
        (:unknown
         ;; (This is OK -- undefined variables are of this kind. So we
         ;; don't warn or error or anything, just fall through.)
         )
        (t (warn "redefining ~(~A~) ~S to be a constant" kind name)))))
+  (dolist (backpatch (info :variable :forward-references name))
+    (funcall backpatch value))
+  (clear-info :variable :forward-references name)
   ;; We ought to be consistent in treating any change of :VARIABLE :KIND
   ;; as a continuable error. The above CASE expression pre-dates the
   ;; existence of symbol-macros (I believe), but at a bare minimum,
@@ -240,7 +274,16 @@ tree structure resulting from the evaluation of EXPRESSION."
     (when docp
       (setf (documentation name 'variable) doc))
     (%set-symbol-value name value))
+  ;; Define the constant in the cross-compilation host, since the
+  ;; value is used when cross-compiling for :COMPILE-TOPLEVEL contexts
+  ;; which reference the constant.
+  #+sb-xc-host
+  (eval `(unless (boundp ',name) (defconstant ,name ',value)))
   (setf (info :variable :kind name) :constant)
+  ;; Deoptimize after changing it to :CONSTANT, and not before, though tbh
+  ;; if your code cares about the timing of PROGV relative to DEFCONSTANT,
+  ;; well, I can't even.
+  #-sb-xc-host (sb-c::unset-symbol-progv-optimize name)
   name)
 
 (sb-xc:defmacro defvar (var &optional (val nil valp) (doc nil docp))
@@ -248,7 +291,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   SPECIAL and, optionally, initialize it. If the variable already has a
   value, the old value is not clobbered. The third argument is an optional
   documentation string for the variable."
-  (check-designator var defvar)
+  (check-designator var 'defvar)
   ;; Maybe kill docstring, but only under the cross-compiler.
   #+(and (not sb-doc) sb-xc-host) (setq doc nil)
   `(progn
@@ -272,7 +315,7 @@ tree structure resulting from the evaluation of EXPRESSION."
   variable special and sets its value to VAL, overwriting any
   previous value. The third argument is an optional documentation
   string for the parameter."
-  (check-designator var defparameter)
+  (check-designator var 'defparameter)
   ;; Maybe kill docstring, but only under the cross-compiler.
   #+(and (not sb-doc) sb-xc-host) (setq doc nil)
   `(progn
@@ -282,8 +325,53 @@ tree structure resulting from the evaluation of EXPRESSION."
                     ,@(and docp
                            `(',doc)))))
 
+(defun %compiler-defvar (var)
+  (proclaim `(special ,var)))
+
+
+;;;; DEFGLOBAL and DEFINE-LOAD-TIME-GLOBAL
+
+(sb-xc:defmacro defglobal (name value &optional (doc nil docp))
+  "Defines NAME as a global variable that is always bound. VALUE is evaluated
+and assigned to NAME both at compile- and load-time, but only if NAME is not
+already bound.
+
+Global variables share their values between all threads, and cannot be
+locally bound, declared special, defined as constants, and neither bound
+nor defined as symbol macros.
+
+See also the declarations SB-EXT:GLOBAL and SB-EXT:ALWAYS-BOUND."
+  (check-designator name 'defglobal)
+  (let ((boundp (make-symbol "BOUNDP")))
+    `(progn
+       (eval-when (:compile-toplevel)
+         (let ((,boundp (boundp ',name)))
+           (%compiler-defglobal ',name :always-bound
+                                (not ,boundp) (unless ,boundp ,value))))
+       (%defglobal ',name
+                   (if (%boundp ',name) (make-unbound-marker) ,value)
+                   (sb-c:source-location)
+                   ,@(and docp `(',doc))))))
+
+(sb-xc:defmacro define-load-time-global (name value &optional (doc nil docp))
+  "Defines NAME as a global variable that is always bound. VALUE is evaluated
+and assigned to NAME at load-time, but only if NAME is not already bound.
+
+Attempts to read NAME at compile-time will signal an UNBOUND-VARIABLE error
+unless it has otherwise been assigned a value.
+
+See also DEFGLOBAL which assigns the VALUE at compile-time too."
+  (check-designator name 'define-load-time-global)
+  `(progn
+     (eval-when (:compile-toplevel)
+       (%compiler-defglobal ',name :eventually nil nil))
+     (%defglobal ',name
+                 (if (%boundp ',name) (make-unbound-marker) ,value)
+                 (sb-c:source-location)
+                 ,@(and docp `(',doc)))))
+
 (defun %compiler-defglobal (name always-boundp assign-it-p value)
-  (sb-xc:proclaim `(global ,name))
+  (proclaim `(global ,name))
   (when assign-it-p
     (set-symbol-global-value name value))
   (sb-c::process-variable-declaration
@@ -292,9 +380,6 @@ tree structure resulting from the evaluation of EXPRESSION."
    (if (eq (info :variable :always-bound name) :always-bound)
        :always-bound
        always-boundp)))
-
-(defun %compiler-defvar (var)
-  (sb-xc:proclaim `(special ,var)))
 
 
 ;;;; various conditional constructs
@@ -358,7 +443,7 @@ evaluated as a PROGN."
     (prog-expansion-from-let varlist body-decls 'let*)))
 
 (sb-xc:defmacro prog1 (result &body body)
-  (let ((n-result (sb-xc:gensym)))
+  (let ((n-result (gensym)))
     `(let ((,n-result ,result))
        (progn
          ,@body
@@ -398,7 +483,7 @@ evaluated as a PROGN."
            ;; Preserve non-toplevelness of the form!
            (let ((car (car forms))) (if nested car `(the t ,car))))
           (t
-           (let ((n-result (sb-xc:gensym)))
+           (let ((n-result (gensym)))
              `(let ((,n-result ,(first forms)))
                 (if ,n-result
                     ,n-result
@@ -422,12 +507,13 @@ evaluated as a PROGN."
       ;; Certainly for the evaluator it's preferable.
       `(let ((,(car vars) ,value-form))
          ,@body)
-      (let ((ignore (sb-xc:gensym)))
-        `(multiple-value-call #'(lambda (&optional ,@(mapcar #'list vars)
+      (flet ((maybe-list (x) (if (member x lambda-list-keywords) (list x) x)))
+        (let ((ignore '#:ignore))
+          `(multiple-value-call #'(lambda (&optional ,@(mapcar #'maybe-list vars)
                                          &rest ,ignore)
                                   (declare (ignore ,ignore))
                                   ,@body)
-                              ,value-form))))
+                              ,value-form)))))
 
 (sb-xc:defmacro multiple-value-setq (vars value-form)
   (validate-vars vars)
@@ -457,7 +543,7 @@ evaluated as a PROGN."
                                           1000
                                           10))) ; Arbitrary limit.
         (let ((dummy-list (make-gensym-list val))
-              (keeper (sb-xc:gensym "KEEPER")))
+              (keeper (gensym "KEEPER")))
           `(multiple-value-bind (,@dummy-list ,keeper) ,form
              (declare (ignore ,@dummy-list))
              ,keeper))
@@ -579,14 +665,18 @@ invoked. In that case it will store into PLACE and start over."
   ;; variable to work around Python's blind spot in type derivation.
   ;; For more complex places getting the type derived should not
   ;; matter so much anyhow.
-  (let ((expanded (%macroexpand place env)))
+  (let ((expanded (%macroexpand place env))
+        (type (let ((ctype (sb-c::careful-specifier-type type)))
+                (if ctype
+                    (type-specifier ctype)
+                    type))))
     (if (symbolp expanded)
         `(do ()
              ((typep ,place ',type))
            (setf ,place (check-type-error ',place ,place ',type
                                           ,@(and type-string
                                                  `(,type-string)))))
-        (let ((value (sb-xc:gensym)))
+        (let ((value (gensym)))
           `(do ((,value ,place ,place))
                ((typep ,value ',type))
              (setf ,place
@@ -628,7 +718,8 @@ invoked. In that case it will store into PLACE and start over."
 
 (sb-xc:defmacro define-compiler-macro (name lambda-list &body body)
   "Define a compiler-macro for NAME."
-  (check-designator name define-compiler-macro)
+  (check-designator name 'define-compiler-macro
+      #'legal-fun-name-p "function name")
   (when (and (symbolp name) (special-operator-p name))
     (%program-error "cannot define a compiler-macro for a special operator: ~S"
                     name))
@@ -637,11 +728,13 @@ invoked. In that case it will store into PLACE and start over."
   (let ((def (make-macro-lambda (sb-c::debug-name 'compiler-macro name)
                                 lambda-list body 'define-compiler-macro name
                                 :accessor 'sb-c::compiler-macro-args)))
+    ;; FIXME: Shouldn't compiler macros also get source locations?
+    ;; Plain DEFMACRO supplies source location information.
     `(progn
-          (eval-when (:compile-toplevel)
-           (sb-c::%compiler-defmacro :compiler-macro-function ',name))
-          (eval-when (:compile-toplevel :load-toplevel :execute)
-           (sb-c::%define-compiler-macro ',name ,def)))))
+       (eval-when (:compile-toplevel)
+         (sb-c::%compiler-defmacro :compiler-macro-function ',name))
+       (eval-when (:compile-toplevel :load-toplevel :execute)
+         (sb-c::%define-compiler-macro ',name ,def)))))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun sb-c::%define-compiler-macro (name definition)
@@ -672,269 +765,147 @@ invoked. In that case it will store into PLACE and start over."
         (case-warning-case-kind condition)
         (duplicate-case-key-warning-occurrences condition)))))
 
-#|
-;;; ---------------------------------------------------------------------------
-;;; And now some theory about how to turn CASE expressions which dispatch on
-;;; symbols into expressions which dispatch on numbers instead. The idea is
-;;; to use SYMBOL-HASH. It is easily enforceable that symbols referenced from
-;;; compiled code have a hash, though generally SYMBOL-HASH is lazily computed.
-;;; The masked hash maps to an integer from 0 to (ASH 1 nbits) which will be
-;;; dispatched via a jump table on compiler backends which support jump tables.
+;;; Return three values:
+;;; 1. an array of LAYOUT
+;;; 2. an array of (unsigned-byte 16) for the clause index to select
+;;; 3. an expression mapping each layout in LAYOUT-LISTS to an integer 0..N-1
+(defun build-sealed-struct-typecase-map (layout-lists hashes)
+  ;; The hash-generator emulator wants a cookie identifying the set of objects
+  ;; that were hashed.
+  (let ((lambda (sb-c:make-perfect-hash-lambda
+                 hashes
+                 #+sb-xc-host
+                 (map 'vector
+                      (lambda (list)
+                        (mapcar (lambda (layout)
+                                  (list :type (classoid-name (layout-classoid layout))))
+                                list))
+                      layout-lists))))
+    (unless lambda
+      (return-from build-sealed-struct-typecase-map (values nil nil nil)))
+    (let* ((phashfun (sb-c::compile-perfect-hash lambda hashes))
+           (n (length hashes))
+           (domain (make-array n :initial-element nil))
+           (range (sb-xc:make-array n :element-type '(unsigned-byte 16))))
+      (loop for clause-index from 1 for list across layout-lists
+          do (dolist (layout list)
+               (let* ((hash (ldb (byte 32 0) (layout-clos-hash layout)))
+                      (index (funcall phashfun hash)))
+                 (aver (null (aref domain index)))
+                 (setf (aref domain index) layout
+                       (aref range index) clause-index))))
+      (values domain range lambda))))
 
-;;; There are complications that make any naive attempt to dispatch on hash
-;;; inadmissible. First off, any symbol could hash to the hash of a symbol
-;;; in the dispatched set, so there always has to be a check for a match on
-;;; the symbol. That's the easy part. The difficulty is figuring out what to
-;;; do with hash collisions; but worse, symbols within a given clause of the
-;;; CASE (having the same consequent) may hash differently.
-;;; Consider one example.
+(declaim (ftype function sb-pcl::emit-cache-lookup))
+(defun optimize-%typecase-index (layout-lists object sealed)
+  ;; If no new subtypes can be defined, then there is a compiled-time-computable
+  ;; mapping from CLOS-hash to jump table index.
+  ;; Try the hash-based expansion if applicable. It's allowed to fail, as it will
+  ;; when 32-bit hashes are nonunique.
+  (when sealed
+    ;; TODO: this could eliminate an array lookup when there is only a single layout
+    ;; per clause. So instead of the perfect hash identifying a clause index via lookup,
+    ;; the hash _is_ the clause index; the clauses in the CASE need to be permuted
+    ;; to match the hashes, which doesn't work in the way TYPECASE currently expands.
+    (let ((seen-layouts)
+          (expanded-lists (make-array (length layout-lists) :initial-element nil))
+          (index 0))
+      (flet ((add-to-clause (layout)
+               (unless (member layout seen-layouts)
+                 (push layout seen-layouts)
+                 (push layout (aref expanded-lists index)))))
+        (dovector (layouts layout-lists)
+          (dolist (layout layouts)
+            ;; unless this layout was in a prior clause
+            (when (add-to-clause layout)
+              (sb-kernel::do-subclassoids ((classoid layout) (layout-classoid layout))
+               (declare (ignore classoid))
+               (add-to-clause layout))))
+          (incf index)))
+      (let ((hashes (map '(array (unsigned-byte 32) (*))
+                         (lambda (x) #+64-bit (ldb (byte 32 0) (layout-clos-hash x))
+                                     #-64-bit (layout-clos-hash x))
+                         seen-layouts)))
+        (multiple-value-bind (layouts indices expr)
+            (build-sealed-struct-typecase-map expanded-lists hashes)
+          (when expr
+            (return-from optimize-%typecase-index
+              `(truly-the
+                (integer 0 ,(length layout-lists))
+                (if (not (%instancep ,object))
+                    0
+                    (let* ((l (%instance-layout ,object)) ; layout
+                           (h (,expr (ldb (byte 32 0) (layout-clos-hash l))))) ; perfect hash
+                      (if (and (< h ,(length layouts)) (eq l (svref ,layouts h)))
+                          (aref ,indices h)
+                          0))))))))))
+  ;; The generated s-expression is too sensitive to the order LOAD-TIME-VALUE fixups are
+  ;; patched in by cold-init. You'll have a bad time if CACHE-CELL is an unbound-marker.
+  #+sb-xc-host (error "PCL cache won't work for cross-compiled TYPECASE")
+  ;; Use a PCL cache when the sealed logic was inapplicable (or failed due to hash collisions).
+  ;; A cache is usually an improvement over sequential tests but it's impossible to know
+  ;; (the first clause could get taken 99% of the time)
+  (let ((n (length layout-lists)))
+    `(truly-the
+      (integer 0 ,n)
+      (if (not (%instancep ,object))
+          0
+          ;; TODO: if we access the cache by layout ID instead of the object,
+          ;; one word can store the layout ID and the clause index
+          ;; (certainly true for 64-bit, maybe not 32).
+          ;; The benefit would be never having to observe a key lacking a value.
+          ;; Also: we don't really need the test for the object layout's hash is 0
+          ;; because it can't be. On the other hand, we might want to utilize
+          ;; this macro on STANDARD-OBJECT.
+          (prog* ((clause 0)
+                  (cache-cell
+                   (load-time-value
+                    ;; Assume the cache will want at least N lines
+                    (cons (sb-pcl::make-cache :key-count 1 :size ,n :value t)
+                          ,layout-lists)))
+                  (cache (car (truly-the cons cache-cell)))
+                  (layout (%instance-layout ,object)))
+             (declare (optimize (safety 0)))
+             ,(sb-pcl::emit-cache-lookup 'cache '(layout) 'miss 'clause)
+             (return clause)
+           MISS
+             (return (sb-pcl::%struct-typecase-miss ,object cache-cell)))))))
 
-(CASE sym
- ((u v) (cc1)) ; "CC" designates the "canonical clause" in that ordinal position
- ((w x) (cc2))
- ((y z) (cc3)))
-
-;;; In reality, we would probably find a subset of bits of SYMBOL-HASH producing
-;;; unique bins, but suppose for argument's sake that there are collisions:
-
-hash bin 0: (u . cc1) (w . cc2)
-hash bin 1: (v . cc1) (y . cc3)
-hash bin 2: (x . cc2) (z . cc3)
-hash bin 3: - empty -
-
-;;; Something has to be done to resolve the selection of the consequent.
-;;; Described below are 4 possible techniques.
-
-;;; Option (I)
-;;; Syntactically repeat clause consequents giving a literal rendering
-;;; of the hash-table.  This is a poor choice unless the consequent
-;;; is a self-evaluating object. But it has the nice property of invoking
-;;; at most one IF after the jump-table-based dispatch.
-
-(case hash
-  (0 (if (eq sym 'u) (cc1) (cc2)))  ; each canonical consequent appears twice
-  (1 (if (eq sym 'v) (cc1) (cc3)))
-  (2 (if (eq sym 'x) (cc2) (cc3))))
-
-;;; Option (II)
-;;; Merge bins to create equivalence classes by canonical clause.
-
-(case hash
-  ((0 1) (case sym (y (cc3)) (w (cc2)) (otherwise (cc1))))
-  (2 (if (eq sym 'x) (cc2) (cc3)))
-
-;;; So this expansion has avoided inserting the s-expression CC1 more than once,
-;;; but it inserts CC2 and CC3 each twice.  If those are not self-evaluating
-;;; literals, then we should further merge (0 1) with (2). Doing the second
-;;; merge lumps everything into 1 bin which is as bad as, if not worse than,
-;;; a chain if IF expressions testing the original symbol.
-;;; i.e. bin merging could make the hashing operation pointless.
-
-;;; Option (III)
-;;; Use a "two-stage" decode.
-;;; This makes the consequent of the inner case side-effect free,
-;;; but is probably not great for performance, though is an elegant
-;;; rendition of the equivalence class technique.
-
-(let ((original-clause-index
-       (case hash
-        (0 (if (eq sym 'u) 1 2))
-        (1 (if (eq sym 'v) 1 3))
-        (2 (if (eq sym 'x) 2 3)))))
-  (case original-clause-index (1 (cc1)) (2 (cc2)) (3 (cc3))))
-
-;;; Option (IV)
-;;; Expand involving a tagbody, which though slightly ugly, presumably produces
-;;; decent assembly code.
-
-(block b
- (tagbody
-
-   (case hash
-     (0 (if (eq sym 'u) (go clause1) (go clause2)))
-     (1 (if (eq sym 'v) (go clause1) (go clause3)))
-     (2 (if (eq sym 'x) (go clause2) (go clause3))))
-   clause1 (return-from b (progn (cc1)))
-   clause2 (return-from b (progn (cc2)))
-   ...))
-
-;;; Additionally, if some bin has only 1 possibility, the GO is elided
-;;; and we can just do (return-from b (consequent)).
-
-;;; In practice, the expander does something not entirely unlike any of the above.
-;;; It will insert a consequent more than one time if it is a self-evaluating object,
-;;; and it will merge bins provided that the merging is simple and does not
-;;; introduce any new IF expressions.
-
-;;; A minimal example that won't work - after forcing the expander to try to
-;;; operate on just 4 symbols which normally it would not try to process:
-;;; (CASE (H) ((U V) (F)) ((:U :Z) Y))
-clause 0 -> bins (2 3)
-clause 1 -> bins (1 2)
-bin 0 -> NIL
-bin 1 -> ((:Z . 1))
-bin 2 -> ((:U . 1) (U . 0))
-bin 3 -> ((V . 0))
-symbol-case giving up: case=((V U) (F))
-
-;;; ---------------------------------------------------------------------------
-|#
-
-;;; For the specified symbols, choose bits from the hash producing as near a
-;;; perfect hash function as can be achived without extraction of one
-;;; byte or logxor of two bytes.
-;;; This will fail to find a unique hash if there are symbols whose names are
-;;; spelled the same, since their SXHASHes are the same.
-;;;
-;;; HASH-FUN is taken as an argument mainly for testing purposes so that any
-;;; behavior can be simulated without having to bother with finding symbols
-;;; whose SXHASH hashes collide.
-;;;
-;;; FIXME: If not a perfect hash, then the best choice should be informed by a
-;;; cost function that takes into account which symbols share a clause of the
-;;; CASE form. Prefer collisions on symbols whose consequent in the CASE
-;;; is the same, otherwise the expansion becomes convoluted.
-
-(defun pick-best-sxhash-bits (keys &optional (hash-fun 'sxhash)
-                                             (maxbytes 2)
-                                             (maxbits sb-vm:n-positive-fixnum-bits))
-  (declare (type (member 1 2) maxbytes))
-  (unless keys
-    (bug "Give me some objects")) ; it beats getting division by zero error
-  (let* ((nkeys (length keys))
-         (ideal-table-size (power-of-two-ceiling nkeys))
-         (required-nbits (integer-length (1- ideal-table-size)))
-         ;; If each bin has 2 items in it (which isn't ideal), then the table could
-         ;; be half the "required" minimum size. This occurs with symbol sets such
-         ;; as {AND, NOT, OR, :AND, :NOT, :OR} on account of the fact that hashing
-         ;; by string produces 2 of each hash.
-         (smallest-nbits (max 2 (1- required-nbits)))
-         (largest-nbits (1+ required-nbits)) ; allow double the required minimum
-         (hashes (mapcar hash-fun keys)))
-    (macrolet ((stats (mixer answer)
-                 ;; Compute the average number of items per bin,
-                 ;; looking only at bins that contain something.
-                 ;; It does not improve things to increase the total bins
-                 ;; without distributing items into at least 1 more bin.
-                 `(progn
-                    (fill bin-counts 0)
-                    (dolist (hash hashes)
-                      (incf (aref bin-counts ,mixer)))
-                    (let ((max-bin-count 0) (n-used 0))
-                      (dovector (count bin-counts)
-                        (when (plusp count) (incf n-used))
-                        (setf max-bin-count (max count max-bin-count)))
-                      (when (= max-bin-count 1) ; can't beat a perfect hash
-                        (return-from try (values 1 ,answer)))
-                      (let ((average (/ nkeys n-used)))
-                        (when (or (< max-bin-count best-max-bin-count)
-                                  (and (= max-bin-count best-max-bin-count)
-                                       (< average best-average)))
-                          (setq best-answer ,answer
-                                best-max-bin-count max-bin-count
-                                best-average average)))))))
-      (flet ((try-one-byte ()
-               (let ((best-answer nil)
-                     ;; "best" means smallest
-                     (best-max-bin-count most-positive-fixnum) ; sentinel value
-                     (best-average most-positive-fixnum))
-                 (loop named try
-                       for nbits from smallest-nbits to largest-nbits
-                       do (let ((bin-counts (make-array (ash 1 nbits) :initial-element 0)))
-                            (dotimes (pos (- (1+ maxbits) nbits))
-                              (stats (ldb (byte nbits pos) hash) (byte nbits pos))))
-                       finally (return-from try (values best-max-bin-count best-answer)))))
-             (try-two-bytes ()
-               (let ((best-answer nil)
-                     (best-max-bin-count most-positive-fixnum)
-                     (best-average most-positive-fixnum))
-                 (loop named try
-                       for nbits from smallest-nbits to largest-nbits
-                       do (let ((bin-counts (make-array (ash 1 nbits) :initial-element 0)))
-                            (dotimes (pos1 (- (1+ maxbits) nbits))
-                              (dotimes (pos2 pos1)
-                                (stats (logxor (ldb (byte nbits pos1) hash)
-                                               (ldb (byte nbits pos2) hash))
-                                       (vector (byte nbits pos1) (byte nbits pos2))))))
-                        finally (return-from try (values best-max-bin-count best-answer))))))
-        (multiple-value-bind (score1 answer1) (try-one-byte)
-          ;; Return if perfect score, or if caller doesn't want to try using two bytes
-          (if (or (= score1 1) (= maxbytes 1))
-              (values score1 answer1)
-              (multiple-value-bind (score2 answer2) (try-two-bytes)
-                (if (<= score1 score2)
-                    (values score1 answer1) ; not improved
-                    (values score2 answer2))))))))) ; 2 bytes = better
-
-;;; TODO: see if it's possible to not use SXHASH on layouts here.
-;;;  (etypecase x
-;;;    ((or named-type numeric-type member-type classoid ..) something)
-;;; -> (SB-IMPL::%SEALED-STRUCT-TYPECASE-INDEX
-;;;     ((named-type numeric-type member-type classoid ...)CHARACTER-SET-TYPE
-;;; -> (LET* ((ARRAY
-;;;            #(4048 NIL NIL NIL NIL NIL
-;;;              ((#<LAYOUT for ALIEN-TYPE-TYPE {50202A03}> . 1)) NIL
-;;;              ((#<LAYOUT for NAMED-TYPE {50202503}> . 1)) NIL NIL
-;;;
-(defun build-sealed-struct-typecase-map (type-unions)
-  (let* ((layout-lists
-          (mapcar (lambda (x) (mapcar #'find-layout x)) type-unions))
-         (byte (nth-value 1
-                (pick-best-sxhash-bits (apply #'append layout-lists)
-                                       #'layout-clos-hash 1)))
-         (bin-count (ash 1 (byte-size byte)))
-         (array (make-array (1+ bin-count) :initial-element nil))
-         (mask (1- bin-count))
-         (seen))
-    (setf (aref array 0) (logior (ash mask 6) (byte-position byte)))
-    (loop for layout-list in layout-lists
-          for i from 1
-          do (dolist (layout layout-list)
-               (unless (member layout seen) ; in case of dups / overlaps
-                 (push layout seen)
-                 (let ((bin (1+ (logand (ash (layout-clos-hash layout)
-                                             (- (the (mod #.sb-vm:n-word-bits)
-                                                     (byte-position byte))))
-                                        (the (and fixnum unsigned-byte) mask)))))
-                   (setf (aref array bin)
-                         (nconc (aref array bin) (list (cons layout i))))))))
-    array))
-
-;;; FIXME: now that structure classoid hashes are computable at compile-time,
-;;; we can do ever better in this expander: if the hash is perfect,
-;;; then do not iterate over candidates, just flatten the array into
-;;;   #(<LAYOUT> case-index #<LAYOUT> case-index ...)
-;;; then test for a hit on the indexed layout, get the case-index, and jump.
-(sb-xc:defmacro %sealed-struct-typecase-index (cases object)
-  `(if (%instancep ,object)
-       (locally (declare (optimize (safety 0)))
-         ;; When the second argument to LOAD-TIME-VALUE is T in COMPILE (but not COMPILE-FILE)
-         ;; then element 0 of the vector is used as a compile-time constant and we'll wire in
-         ;; the shift and mask which produces an even better instruction sequence.
-         ;; This is pretty awesome and I did not know that we would do that.
-         (let* ((array ,(build-sealed-struct-typecase-map cases))
-                (layout (%instance-layout ,object))
-                (hash-spec (the fixnum (svref array 0)))
-                (shift (ldb (byte ,(integer-length (1- sb-vm:n-word-bits)) 0)
-                            hash-spec)))
-           (the (mod ,(1+ (length cases)))
-                ;; DOLIST performs a leading test, but we're OK with a cell
-                ;; that is NIL. It'll miss and then exit at the end of the loop.
-                ;; This potentially avoids one comparison vs NIL if we hit immediately.
-                (let ((list (svref array
-                                   (1+ (logand (ash (layout-clos-hash layout) (- shift))
-                                               (ash hash-spec -6))))))
-                  (loop (let ((cell (car list)))
-                          (cond ((eq layout (car cell)) (return (cdr cell)))
-                                ((null (setq list (cdr list))) (return 0)))))))))
-       0))
+;;; Decide whether to bind EXPR to a random gensym or a COPY-SYMBOL, or not at all,
+;;; for purposes of CASE/TYPECASE. Lexical vars don't require rebinding because
+;;; no SET can occur in dispatching to a clause, and multiple refs are devoid
+;;; of side-effects (such as UNBOUND-SYMBOL or undefined-alien trap)
+(defun choose-tempvar (bind expr env)
+  (let ((bind
+         (cond ((or bind (consp expr)) t)
+               ((not (symbolp expr)) nil)
+               (t
+                (let ((found (and (sb-c::lexenv-p env)
+                                  (sb-c:lexenv-find expr vars :lexenv env))))
+                  (cond ((or (sb-c::global-var-p found)
+                             (listp found) ; special, macro, or not found
+                             (eq found :bogus)) ; PCL walker shenanigans
+                         t)
+                        ((sb-c::lambda-var-specvar found)
+                         (bug "can't happen"))
+                        (t
+                         nil)))))))
+    (cond ((not bind) expr)
+          ((and (symbolp expr)
+                ;; Some broken 3rd-party code walker is confused by #:_
+                ;; and this hack of forcing a random gensym seems
+                ;; to partially cure whatever the problem is.
+                (string/= expr "_"))
+           (copy-symbol expr))
+          (t
+           (gensym)))))
 
 ;;; Given an arbitrary TYPECASE, see if it is a discriminator over
 ;;; an assortment of structure-object subtypes. If it is, potentially turn it
 ;;; into a dispatch based on layout-clos-hash.
 ;;; The decision to use a hash-based lookup should depend on the number of types
 ;;; matched, but if there are a lot of types matched all rooted at a common
-;;; ancestor, it is not beneficial.
+;;; ancestor, it may not be as beneficial.
 ;;;
 ;;; The expansion currently works only with sealed classoids.
 ;;; Making it work with unsealed classoids isn't too tough.
@@ -945,393 +916,109 @@ symbol-case giving up: case=((V U) (F))
 ;;; In fact as far as I can tell, redefining a standard class doesn't require a new hash
 ;;; because the obsolete layout always gets clobbered to 0, and cache lookups always check
 ;;; for a match on both the hash and the layout.
-(defun expand-struct-typecase (keyform temp normal-clauses type-specs default errorp
-                               &aux (n-root-types 0) (exhaustive-list))
-  (flet ((discover-subtypes (specifier)
-           (let* ((parse (specifier-type specifier))
-                  (worklist
-                   (cond ((structure-classoid-p parse) (list parse))
-                         ((and (union-type-p parse)
-                               (every #'structure-classoid-p (union-type-types parse)))
-                          (copy-list (union-type-types parse)))
-                         (t
-                          (return-from discover-subtypes nil)))))
-             ;; Assume that each "root" type would require its own test based
-             ;; on %instance-layout of self and ancestor and that all root types
-             ;; are disjoint. This may not be true if a later one includes
-             ;; an earlier one.
-             (incf n-root-types (length worklist))
-             (collect ((visited))
-               (loop (unless worklist (return))
-                     (let ((classoid (pop worklist)))
-                       (visited classoid)
-                       (awhen (classoid-subclasses classoid)
-                         (dohash ((classoid layout) it)
-                           (declare (ignore layout))
-                           (unless (or (member classoid (visited))
-                                       (member classoid worklist))
-                             (setf worklist (nconc worklist (list classoid))))))))
-               (setf exhaustive-list (union (visited) exhaustive-list))
-               (visited)))))
-    (let ((classoid-lists (mapcar #'discover-subtypes type-specs)))
-      (when (or (some #'null classoid-lists)
-                (< n-root-types 6)
-                ;; Given something like:
-                ;; (typecase x
-                ;;   ((or parent1 parent2 parent3) ...)
-                ;;   ((or parent4 parent5 parent6) ...)
-                ;; where eaach parent has dozens of children (directly or indirectly),
-                ;; it may be worse to use a hash-based lookup.
-                (> (length exhaustive-list) (* 3 n-root-types)))
+(defun expand-struct-typecase (keyform normal-clauses type-specs default errorp)
+  (let* ((n (length type-specs))
+         (n-base-types 0)
+         (layout-lists (make-array n))
+         (exhaustive-list) ; of classoids
+         (temp (choose-tempvar t keyform nil))
+         (all-sealed t))
+    (labels
+        ((ok-classoid (classoid)
+           ;; Return T if this is a classoid this expander can work with.
+           ;; Also figure if all classoids accepted by this test were sealed.
+           (when (or (structure-classoid-p classoid)
+                     (and (sb-kernel::built-in-classoid-p classoid)
+                          (not (memq (classoid-name classoid)
+                                     sb-kernel::**non-instance-classoid-types**))))
+             ;; If this classoid is sealed, then its children are sealed too,
+             ;; and we don't need to verify that.
+             (unless (eq (classoid-state classoid) :sealed)
+               (setq all-sealed nil))
+             (sb-kernel::do-subclassoids ((subclassoid layout) classoid)
+               (declare (ignore layout))
+               (pushnew subclassoid exhaustive-list))
+             t))
+         (get-layouts (ctype)
+           (let ((list
+                  (cond ((ok-classoid ctype) (list (classoid-layout ctype)))
+                        ((and (union-type-p ctype)
+                              (every #'ok-classoid (union-type-types ctype)))
+                         (mapcar 'classoid-layout (union-type-types ctype))))))
+             (incf n-base-types (length list))
+             list)))
+      ;; For each clause, if it effectively an OR over acceptable instance types,
+      ;; collect the layouts of those types.
+      (loop for i from 0 for spec in type-specs
+            do (let ((parse (specifier-type spec)))
+                 (setf (aref layout-lists i) (or (get-layouts parse)
+                                                 (return-from expand-struct-typecase nil)))))
+      ;; The number of base types is an upper bound on the number of different TYPEP
+      ;; executions that could occur.
+      ;; Let's say 1 to 4 TYPEP tests isn't to bad. Just do them sequentially.
+      ;; But given something like:
+      ;; (typecase x
+      ;;   ((or parent1 parent2 parent3) ...)
+      ;;   ((or parent4 parent5 parent6) ...)
+      ;; where eaach parent has dozens of children (directly or indirectly),
+      ;; it may be worse to use a hash-based lookup.
+      (when (or (< n-base-types 5) ; too few cases
+                (> (length exhaustive-list) (* 3 n-base-types))) ; too much "bloat"
         (return-from expand-struct-typecase))
-      (if (every (lambda (classoids)
-                   (every (lambda (classoid)
-                            (eq (classoid-state classoid) :sealed))
-                          classoids))
-                 classoid-lists)
-          `(let ((,temp ,keyform))
-             (case (%sealed-struct-typecase-index
-                    ,(mapcar (lambda (list) (mapcar #'classoid-name list))
-                             classoid-lists)
-                    ,temp)
-               ,@(loop for i from 1 for clause in normal-clauses
-                       collect `(,i
-                                 ;; CLAUSE is ((TYPEP #:G 'a-type) NIL . forms)
-                                 (sb-c::%type-constraint ,temp ,(third (car clause)))
-                                 ,@(cddr clause)))
-               (0 ,@(if errorp
-                        `((etypecase-failure ,temp ',type-specs))
-                        (cddr default)))))
-          ;; not done
-          nil))))
+      ;; I don't know if these criteria are sane: Use hashing only if either all sealed,
+      ;; or very large? Why is this an additional restriction beyond the above heuristics?
+      (when (or all-sealed (>= n-base-types 8))
+        `(let ((,temp ,keyform))
+           (case (sb-kernel::%typecase-index ,layout-lists ,temp ,all-sealed)
+             ,@(loop for i from 1 for clause in normal-clauses
+                     collect `(,i
+                                   ;; CLAUSE is ((TYPEP #:G 'a-type) . forms)
+                                   (sb-c::%type-constraint ,temp ,(third (car clause)))
+                                   ,@(cdr clause)))
+             (0 ,@(if errorp
+                          `((etypecase-failure ,temp ',type-specs))
+                          (cdr default)))))))))
 
-;;; Turn a case over symbols into a case over their hashes.
-;;; Regarding the apparently redundant UNREACHABLE branches:
-;;; The first one causes the total number of ways to be (ASH 1 NBITS) exactly.
-;;; The second allows proper type derivation, because otherwise it is not obvious
-;;; (to the compiler) that all prior COND clauses were exhaustive.
-;;; This actually matters to to encoding of alien ENUM types. In the conventional
-;;; expansion of ECASE, all branches cover the enum, and the failure branch
-;;; ensures non-return of anything but an integer.
-;;; In the fancy expansion, we would get a compile-time error:
-;;;   debugger invoked on a SIMPLE-ERROR in thread
-;;;   #<THREAD "main thread" RUNNING {10005304C3}>:
-;;;     #<SB-C:TN t1 :NORMAL> is not valid as the first argument to VOP:
-;;;     SB-VM::MOVE-WORD-ARG
-;;; without the UNREACHABLE branch, because the expansion otherwise
-;;; looked as if the COND might return NIL.
-(defun expand-symbol-case (keyform clauses keys errorp hash-fun &optional (maxbytes 2))
-  (declare (ignorable keyform clauses keys errorp))
-  ;; for few keys, the clever algorithm  probably gives no better performance
-  ;; - and potentially worse - than the CPU's branch predictor.
-  (unless (>= (length keys) 6)
-    (return-from expand-symbol-case nil))
-  (multiple-value-bind (maxprobes byte) (pick-best-sxhash-bits keys hash-fun maxbytes)
-    (when (and (vectorp byte) (< (length keys) 9))
-      ;; It took two bytes to hash well enough. That's more fixed overhead,
-      ;; so require more symbols. Otherwise just go back to linear scan.
-      (return-from expand-symbol-case nil))
-    ;; (format t "maxprobes ~d byte ~s~%" maxprobes byte)
-    (when (> maxprobes 2) ; Give up (for now) if more than 2 keys hash the same.
-      #+sb-devel (format t "~&symbol-case giving up: probes=~d byte=~d~%"
-                         maxprobes byte)
-      (return-from expand-symbol-case nil))
-    (let* ((default (when (eql (caar clauses) 't) (pop clauses)))
-           (unique-symbols)
-           (clauses
-            ;; This is crummy, but we first have to undo our pre-expansion
-            ;; and remove dups. Otherwise the (BUG "Messup") below could occur.
-            (mapcar
-             (lambda (clause)
-               (destructuring-bind (antecedent . consequent) clause
-                 (aver (typep consequent '(cons (eql nil))))
-                 (pop consequent) ; strip the NIL that CASE-BODY inserts
-                 (when (typep antecedent '(cons (eql eql)))
-                   (setq antecedent `(or ,antecedent)))
-                 (flet ((extract-key (form) ; (EQL #:gN (QUOTE foo)) -> FOO
-                          (let ((third (third form)))
-                            (aver (typep third '(cons (eql quote))))
-                            (the symbol (second third)))))
-                   (let (clause-symbols)
-                     ;; De-duplicate across all clauses and within each clause
-                     ;; due to possible extreme stupidity in source code.
-                     (dolist (term (cdr antecedent))
-                       (aver (typep term '(cons (eql eql))))
-                       (let ((symbol (extract-key term)))
-                         (unless (member symbol unique-symbols)
-                           (push symbol unique-symbols)
-                           (push symbol clause-symbols))))
-                     (if clause-symbols ; all symbols could have dropped out
-                         (cons clause-symbols consequent)
-                         ;; give up. There are reasons the compiler should see
-                         ;; all subforms. Maybe not good reasons.
-                         (return-from expand-symbol-case nil))))))
-             (reverse clauses)))
-           (clause->bins (make-array (length clauses) :initial-element nil))
-           (table-nbits (byte-size (if (vectorp byte) (elt byte 0) byte)))
-           (bins (make-array (ash 1 table-nbits) :initial-element 0))
-           (symbol (sb-xc:gensym "S"))
-           (hash (sb-xc:gensym "H"))
-           (vector (sb-xc:gensym "V"))
-           (is-hashable
-            ;; For x86-64, any non-immediate object is considered hashable,
-            ;; so we only do a lowtag test on the object, though the correct hash
-            ;; is obtained only if the object is a symbol.
-            #+x86-64 `(pointerp ,symbol)
-            ;; For others backends, the set of keys in a particular CASE form
-            ;; makes a difference. NIL as a possible key mandates choosing SYMBOLP
-            ;; but NON-NULL-SYMBOL-P is the quicker test.
-            #-x86-64 `(,(if (member nil keys) 'symbolp 'non-null-symbol-p) ,symbol))
-           (sxhash
-             ;; Always access the pre-memoized value in the hash slot.
-             ;; SYMBOL-HASH* reads the word following the header word
-             ;; in any pointer object regardless of lowtag.
-             #+x86-64
-             (if (eq hash-fun 'sxhash) `(symbol-hash* ,symbol nil) `(,hash-fun ,symbol))
-             ;; For others, use SYMBOL-HASH.
-             #-x86-64 `(,(if (eq hash-fun 'sxhash) 'symbol-hash hash-fun) ,symbol))
-           (calc-hash
-             (if (vectorp byte) ; mix 2 bytes
-                 ;; FIXME: this could be performed as ((h >> c1) ^ (h >> c2)) & mask
-                 ;; instead of having two AND operations as it does now.
-                 (let ((b1 (elt byte 0)) (b2 (elt byte 1)))
-                   `(let ((,hash ,sxhash))
-                      (logxor (ldb (byte ,(byte-size b1) ,(byte-position b1)) ,hash)
-                              (ldb (byte ,(byte-size b2) ,(byte-position b2)) ,hash))))
-                 `(ldb (byte ,(byte-size byte) ,(byte-position byte)) ,sxhash))))
+(defun should-attempt-hash-based-case-dispatch (keys)
+  ;; Guess a good minimum table size, with a slight bias against using the xperfecthash files.
+  ;; If there are a mixture of key types, penalize slightly be requiring a larger minimum
+  ;; number of keys. If we don't do that, then the expression can have a ridiculous amount
+  ;; of math in it that would surely outweigh any savings over an IF/ELSE chain.
+  ;; Technically I should generate the perfect hash function and then decide how costly it is
+  ;; using PHASH-CONVERT-TO-2-OPERAND-CODE as the cost model (number of instructions).
+  (let ((minimum #+sb-xc-host 5 #-sb-xc-host 4))
+    (when (and (some #'symbolp keys) (or (some #'integerp keys) (some #'characterp keys)))
+      (incf minimum 2))
+    (>= (length keys) minimum)))
 
-      (flet ((trivial-result-p (clause)
-               ;; Return 2 values: T/NIL if the clause's consequent
-               ;; is trivial, and its value when trivial.
-               (let ((consequent (cdr clause)))
-                 (if (singleton-p consequent)
-                     (let ((form (car consequent)))
-                       (cond ((typep form '(cons (eql quote) (cons t null)))
-                              (values t (cadr form)))
-                             ((self-evaluating-p form) (values t form))
-                             (t (values nil nil))))
-                     ;; NIL -> T, otherwise -> NIL
-                     (values (not consequent) nil))))
-             (hash-bits (symbol)
-               (let ((sxhash (funcall hash-fun symbol)))
-                 (if (vectorp byte)
-                     (logxor (ldb (elt byte 0) sxhash)
-                             (ldb (elt byte 1) sxhash))
-                     (ldb byte sxhash)))))
-
-        ;; Try doing an array lookup if the hashing has no collisions and
-        ;; every consequent is trivial.
-        (when (= maxprobes 1)
-          (block try-table-lookup
-            (let ((values (make-array (length bins)))
-                  (single-value) ; only if exactly one clause
-                  (types nil))
-              (dolist (clause clauses)
-                (multiple-value-bind (trivialp value) (trivial-result-p clause)
-                  (unless trivialp
-                    (return-from try-table-lookup))
-                  (setq single-value value)
-                  (push (ctype-of value) types)
-                  (dolist (symbol (car clause))
-                    (let ((index (hash-bits symbol)))
-                      (aver (eql (aref bins index) 0)) ; no collisions
-                      (setf (aref bins index) symbol
-                            (aref values index) value)))))
-              (return-from expand-symbol-case
-                ;; FIXME: figure out how to eliminate the dead store.
-                ;; If hash gets used, then we store into it later, killing the initial store.
-                `(let ((,symbol ,keyform) (,hash 0))
-                   (if (and ,is-hashable (eq ,symbol (svref ,bins (setq ,hash ,calc-hash))))
-                       ,(if (singleton-p clauses)
-                            `',single-value
-                            `(truly-the ,(type-specifier (apply #'type-union types))
-                                        (aref ,(sb-c::coerce-to-smallest-eltype values)
-                                              ,hash)))
-                       ,(if errorp
-                            ;; coalescing of simple-vectors in a saved core
-                            ;; could eliminate repeated data from the same
-                            ;; ECASE that gets inlined many times over.
-                            `(ecase-failure
-                              ,symbol ,(coerce keys 'simple-vector))
-                            `(progn ,@(cddr default)))))))))
-
-        ;; Reset the bins, try it the long way
-        (fill bins nil)
-        ;; Place each symbol into its hash bin. Also, for each clause compute the
-        ;; set of hash bins that it has placed a symbol into.
-        (loop for clause in clauses for clause-index from 0
-              do (dolist (symbol (car clause))
-                   (let ((masked-hash (hash-bits symbol)))
-                     (pushnew masked-hash (aref clause->bins clause-index))
-                     (push (cons symbol clause-index) (aref bins masked-hash)))))
-        ;; Canonically order each element of clause->bins
-        (dotimes (i (length clause->bins))
-          (setf (aref clause->bins i) (sort (aref clause->bins i) #'<)))
-
-        ;; Perform a very limited bin merging step as follows: if a clause
-        ;; placed its symbols in more than one bin, allow it provided that either:
-        ;; - the clause's consequent is trivial, OR
-        ;; - none of its bins contains a symbol from a different clause.
-        ;; In the former case, we don't need to merge bins.
-        ;; In the latter case, the bins define an equivalence class
-        ;; that does not intersect any other equivalence class.
-        ;;
-        ;; To make this work, if a bin requires an IF to disambiguate which consequent
-        ;; to take, then it is removed from the clase->bins entry for each clause
-        ;; for which it contains a consequent so that the code below which computes
-        ;; the COND does not see the bin as a member of any equivalence class.
-        ;; Pass 1: decide whether to give up or go on.
-        (loop for clause in clauses for clause-index from 0
-              do (let ((equivalence-class (aref clause->bins clause-index)))
-                   ;; if a nontrivial consequent is distributed into
-                   ;; more than one hash bin ...
-                   (when (and (cdr equivalence-class)
-                              (not (trivial-result-p clause)))
-                     (dolist (bin-index (aref clause->bins clause-index))
-                       (dolist (item (aref bins bin-index))
-                         (unless (eql (cdr item) clause-index)
-                           #+sb-devel (format t "~&symbol-case gives up: case=~s~%" clause)
-                           (return-from expand-symbol-case)))))))
-        ;; Pass 2: remove bins with more than one consequent from their
-        ;; clause equivalence class.
-        ;; Maybe these passes could be combined, but I'd rather conservatively
-        ;; preserve accumulated data thus far before wrecking it.
-        (dotimes (bin-index (length bins))
-          (let ((unique-clause-indices
-                 (remove-duplicates (mapcar #'cdr (aref bins bin-index)))))
-            (when (cdr unique-clause-indices)
-              (dolist (clause-index unique-clause-indices)
-                (setf (aref clause->bins clause-index)
-                      (delete bin-index (aref clause->bins clause-index))))))))
-
-      ;; Compute the COND clauses over the range of hash values.
-      (let ((symbol-vector (make-array (* maxprobes (length bins)) :initial-element 0))
-            (cond-clauses))
-        ;; For each nonempty bin:
-        ;; - If it contains >1 consequent, then arbitrarily pick one symbol to test
-        ;;   to see which consequent pertains.
-        ;; - Otherwise, it contains exactly one consequent. See if the bin's equivalence
-        ;;   class has >1 item. If it does, insert for only a representative element.
-        ;;   By the above construction, no other bin in the class can have >1 consequent.
-        (flet ((action (clause-index)
-                 (let ((clause (nth clause-index clauses)))
-                   (or (cdr clause) '(nil)))))
-          (dotimes (bin-index (length bins))
-            (let* ((bin-contents (aref bins bin-index))
-                   (unique-clause-indices
-                    (remove-duplicates (mapcar #'cdr bin-contents)))
-                   (cond-clause
-                    (cond ((cdr unique-clause-indices)
-                           ;; Exactly 2 actions in the bin due to hardcoded limitation
-                           ;; on the implementation of collision resolution.
-                           `((eql ,hash ,bin-index)
-                             (cond ((eq ,symbol ',(caar bin-contents))
-                                    ,@(action (cdar bin-contents)))
-                                   (t
-                                    ,@(action (cdadr bin-contents))))))
-                          (unique-clause-indices
-                           (let* ((clause-index (car unique-clause-indices))
-                                  (equivalence-class (aref clause->bins clause-index)))
-                             (when (eql bin-index (car equivalence-class))
-                               ;; This is the representative bin of a class
-                               `(,(if (cdr equivalence-class)
-                                      `(or ,@(mapcar (lambda (x) `(eql ,hash ,x))
-                                                     equivalence-class))
-                                      `(eql ,hash ,bin-index))
-                                 ,@(action clause-index))))))))
-              (when cond-clause (push cond-clause cond-clauses)))))
-
-        ;; Fill in the symbol vector. Symbols in a bin are adjacent in the vector.
-        ;; 2 items per bin looks like so: | elt0 | elt1 | elt2 | elt3 | ...
-        ;;                                | <- bin 0 -> | <- bin 1 -> | ...
-        (dotimes (hash (length bins))
-          (let ((items (aref bins hash))
-                (index (* hash maxprobes)))
-            (dotimes (i maxprobes)
-              (unless items (return))
-              (setf (aref symbol-vector index) (car (pop items)))
-              (incf index))
-            (when items (bug "Messup in CASE vectors for ~S" keys))))
-
-        ;; If there is only one clause (plus possibly a default), then hash
-        ;; collisions do not need to be disambiguated. Hence it can be implemented
-        ;; as one or two array lookups.
-        (when (singleton-p clauses)
-          (return-from expand-symbol-case
-            `(let ((,symbol ,keyform) (,hash 0))
-               (if (and ,is-hashable
-                        ,(ecase maxprobes
-                           (1 `(eq (svref ,symbol-vector (setq ,hash ,calc-hash)) ,symbol))
-                           ;; FIXME: see why SVREF on constant vector of symbols would get
-                           ;; >1 header constant unless lexically bound.
-                           (2 `(let ((,vector ,symbol-vector))
-                                 (or (eq (svref ,vector (setq ,hash (ash ,calc-hash 1))) ,symbol)
-                                     (eq (svref ,vector (1+ ,hash)) ,symbol))))))
-                   (progn ,@(cdar clauses))
-                   ,(if errorp
-                        `(ecase-failure ,symbol ,(coerce keys 'simple-vector))
-                        `(progn ,@(cddr default)))))))
-
-        ;; Produce a COND only if the backend supports the multiway branch vop.
-        #+(or x86 x86-64)
-        (let ((block (sb-xc:gensym "B"))
-              (unused-bins))
-          ;; Take note of the unused bins
-          (dotimes (i (length bins))
-            (unless (aref bins i) (push i unused-bins)))
-          `(let ((,symbol ,keyform))
-             (block ,block
-               (when ,is-hashable
-                 (let ((,hash ,calc-hash))
-                   (declare (sb-c::no-constraints ,hash))
-                   ;; At most two probes are required, and usually just 1
-                   (when ,(ecase maxprobes
-                            (1 `(eq (svref ,symbol-vector ,hash) ,symbol))
-                            (2 `(let ((,vector ,symbol-vector)
-                                      (,hash (ash ,hash 1)))
-                                  (declare (sb-c::no-constraints ,hash))
-                                  (or (eq (svref ,vector ,hash) ,symbol)
-                                      (eq (svref ,vector (1+ ,hash)) ,symbol)))))
-                     (return-from ,block
-                       (cond ,@(nreverse cond-clauses)
-                             ,@(when unused-bins
-                                 ;; to make it clear that the number of "ways"
-                                 ;; is the exact right number, which avoids a range
-                                 ;; test in multiway-branch.
-                                 `(((or ,@(mapcar (lambda (x) `(eql ,hash ,x))
-                                                  (nreverse unused-bins)))
-                                    (unreachable))))
-                             (t (unreachable)))))))
-               ,@(if errorp
-                     `((ecase-failure ,symbol ,(coerce keys 'simple-vector)))
-                     (cddr default)))))))))
+(defun wrap-if (condition with form)
+  (if condition
+      (append with (list form))
+      form))
 
 ;;; CASE-BODY returns code for all the standard "case" macros. NAME is
-;;; the macro name, and KEYFORM is the thing to case on. MULTI-P
-;;; indicates whether a branch may fire off a list of keys; otherwise,
-;;; a key that is a list is interpreted in some way as a single key.
-;;; When MULTI-P, TEST is applied to the value of KEYFORM and each key
-;;; for a given branch; otherwise, TEST is applied to the value of
-;;; KEYFORM and the entire first element, instead of each part, of the
-;;; case branch. When ERRORP, no OTHERWISE-CLAUSEs are recognized,
-;;; and an ERROR form is generated where control falls off the end
-;;; of the ordinary clauses. When PROCEEDP, it is an error to
-;;; omit ERRORP, and the ERROR form generated is executed within a
-;;; RESTART-CASE allowing KEYFORM to be set and retested.
+;;; the macro name, and KEYFORM is the thing to case on.
+;;; When ERRORP, no OTHERWISE-CLAUSEs are recognized,
+;;; and an ERROR or CERROR form is generated where control falls off the end
+;;; of the ordinary clauses.
 
 ;;; Note the absence of EVAL-WHEN here. The cross-compiler calls this function
 ;;; and gets the compiled code that the host produced in make-host-1.
 ;;; If recompiled, you do not want an interpreted definition that might come
 ;;; from EVALing a toplevel form - the stack blows due to infinite recursion.
-(defun case-body (name keyform cases multi-p test errorp proceedp needcasesp)
-  (unless (or cases (not needcasesp))
-    (warn "no clauses in ~S" name))
-  (let ((keyform-value (gensym))
-        (clauses ())
-        (keys ())
-        (keys-seen (make-hash-table :test #'eql)))
-    (do* ((cases cases (cdr cases))
-          (case (car cases) (car cases))
+(defun case-body (whole lexenv test errorp
+                  &aux (clauses ())
+                       (case-clauses (if (eq test 'typep) '(0))) ; generalized boolean
+                       (keys))
+  (destructuring-bind (name keyform &rest specified-clauses
+                       &aux (keyform-value (choose-tempvar (eq errorp 'cerror)
+                                                           keyform lexenv)))
+      whole
+    (unless (or (cdr whole) (not errorp))
+      (warn "no clauses in ~S" name))
+    (do* ((cases specified-clauses (cdr cases))
+          (clause (car cases) (car cases))
+          (keys-seen (make-hash-table :test #'eql))
           (case-position 1 (1+ case-position)))
          ((null cases) nil)
       (flet ((check-clause (case-keys)
@@ -1341,210 +1028,230 @@ symbol-case giving up: case=((V U) (F))
                        (warn 'duplicate-case-key-warning
                              :key k
                              :case-kind name
-                             :occurrences `(,existing (,case-position (,case))))))
-               (let ((record (list case-position (list case))))
+                             :occurrences `(,existing (,case-position (,clause))))))
+               (let ((record (list case-position (list clause))))
                  (dolist (k case-keys)
-                   (setf (gethash k keys-seen) record)))))
-        (unless (list-of-length-at-least-p case 1)
+                   (setf (gethash k keys-seen) record))))
+             (testify (k)
+               `(,test ,keyform-value
+                       ,(if (and (eq test 'eql) (self-evaluating-p k)) k `',k))))
+        (unless (list-of-length-at-least-p clause 1)
           (with-current-source-form (cases)
-            (error "~S -- bad clause in ~S" case name)))
-        (with-current-source-form (case)
-          (destructuring-bind (keyoid &rest forms) case
+            (error "~S -- bad clause in ~S" clause name)))
+        (with-current-source-form (clause)
+          ;; https://sourceforge.net/p/sbcl/mailman/message/11863996/ contains discussion
+          ;; of whether to warn when seeing OTHERWISE in a normal-clause position, but
+          ;; it is in fact an error: "In the case of case, the symbols t and otherwise
+          ;; MAY NOT be used as the keys designator."
+          ;; T in CASE heads an otherwise-clause, but in TYPECASE it's either a plain
+          ;; type specifier OR it is the otherwise-clause. They're equivalent, but
+          ;; EXPAND-STRUCT-TYPECASE has a fixed expectation re. normal and otherwise clause
+          (destructuring-bind (keyoid &rest forms) clause
+            (when (null forms)
+              (setq forms '(nil)))
             (cond (;; an OTHERWISE-CLAUSE
-                   ;;
-                   ;; By the way... The old code here tried gave
-                   ;; STYLE-WARNINGs for normal-clauses which looked as
-                   ;; though they might've been intended to be
-                   ;; otherwise-clauses. As Tony Martinez reported on
-                   ;; sbcl-devel 2004-11-09 there are sometimes good
-                   ;; reasons to write clauses like that; and as I noticed
-                   ;; when trying to understand the old code so I could
-                   ;; understand his patch, trying to guess which clauses
-                   ;; don't have good reasons is fundamentally kind of a
-                   ;; mess. SBCL does issue style warnings rather
-                   ;; enthusiastically, and I have often justified that by
-                   ;; arguing that we're doing that to detect issues which
-                   ;; are tedious for programmers to detect for by
-                   ;; proofreading (like small typoes in long symbol
-                   ;; names, or duplicate function definitions in large
-                   ;; files). This doesn't seem to be an issue like that,
-                   ;; and I can't think of a comparably good justification
-                   ;; for giving STYLE-WARNINGs for legal code here, so
-                   ;; now we just hope the programmer knows what he's
-                   ;; doing. -- WHN 2004-11-20
                    (and (not errorp) ; possible only in CASE or TYPECASE,
                                         ; not in [EC]CASE or [EC]TYPECASE
-                        (memq keyoid '(t otherwise))
-                        (null (cdr cases)))
-                   ;; The NIL has a reason for being here: Without it, COND
-                   ;; will return the value of the test form if FORMS is NIL.
-                   (push `(t nil ,@forms) clauses))
-                  ((and multi-p (listp keyoid))
-                   (setf keys (nconc (reverse keyoid) keys))
-                   (check-clause keyoid)
-                   (push `((or ,@(mapcar (lambda (key)
-                                           `(,test ,keyform-value ',key))
-                                         keyoid))
-                           nil
-                           ,@forms)
-                         clauses))
-                  (t
-                   (when (and (eq name 'case)
-                              (cdr cases)
-                              (memq keyoid '(t otherwise)))
-                     (error 'simple-reference-error
-                            :format-control
+                        (or (eq keyoid 'otherwise)
+                            (and (eq keyoid 't) (or (eq test 'eql) (not (cdr cases))))))
+                   (cond ((null (cdr cases))
+                          (push `(t ,@forms) clauses))
+                         ((eq name 'case)
+                          (error 'simple-reference-error
+                                 :format-control
                             "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
                            designator only in the final otherwise-clause, not in a ~
                            normal-clause. Use (~S) instead, or move the clause to the ~
                            correct position.~:@>"
-                            :format-arguments (list 'case case keyoid keyoid)
+                            :format-arguments (list 'case clause keyoid keyoid)
                             :references `((:ansi-cl :macro case))))
+                         (t
+                          ;; OTHERWISE is a redundant bit of the behavior of TYPECASE
+                          ;; since T is the universal type. OTHERWISE could not legally
+                          ;; be DEFTYPEed so this _must_ be a misplaced clause.
+                          (error 'simple-reference-error
+                                     :format-control
+                            "~@<~IBad ~S clause:~:@_  ~S~:@_~S is allowed only in the final clause. ~
+                           Use T instead, or move the clause to the correct position.~:@>"
+                            :format-arguments (list 'typecase clause keyoid)
+                            :references `((:ansi-cl :macro typecase))))))
+                  ((and (listp keyoid) (eq test 'eql))
+                   (unless (proper-list-p keyoid) ; REVERSE would err with unclear message
+                     (error "~S is not a proper list" keyoid))
+                   (check-clause keyoid)
+                   (setf keys (nconc (reverse keyoid) keys))
+                   ;; This inserts an unreachable clause if KEYOID is NIL, but
+                   ;; FORMS could contain a side-effectful LOAD-TIME-VALUE.
+                   (push `(,(cond ((cdr keyoid) `(or ,@(mapcar #'testify keyoid)))
+                                  (keyoid (testify (car keyoid))))
+                           ,@forms)
+                         clauses))
+                  (t
+                   (when (and (eq test 'typep) (eq keyoid t))
+                     ;; - if ERRORP is nil and there are more clauses, this shadows them,
+                     ;;   which seems suspicious and worth style-warning for.
+                     ;; - if ERRORP is non-nil, though this isn't technically an "otherwise"
+                     ;;   clause, in acts just like one.
+                     (if errorp
+                         (setq errorp :none)
+                         (style-warn "T clause in ~S makes subsequent clauses unreachable:~%~S"
+                                     name specified-clauses)))
+                   (when case-clauses ; try the TYPECASE into CASE reduction
+                     (let ((typespec (ignore-errors (typexpand keyoid))))
+                       (cond ((typep typespec '(cons (eql member) (satisfies proper-list-p)))
+                              (push (cons (cdr typespec) forms) case-clauses))
+                             ((and (eq typespec t) (not (cdr cases))) ; one more KLUDGE
+                              (push clause case-clauses))
+                             (t
+                              (setq case-clauses nil)))))
                    (push keyoid keys)
                    (check-clause (list keyoid))
-                   (push `((,test ,keyform-value ',keyoid)
-                           nil
-                           ,@forms)
-                         clauses)))))))
+                   (push `(,(testify keyoid) ,@forms) clauses)))))))
+    (when (eq errorp :none)
+      (setq errorp nil))
+
+    ;; [EC]CASE has an advantage over [EC]TYPECASE in that we readily notice when
+    ;; the expansion can use symbol-hash to pick the clause.
+    (when case-clauses
+      (return-from case-body
+        `(,(cond ((not errorp) 'case) ((eq name 'ctypecase) 'ccase) (t 'ecase))
+           ,keyform
+          ,@(cdr (reverse case-clauses)) ; 1st elt was a boolean flag
+          ,@(when (eq (caar clauses) t) (list (car clauses))))))
+
     (setq keys
           (nreverse (mapcon (lambda (tail)
                               (unless (member (car tail) (cdr tail))
                                 (list (car tail))))
                             keys)))
-    (case-body-aux name keyform keyform-value clauses keys errorp proceedp
-                   `(,(if multi-p 'member 'or) ,@keys))))
 
-;;; CASE-BODY-AUX provides the expansion once CASE-BODY has groveled
-;;; all the cases. Note: it is not necessary that the resulting code
-;;; signal case-failure conditions, but that's what KMP's prototype
-;;; code did. We call CASE-BODY-ERROR, because of how closures are
-;;; compiled. RESTART-CASE has forms with closures that the compiler
-;;; causes to be generated at the top of any function using the case
-;;; macros, regardless of whether they are needed.
-(defun case-body-aux (name keyform keyform-value clauses keys
-                      errorp proceedp expected-type)
-  (when proceedp ; CCASE or CTYPECASE
-    (return-from case-body-aux
-      (let ((block (gensym))
-            (again (gensym)))
-        `(let ((,keyform-value ,keyform))
-           (block ,block
-             (tagbody
-                ,again
-                (return-from
-                 ,block
-                  (cond ,@(nreverse clauses)
-                        (t
-                         (setf ,keyform-value
-                               (setf ,keyform
-                                     (case-body-error
-                                      ',name ',keyform ,keyform-value
-                                      ',expected-type ',keys)))
-                         (go ,again))))))))))
-
-  (let ((implement-as name)
-        (original-keys keys))
-    (when (member name '(typecase etypecase))
-      ;; Bypass all TYPEP handling if every clause of [E]TYPECASE is a MEMBER type.
-      ;; More importantly, try to use the fancy expansion for symbols as keys.
+    ;; Try hash-based dispatch only if expanding for the compiler
+    (when (and (neq errorp 'cerror)
+               (sb-c::compiling-p lexenv)
+               (sb-c:policy lexenv (> sb-c:jump-table 0))
+               (sb-c::vop-existsp :named sb-c:jump-table))
       (let* ((default (if (eq (caar clauses) 't) (car clauses)))
-             (normal-clauses (reverse (if default (cdr clauses) clauses)))
-             (new-clauses))
-        (collect ((new-keys))
-          (dolist (clause normal-clauses)
-            ;; clause is ((TYPEP #:x (QUOTE <sometype>)) NIL forms*)
-            (destructuring-bind ((typep thing type-expr) . consequent) clause
-              (declare (ignore thing))
-              (unless (and (typep type-expr '(cons (eql quote) (cons t null)))
-                           (eq typep 'typep))
-                (bug "TYPECASE expander glitch"))
-              (let* ((spec (second type-expr))
-                     (clause-keys
-                      (case (if (listp spec) (car spec))
-                        (eql (when (singleton-p (cdr spec)) (list (cadr spec))))
-                        (member (when (proper-list-p (cdr spec)) (cdr spec)))
-                        (t :fail))))
-                (cond ((eq clause-keys :fail)
-                       (setq new-clauses :fail))
-                      ((neq new-clauses :fail)
-                       (dolist (key clause-keys)
-                         (unless (member key (new-keys))
-                           (new-keys key)))
-                       (push (cons `(or ,@(mapcar (lambda (x) `(eql ,keyform-value ',x))
-                                                  clause-keys))
-                                   consequent)
-                             new-clauses))))))
-          (acond ((neq new-clauses :fail)
-                  ;; all TYPECASE clauses were convertible to CASE clauses
-                  (setq clauses (if default (cons default new-clauses) new-clauses)
-                        keys (new-keys)
-                        implement-as 'case))
-                 ((and (sb-c::vop-existsp :named sb-c:multiway-branch-if-eq)
-                       (expand-struct-typecase keyform keyform-value normal-clauses keys
-                                          default errorp))
-                  (return-from case-body-aux it))))))
+             (normal-clauses (reverse (if default (cdr clauses) clauses))))
+        ;; Try expanding a using perfect hash and either a jump table or k/v vectors
+        ;; depending on constant-ness of results.
+        (cond ((eq test 'typep)
+               (awhen (expand-struct-typecase keyform normal-clauses keys
+                                              default errorp)
+                 (return-from case-body it))))))
 
-    ;; Efficiently expanding CASE over symbols depends on CASE over integers being
-    ;; translated as a jump table. If it's not - as on most backends - then we use
-    ;; the customary expansion as a series of IF tests.
-    ;; Production code rarely uses CCASE, and the expansion differs such that
-    ;; it doesn't seem worth the effort to handle it as a jump table.
-    (when (and (member implement-as '(case ecase)) (every #'symbolp keys))
-      (awhen (expand-symbol-case keyform clauses keys errorp 'sxhash)
-        (return-from case-body-aux it)))
+    (setq clauses (nreverse clauses))
 
-    `(let ((,keyform-value ,keyform))
-       (declare (ignorable ,keyform-value)) ; e.g. (CASE KEY (T))
-       (cond ,@(nreverse clauses)
-             ,@(when errorp
-                 `((t (,(ecase name
-                          (etypecase 'etypecase-failure)
-                          (ecase 'ecase-failure))
-                       ,keyform-value ',original-keys))))))))
+    (let ((expected-type `(,(if (eq test 'eql) 'member 'or) ,@keys)))
+      (when (eq errorp 'cerror) ; CCASE or CTYPECASE
+        (return-from case-body
+      ;; It is not a requirement to evaluate subforms of KEYFORM once only, but it often
+      ;; reduces code size to do so, as the update form will take advantage of typechecks
+      ;; already performed. (Nor is it _required_ to re-evaluate subforms)
+          (binding* ((switch (make-symbol "SWITCH"))
+                     (retry
+                      ;; TODO: consider using the union type simplifier algorithm here
+                      `(case-body-error ',name ',keyform ,keyform-value ',expected-type ',keys))
+                     ((vars vals stores writer reader) (get-setf-expansion keyform)))
+          `(let* ,(mapcar #'list vars vals)
+             (named-let ,switch ((,keyform-value ,reader))
+               (cond ,@clauses
+                     (t (multiple-value-bind ,stores ,retry (,switch ,writer)))))))))
 
-(sb-xc:defmacro case (keyform &body cases)
+      (when (and (eq keyform-value keyform) (not keys))
+        (setq keyform-value '#:dummy)) ; force a rebinding to "use" the value
+      (let ((switch
+             `(cond
+                ,@clauses
+                ,@(when errorp
+                    `((t
+                       ,(wrap-if
+                         (sb-c::compiling-p lexenv)
+                         '(locally (declare (muffle-conditions code-deletion-note)))
+                         (ecase name
+                           (etypecase
+                             `(etypecase-failure
+                                 ,keyform-value ,(etypecase-error-spec keys)))
+                           (ecase
+                             `(ecase-failure ,keyform-value ',keys))))))))))
+        (if (eq keyform-value keyform)
+            switch
+            `(let ((,keyform-value ,keyform))
+               ;; binding must be IGNORABLE in either of these expressions:
+               ;;   (CASE KEY (() 'res))
+               ;;   (CASE KEY (T 'res))
+               (declare (ignorable ,keyform-value))
+               ,switch))))))
+
+;;; ETYPECASE over clauses that form a "simpler" type specifier should use that,
+;;; e.g. partitions of INTEGER:
+;;;  (etypecase ((integer * -1) ...) ((eql 0) ...) ((integer 1 *) ...))
+;;;  (etypecase (fixnum ...) (bignum ...))
+(defun etypecase-error-spec (types)
+  (when (cdr types) ; no sense in doing this for a single type
+    (let ((parsed (mapcar #'sb-c::careful-specifier-type types)))
+      (when (every (lambda (x) (and x (not (contains-unknown-type-p x))))
+                   parsed)
+        (let* ((union (apply #'type-union parsed))
+               (unparsed (type-specifier union)))
+          ;; If the type-union of the types is a simpler expression than (OR ...),
+          ;; then return the simpler one. CTYPECASE could do this also, but doesn't.
+          ;; http://www.lispworks.com/documentation/HyperSpec/Body/m_tpcase.htm#etypecase
+          ;;   "If no normal-clause matches, a non-correctable error of type type-error
+          ;;    is signaled. The offending datum is the test-key and the expected type
+          ;;    is /type equivalent/ to (or type1 type2 ...)"
+          (when (symbolp unparsed)
+            (return-from etypecase-error-spec `',unparsed))))))
+  `',types)
+
+(sb-xc:defmacro case (&whole form &environment env &rest r)
+  (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
   "CASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If a singleton key is T then the clause is a default clause."
-  (case-body 'case keyform cases t 'eql nil nil nil))
+  (case-body form env 'eql nil))
 
-(sb-xc:defmacro ccase (keyform &body cases)
+(sb-xc:defmacro ccase (&whole form &environment env &rest r)
+  (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
   "CCASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If none of the keys matches then a correctable error is
   signalled."
-  (case-body 'ccase keyform cases t 'eql t t t))
+  (case-body form env 'eql 'cerror))
 
-(sb-xc:defmacro ecase (keyform &body cases)
+(sb-xc:defmacro ecase (&whole form &environment env &rest r)
+  (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
   "ECASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If none of the keys matches then an error is signalled."
-  (case-body 'ecase keyform cases t 'eql t nil t))
+  (case-body form env 'eql 'error))
 
-(sb-xc:defmacro typecase (keyform &body cases)
+(sb-xc:defmacro typecase (&whole form &environment env &rest r)
+  (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
   "TYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true."
-  (case-body 'typecase keyform cases nil 'typep nil nil nil))
+  (case-body form env 'typep nil))
 
-(sb-xc:defmacro ctypecase (keyform &body cases)
+(sb-xc:defmacro ctypecase (&whole form &environment env &rest r)
+  (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
   "CTYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true. If no form is satisfied then a correctable error is signalled."
-  (case-body 'ctypecase keyform cases nil 'typep t t t))
+  (case-body form env 'typep 'cerror))
 
-(sb-xc:defmacro etypecase (keyform &body cases)
+(sb-xc:defmacro etypecase (&whole form &environment env &rest r)
+  (declare (sb-c::lambda-list (keyform &body cases)) (ignore r))
   "ETYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true. If no form is satisfied then an error is signalled."
-  (case-body 'etypecase keyform cases nil 'typep t nil t))
+  (case-body form env 'typep 'error))
 
 ;;; Compile a version of BODY for all TYPES, and dispatch to the
 ;;; correct one based on the value of VAR. This was originally used
 ;;; only for strings, hence the name. Renaming it to something more
 ;;; generic might not be a bad idea.
 (sb-xc:defmacro string-dispatch ((&rest types) var &body body)
-  (let ((fun (sb-xc:gensym "STRING-DISPATCH-FUN")))
+  (let ((fun (gensym "STRING-DISPATCH-FUN")))
     `(flet ((,fun (,var)
               ,@body))
        (declare (inline ,fun))
@@ -1567,7 +1274,7 @@ symbol-case giving up: case=((V U) (F))
 (sb-xc:defmacro with-open-file ((stream filespec &rest options)
                                 &body body)
   (multiple-value-bind (forms decls) (parse-body body nil)
-    (let ((abortp (sb-xc:gensym)))
+    (let ((abortp (gensym)))
       `(let ((,stream (open ,filespec ,@options))
              (,abortp t))
          ,@decls
@@ -1611,7 +1318,7 @@ symbol-case giving up: case=((V U) (F))
                                          var name))))
                           varlist))))
            (multiple-value-bind (code decls) (parse-body decls-and-code nil)
-             (let ((label-1 (sb-xc:gensym)) (label-2 (sb-xc:gensym)))
+             (let ((label-1 (gensym)) (label-2 (gensym)))
                `(block ,block
                   (,bind ,inits
                     ,@decls
@@ -1627,7 +1334,7 @@ symbol-case giving up: case=((V U) (F))
 
   ;; This is like DO, except it has no implicit NIL block.
   (sb-xc:defmacro do-anonymous (varlist endlist &rest body)
-    (frob-do-body varlist endlist body 'let 'psetq 'do-anonymous (sb-xc:gensym)))
+    (frob-do-body varlist endlist body 'let 'psetq 'do-anonymous (gensym)))
 
   (sb-xc:defmacro do (varlist endlist &body body)
   "DO ({(Var [Init] [Step])}*) (Test Exit-Form*) Declaration* Form*
@@ -1654,7 +1361,7 @@ symbol-case giving up: case=((V U) (F))
 (sb-xc:defmacro dotimes ((var count &optional (result nil)) &body body)
   ;; A nice optimization would be that if VAR is never referenced,
   ;; it's slightly more efficient to count backwards, but that's tricky.
-  (let ((c (if (integerp count) count (sb-xc:gensym))))
+  (let ((c (if (integerp count) count (gensym))))
     `(do ((,var 0 (1+ ,var))
           ,@(if (symbolp c) `((,c (the integer ,count)))))
          ((>= ,var ,c) ,result)
@@ -1671,8 +1378,8 @@ symbol-case giving up: case=((V U) (F))
   ;; since we don't want to use IGNORABLE on what might be a special
   ;; var.
   (binding* (((forms decls) (parse-body body nil))
-             (n-list (sb-xc:gensym "LIST"))
-             (start (sb-xc:gensym "START"))
+             (n-list (gensym "LIST"))
+             (start (gensym "START"))
              ((clist members clist-ok)
               (with-current-source-form (list)
                 (cond
@@ -1763,7 +1470,7 @@ symbol-case giving up: case=((V U) (F))
                   (cons (eql quote) (cons symbol null))
                   (cons (eql lambda))))
       (values nil `(funcall ,funarg . ,arg-forms))
-    (let ((fn-sym (sb-xc:gensym))) ; for ONCE-ONLY-ish purposes
+    (let ((fn-sym (gensym))) ; for ONCE-ONLY-ish purposes
       (values `((,fn-sym (%coerce-callable-to-fun ,funarg)))
               `(sb-c::%funcall ,fn-sym . ,arg-forms)))))
 
@@ -1796,29 +1503,438 @@ symbol-case giving up: case=((V U) (F))
   ;; This is simpler than trying to arrange transforms that cause
   ;; MAKE-STRING-OUTPUT-STREAM to be DXable. While that might be awesome,
   ;; this macro exists for a reason.
-  (let ((initial-buffer '#:buf)
-        (dummy '#:stream)
-        (string-let (or #+c-stack-is-control-stack 'dx-let 'let))
-        (string-ctor
-          (if (and (sb-xc:constantp element-type)
-                   (let ((ctype (sb-c::careful-specifier-type
-                                 (constant-form-value element-type))))
-                     (and ctype
-                          (csubtypep ctype (specifier-type 'character))
-                          (neq ctype *empty-type*))))
-              ;; Using MAKE-ARRAY avoids a style-warning if et is 'STANDARD-CHAR:
-              ;; "The default initial element #\Nul is not a STANDARD-CHAR."
-              'make-array ; hooray! it's known be a valid string type
-              ;; Force a runtime STRINGP check unless futher transforms
-              ;; deduce a known type. You'll get "could not stack allocate"
-              ;; perhaps, but that's acceptable.
-              'make-string)))
+  (let* ((initial-buffer '#:buf)
+         (dummy '#:stream)
+         (string-ctor
+           (if (and (sb-xc:constantp element-type)
+                    (let ((ctype (sb-c::careful-specifier-type
+                                  (constant-form-value element-type))))
+                      (and ctype
+                           (csubtypep ctype (specifier-type 'character))
+                           (neq ctype *empty-type*))))
+               ;; Using MAKE-ARRAY avoids a style-warning if et is 'STANDARD-CHAR:
+               ;; "The default initial element #\Nul is not a STANDARD-CHAR."
+               'make-array ; hooray! it's known be a valid string type
+               ;; Force a runtime STRINGP check unless futher transforms
+               ;; deduce a known type.
+               'make-string)))
     ;; A full call to MAKE-STRING-OUTPUT-STREAM uses a larger initial buffer
     ;; if BASE-CHAR but I really don't care to think about that here.
-    `(,string-let ((,initial-buffer (,string-ctor 31 :element-type ,element-type)))
+    `(let ((,initial-buffer (,string-ctor 31 :element-type ,element-type)))
+       (declare (dynamic-extent ,initial-buffer))
        (dx-let ((,dummy (%allocate-string-ostream)))
          (let ((,var (%init-string-output-stream ,dummy ,initial-buffer
                                                  ,wild-result-type)))
            (declare (ignorable ,var))
            ,@body)
          (get-output-stream-string ,dummy)))))
+
+
+;;;; COMPARE-AND-SWAP
+;;;;
+;;;; SB-EXT:COMPARE-AND-SWAP is the public API for now.
+;;;;
+;;;; Internally our interface has CAS, GET-CAS-EXPANSION,
+;;;; DEFCAS, and #'(CAS ...) functions.
+
+(defun expand-structure-slot-cas (info name place)
+  (let* ((dd (car info))
+         (structure (dd-name dd))
+         (slotd (cdr info))
+         (index (dsd-index slotd))
+         (type (dsd-type slotd))
+         (casser
+           (case (dsd-raw-type slotd)
+             ((t) '%instance-cas)
+             #+(or arm64 ppc ppc64 riscv x86 x86-64)
+             ((word) '%raw-instance-cas/word)
+             #+(or arm64 riscv x86 x86-64)
+             ((sb-vm:signed-word) '%raw-instance-cas/signed-word))))
+    (unless casser
+      (error "Cannot use COMPARE-AND-SWAP with structure accessor ~
+                for a typed slot: ~S"
+             place))
+    (when (dsd-read-only slotd)
+      (error "Cannot use COMPARE-AND-SWAP with structure accessor ~
+                for a read-only slot: ~S"
+             place))
+    (destructuring-bind (op arg) place
+      (aver (eq op name))
+      (with-unique-names (instance old new)
+        (values (list instance)
+                (list `(the ,structure ,arg))
+                old
+                new
+                `(truly-the (values ,type &optional)
+                            (,casser ,instance ,index
+                                     (the ,type ,old)
+                                     (the ,type ,new)))
+                `(,op ,instance))))))
+
+;;; FIXME: remove (it's EXPERIMENTAL, so doesn't need to go through deprecation)
+(defun get-cas-expansion (place &optional environment)
+  "Analogous to GET-SETF-EXPANSION. Returns the following six values:
+
+ * list of temporary variables
+
+ * list of value-forms whose results those variable must be bound
+
+ * temporary variable for the old value of PLACE
+
+ * temporary variable for the new value of PLACE
+
+ * form using the aforementioned temporaries which performs the
+   compare-and-swap operation on PLACE
+
+ * form using the aforementioned temporaries with which to perform a volatile
+   read of PLACE
+
+Example:
+
+  (get-cas-expansion '(car x))
+  ; => (#:CONS871), (X), #:OLD872, #:NEW873,
+  ;    (SB-KERNEL:%COMPARE-AND-SWAP-CAR #:CONS871 #:OLD872 :NEW873).
+  ;    (CAR #:CONS871)
+
+  (defmacro my-atomic-incf (place &optional (delta 1) &environment env)
+    (multiple-value-bind (vars vals old new cas-form read-form)
+        (get-cas-expansion place env)
+     (let ((delta-value (gensym \"DELTA\")))
+       `(let* (,@(mapcar 'list vars vals)
+               (,old ,read-form)
+               (,delta-value ,delta)
+               (,new (+ ,old ,delta-value)))
+          (loop until (eq ,old (setf ,old ,cas-form))
+                do (setf ,new (+ ,old ,delta-value)))
+          ,new))))
+
+EXPERIMENTAL: Interface subject to change."
+  ;; FIXME: this seems wrong on two points:
+  ;; 1. if TRULY-THE had a CAS expander (which it doesn't) we'd want
+  ;;    to use %MACROEXPAND[-1] so as not to lose the "truly-the"-ness
+  ;; 2. if both a CAS expander and a macro exist, the CAS expander
+  ;;    should be preferred before macroexpanding (just like SETF does)
+  (let ((expanded (macroexpand place environment)))
+    (flet ((invalid-place ()
+             (error "Invalid place to CAS: ~S -> ~S" place expanded)))
+      (unless (consp expanded)
+        (cond ((and (symbolp expanded)
+                    (member (info :variable :kind expanded)
+                            '(:global :special)))
+               (setq expanded `(symbol-value ',expanded)))
+              (t
+               (invalid-place))))
+      (let ((name (car expanded)))
+        (unless (symbolp name)
+          (invalid-place))
+        (acond
+         ((info :cas :expander name)
+          ;; CAS expander.
+          (funcall it expanded environment))
+
+         ;; Structure accessor
+         ((structure-instance-accessor-p name)
+          (expand-structure-slot-cas it name expanded))
+
+         ;; CAS function
+         (t
+          (with-unique-names (old new)
+            (let ((vars nil)
+                  (vals nil)
+                  (args nil))
+              (dolist (x (reverse (cdr expanded)))
+                (cond ((constantp x environment)
+                       (push x args))
+                      (t
+                       (let ((tmp (gensymify x)))
+                         (push tmp args)
+                         (push tmp vars)
+                         (push x vals)))))
+              (values vars vals old new
+                      `(funcall #'(cas ,name) ,old ,new ,@args)
+                      `(,name ,@args))))))))))
+
+
+;;; This is what it all comes down to.
+;;; Possible todo: implement CAS-WEAK like in C and C++ standards
+;;; so that we don't loop-in-a-loop where failure has to re-test
+;;; whether some item is in a list, and retry the CAS anyway.
+(sb-xc:defmacro cas (place old new &environment env)
+  "Synonym for COMPARE-AND-SWAP.
+
+Additionally DEFUN, DEFGENERIC, DEFMETHOD, FLET, and LABELS can be also used to
+define CAS-functions analogously to SETF-functions:
+
+  (defvar *foo* nil)
+
+  (defun (cas foo) (old new)
+    (cas (symbol-value '*foo*) old new))
+
+First argument of a CAS function is the expected old value, and the second
+argument of is the new value. Note that the system provides no automatic
+atomicity for CAS functions, nor can it verify that they are atomic: it is up
+to the implementor of a CAS function to ensure its atomicity.
+
+EXPERIMENTAL: Interface subject to change."
+  ;; It's not necessary that GET-CAS-EXPANSION work on defined alien vars.
+  ;; They're not generalized places in the sense that they could hold any object,
+  ;; so there's very little point to being more general.
+  ;; In particular, allowing ATOMIC-PUSH or ATOMIC-POP on them is wrong.
+  (awhen (and (symbolp place)
+              (eq (info :variable :kind place) :alien)
+              (sb-alien::cas-alien place old new))
+    (return-from cas it))
+  (multiple-value-bind (temps place-args old-temp new-temp cas-form)
+      (get-cas-expansion place env)
+    `(let* (,@(mapcar #'list temps place-args)
+            (,old-temp ,old)
+            (,new-temp ,new))
+       ,cas-form)))
+
+(sb-xc:defmacro compare-and-swap (place old new)
+  "Atomically stores NEW in PLACE if OLD matches the current value of PLACE.
+Two values are considered to match if they are EQ. Returns the previous value
+of PLACE: if the returned value is EQ to OLD, the swap was carried out.
+
+PLACE must be an CAS-able place. Built-in CAS-able places are accessor forms
+whose CAR is one of the following:
+
+ CAR, CDR, FIRST, REST, SVREF, SYMBOL-PLIST, SYMBOL-VALUE, SVREF, SLOT-VALUE
+ SB-MOP:STANDARD-INSTANCE-ACCESS, SB-MOP:FUNCALLABLE-STANDARD-INSTANCE-ACCESS,
+
+or the name of a DEFSTRUCT created accessor for a slot whose storage type
+is not raw. (Refer to the the \"Efficiency\" chapter of the manual
+for the list of raw slot types.  Future extensions to this macro may allow
+it to work on some raw slot types.)
+
+In case of SLOT-VALUE, if the slot is unbound, SLOT-UNBOUND is called unless
+OLD is EQ to SB-PCL:+SLOT-UNBOUND+ in which case SB-PCL:+SLOT-UNBOUND+ is
+returned and NEW is assigned to the slot. Additionally, the results are
+unspecified if there is an applicable method on either
+SB-MOP:SLOT-VALUE-USING-CLASS, (SETF SB-MOP:SLOT-VALUE-USING-CLASS), or
+SB-MOP:SLOT-BOUNDP-USING-CLASS.
+
+Additionally, the PLACE can be a anything for which a CAS-function has
+been defined. (See SB-EXT:CAS for more information.)
+"
+  `(cas ,place ,old ,new))
+
+
+;;;; ATOMIC-INCF and ATOMIC-DECF
+
+(defun expand-atomic-frob
+    (name specified-place diff env
+     &aux (place (macroexpand specified-place env)))
+  (declare (type (member atomic-incf atomic-decf) name))
+  (flet ((invalid-place ()
+           (error "Invalid first argument to ~S: ~S" name specified-place))
+         (compute-newval (old) ; used only if no atomic inc vop
+           `(logand (,(case name (atomic-incf '+) (atomic-decf '-)) ,old
+                     (the sb-vm:signed-word ,diff)) sb-ext:most-positive-word))
+         (compute-delta () ; used only with atomic inc vop
+           `(logand ,(case name
+                       (atomic-incf `(the sb-vm:signed-word ,diff))
+                       (atomic-decf `(- (the sb-vm:signed-word ,diff))))
+                    sb-ext:most-positive-word)))
+    (declare (ignorable #'compute-newval #'compute-delta))
+    (when (and (symbolp place)
+               (eq (info :variable :kind place) :global)
+               (type= (info :variable :type place) (specifier-type 'fixnum)))
+      ;; Global can't be lexically rebound.
+      (return-from expand-atomic-frob
+        `(truly-the fixnum (,(case name
+                               (atomic-incf '%atomic-inc-symbol-global-value)
+                               (atomic-decf '%atomic-dec-symbol-global-value))
+                            ',place (the fixnum ,diff)))))
+    (unless (consp place) (invalid-place))
+    (destructuring-bind (op . args) place
+      ;; FIXME: The lexical environment should not be disregarded.
+      ;; CL builtins can't be lexically rebound, but structure accessors can.
+      (case op
+        (aref
+         (unless (singleton-p (cdr args))
+           (invalid-place))
+         (with-unique-names (array)
+           `(let ((,array (the (simple-array word (*)) ,(car args))))
+              #+compare-and-swap-vops
+              (%array-atomic-incf/word
+               ,array
+               (check-bound ,array (array-dimension ,array 0) ,(cadr args))
+               ,(compute-delta))
+              #-compare-and-swap-vops
+              ,(with-unique-names (index old-value)
+                 `(without-interrupts
+                    (let* ((,index ,(cadr args))
+                           (,old-value (aref ,array ,index)))
+                      (setf (aref ,array ,index) ,(compute-newval old-value))
+                      ,old-value))))))
+        ((car cdr first rest)
+         (when (cdr args)
+           (invalid-place))
+         `(truly-the
+           fixnum
+           (,(case op
+               ((first car) (case name
+                              (atomic-incf '%atomic-inc-car)
+                              (atomic-decf '%atomic-dec-car)))
+               ((rest cdr)  (case name
+                              (atomic-incf '%atomic-inc-cdr)
+                              (atomic-decf '%atomic-dec-cdr))))
+            ,(car args) (the fixnum ,diff))))
+        (t
+         (when (or (cdr args)
+                   ;; Because accessor info is identical for the writer and reader
+                   ;; functions, without a SYMBOLP check this would erroneously allow
+                   ;;   (ATOMIC-INCF ((SETF STRUCT-SLOT) x))
+                   (not (symbolp op))
+                   (not (structure-instance-accessor-p op)))
+           (invalid-place))
+         (let* ((accessor-info (structure-instance-accessor-p op))
+                (slotd (cdr accessor-info))
+                (type (dsd-type slotd)))
+           (unless (and (eq 'sb-vm:word (dsd-raw-type slotd))
+                        (type= (specifier-type type) (specifier-type 'sb-vm:word)))
+             (error "~S requires a slot of type (UNSIGNED-BYTE ~S), not ~S: ~S"
+                    name sb-vm:n-word-bits type place))
+           (when (dsd-read-only slotd)
+             (error "Cannot use ~S with structure accessor for a read-only slot: ~S"
+                    name place))
+           #+compare-and-swap-vops
+           `(truly-the sb-vm:word
+                       (%raw-instance-atomic-incf/word
+                        (the ,(dd-name (car accessor-info)) ,@args)
+                        ,(dsd-index slotd)
+                        ,(compute-delta)))
+           #-compare-and-swap-vops
+           (with-unique-names (structure old-value)
+             `(without-interrupts
+                (let* ((,structure ,@args)
+                       (,old-value (,op ,structure)))
+                  (setf (,op ,structure) ,(compute-newval old-value))
+                  ,old-value)))))))))
+
+(sb-xc:defmacro atomic-incf (&environment env place &optional (diff 1))
+  #.(format nil
+  "Atomically increments PLACE by DIFF, and returns the value of PLACE before
+the increment.
+
+PLACE must access one of the following:
+ - a DEFSTRUCT slot with declared type (UNSIGNED-BYTE ~D~:*)
+   or AREF of a (SIMPLE-ARRAY (UNSIGNED-BYTE ~D~:*) (*))
+   The type SB-EXT:WORD can be used for these purposes.
+ - CAR or CDR (respectively FIRST or REST) of a CONS.
+ - a variable defined using DEFGLOBAL with a proclaimed type of FIXNUM.
+Macroexpansion is performed on PLACE before expanding ATOMIC-INCF.
+
+Incrementing is done using modular arithmetic,
+which is well-defined over two different domains:
+ - For structures and arrays, the operation accepts and produces
+   an (UNSIGNED-BYTE ~D~:*), and DIFF must be of type (SIGNED-BYTE ~D).
+   ATOMIC-INCF of #x~x by one results in #x0 being stored in PLACE.
+ - For other places, the domain is FIXNUM, and DIFF must be a FIXNUM.
+   ATOMIC-INCF of #x~x by one results in #x~x
+   being stored in PLACE.
+
+DIFF defaults to 1.
+
+EXPERIMENTAL: Interface subject to change."
+  sb-vm:n-word-bits most-positive-word
+  most-positive-fixnum most-negative-fixnum)
+  (expand-atomic-frob 'atomic-incf place diff env))
+
+(sb-xc:defmacro atomic-decf (&environment env place &optional (diff 1))
+  #.(format nil
+  "Atomically decrements PLACE by DIFF, and returns the value of PLACE before
+the decrement.
+
+PLACE must access one of the following:
+ - a DEFSTRUCT slot with declared type (UNSIGNED-BYTE ~D~:*)
+   or AREF of a (SIMPLE-ARRAY (UNSIGNED-BYTE ~D~:*) (*))
+   The type SB-EXT:WORD can be used for these purposes.
+ - CAR or CDR (respectively FIRST or REST) of a CONS.
+ - a variable defined using DEFGLOBAL with a proclaimed type of FIXNUM.
+Macroexpansion is performed on PLACE before expanding ATOMIC-DECF.
+
+Decrementing is done using modular arithmetic,
+which is well-defined over two different domains:
+ - For structures and arrays, the operation accepts and produces
+   an (UNSIGNED-BYTE ~D~:*), and DIFF must be of type (SIGNED-BYTE ~D).
+   ATOMIC-DECF of #x0 by one results in #x~x being stored in PLACE.
+ - For other places, the domain is FIXNUM, and DIFF must be a FIXNUM.
+   ATOMIC-DECF of #x~x by one results in #x~x
+   being stored in PLACE.
+
+DIFF defaults to 1.
+
+EXPERIMENTAL: Interface subject to change."
+  sb-vm:n-word-bits most-positive-word
+  most-negative-fixnum most-positive-fixnum)
+  (expand-atomic-frob 'atomic-decf place diff env))
+
+(sb-xc:defmacro atomic-update (place update-fn &rest arguments &environment env)
+  "Updates PLACE atomically to the value returned by calling function
+designated by UPDATE-FN with ARGUMENTS and the previous value of PLACE.
+
+PLACE may be read and UPDATE-FN evaluated and called multiple times before the
+update succeeds: atomicity in this context means that the value of PLACE did
+not change between the time it was read, and the time it was replaced with the
+computed value.
+
+PLACE can be any place supported by SB-EXT:COMPARE-AND-SWAP.
+
+Examples:
+
+  ;;; Conses T to the head of FOO-LIST.
+  (defstruct foo list)
+  (defvar *foo* (make-foo))
+  (atomic-update (foo-list *foo*) #'cons t)
+
+  (let ((x (cons :count 0)))
+     (mapc #'sb-thread:join-thread
+           (loop repeat 1000
+                 collect (sb-thread:make-thread
+                          (lambda ()
+                            (loop repeat 1000
+                                  do (atomic-update (cdr x) #'1+)
+                                     (sleep 0.00001))))))
+     ;; Guaranteed to be (:COUNT . 1000000) -- if you replace
+     ;; atomic update with (INCF (CDR X)) above, the result becomes
+     ;; unpredictable.
+     x)
+"
+  (multiple-value-bind (vars vals old new cas-form read-form)
+      (get-cas-expansion place env)
+    `(let* (,@(mapcar 'list vars vals)
+            (,old ,read-form))
+       (loop for ,new = (funcall ,update-fn ,@arguments ,old)
+             until (eq ,old (setf ,old ,cas-form))
+             finally (return ,new)))))
+
+(sb-xc:defmacro atomic-push (obj place &environment env)
+  "Like PUSH, but atomic. PLACE may be read multiple times before
+the operation completes -- the write does not occur until such time
+that no other thread modified PLACE between the read and the write.
+
+Works on all CASable places."
+  (multiple-value-bind (vars vals old new cas-form read-form)
+      (get-cas-expansion place env)
+    `(let* (,@(mapcar 'list vars vals)
+            (,old ,read-form)
+            (,new (cons ,obj ,old)))
+       (loop until (eq ,old (setf ,old ,cas-form))
+             do (setf (cdr ,new) ,old)
+             finally (return ,new)))))
+
+(sb-xc:defmacro atomic-pop (place &environment env)
+  "Like POP, but atomic. PLACE may be read multiple times before
+the operation completes -- the write does not occur until such time
+that no other thread modified PLACE between the read and the write.
+
+Works on all CASable places."
+  (multiple-value-bind (vars vals old new cas-form read-form)
+      (get-cas-expansion place env)
+    `(let* (,@(mapcar 'list vars vals)
+            (,old ,read-form))
+       (loop (let ((,new (cdr ,old)))
+               (when (eq ,old (setf ,old ,cas-form))
+                 (return (car (truly-the list ,old)))))))))

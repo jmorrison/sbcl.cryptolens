@@ -50,10 +50,11 @@
 
 #+sb-assembling
 (defun return-single-word-bignum (dest alloc-tn source)
-  (instrument-alloc 16 nil)
-  (let ((header (logior (ash 1 n-widetag-bits) bignum-widetag)))
+  (let ((header (logior (ash 1 n-widetag-bits) bignum-widetag))
+        (nbytes #+bignum-assertions 32 #-bignum-assertions 16))
+    (instrument-alloc bignum-widetag nbytes nil alloc-tn)
     (pseudo-atomic ()
-      (allocation nil 16 0 nil nil alloc-tn)
+      (allocation bignum-widetag nbytes 0 alloc-tn nil nil nil)
       (storew* header alloc-tn 0 0 t)
       (storew source alloc-tn bignum-digits-offset 0)
       (if (eq dest alloc-tn)
@@ -132,7 +133,7 @@
     (inst cmp x rcx)
     (inst jmp :e SINGLE-WORD-BIGNUM)
 
-    (alloc-other res bignum-widetag (+ bignum-digits-offset 2) nil)
+    (alloc-other bignum-widetag (+ bignum-digits-offset 2) res nil nil nil)
     (storew rax res bignum-digits-offset other-pointer-lowtag)
     (storew rcx res (1+ bignum-digits-offset) other-pointer-lowtag)
     (inst clc) (inst ret)
@@ -149,17 +150,17 @@
                           (:translate %negate)
                           (:save-p t))
                          ((:arg x (descriptor-reg any-reg) rdx-offset)
-                          (:res res (descriptor-reg any-reg) rdx-offset)
-                          (:temp rcx unsigned-reg rcx-offset))
+                          (:res res (descriptor-reg any-reg) rdx-offset))
   (inst test :byte x fixnum-tag-mask)
   (inst jmp :nz GENERIC)
   (move res x)
   (inst neg res)                        ; (- most-negative-fixnum) is BIGNUM
-  (inst jmp :o BIGNUM)
-  (inst clc) (inst ret)
-  BIGNUM
-  (inst shr res n-fixnum-tag-bits)      ; sign bit is data - remove type bits
-  (return-single-word-bignum res rcx res)
+  ;; This constant isn't really a fixup, but it's easiest for me to think about it
+  ;; that way for now. It should really do whatever EMIT-EA does for a CONSTANT.
+  (inst cmov :o res (ea (make-fixup nil :code-object
+                                    (+ (ash code-constants-offset word-shift)
+                                       (- other-pointer-lowtag)))
+                        rip-tn))
   (inst clc) (inst ret)
   GENERIC
   (tail-call-static-fun '%negate 1))
@@ -300,30 +301,35 @@
                  (inst jmp :ge POSITIVE)
                  (inst not rdx)
                  POSITIVE))
-           (unless (memq :popcnt *backend-subfeatures*)
-             (test-cpu-feature cpu-has-popcnt)
-             (inst jmp :z slow))
+           (when (memq :popcnt *backend-subfeatures*) ; always use POPCNT
            ;; Intel's implementation of POPCNT on some models treats it as
            ;; a 2-operand ALU op in the manner of ADD,SUB,etc which means that
            ;; it falsely appears to need data from the destination register.
            ;; The workaround is to clear the destination.
            ;; See http://stackoverflow.com/questions/25078285
-           (unless (location= result arg)
+             (unless (location= result arg)
              ;; We only break the spurious dep. chain if result isn't the same
              ;; register as arg. (If they're location=, don't trash the arg!)
-             (inst xor result result))
+               (inst xor :dword result result))
+             (inst popcnt result arg)
+             (return-from ,name))
+
+           ;; Conditionally use POPCNT
+           (test-cpu-feature cpu-has-popcnt)
+           (inst jmp :z slow)
+           (unless (location= result arg)
+             (inst xor :dword result result))
            (inst popcnt result arg)
            (inst jmp done)
          slow
-           (unless (memq :popcnt *backend-subfeatures*)
-             (move rdx arg)
-             (invoke-asm-routine 'call 'logcount vop)
-             (move result rdx))
+           (move rdx arg)
+           (invoke-asm-routine 'call 'logcount vop)
+           (move result rdx)
          done))))
   (def-it unsigned-byte-64-count 14 unsigned-reg unsigned-num)
   (def-it signed-byte-64-count 15 signed-reg signed-num :signed t)
   (def-it positive-fixnum-count 12 any-reg positive-fixnum)
-  (def-it positive-fixnum-count 13 any-reg fixnum :signed t))
+  (def-it signed-fixnum-count 13 any-reg fixnum :signed t))
 
 ;;; General case of EQL
 
@@ -345,9 +351,10 @@
 ;;;   (define-assembly-routine ... ((:temp ...)) (:let ((c (register-inline-constant ...)))))
 ;;; It just doesn't seem worth the effort to do all that.
 (defparameter eql-dispatch nil)
-(define-assembly-routine (generic-eql (:return-style :none))
-    ((:temp rax unsigned-reg rax-offset)
-     (:temp rcx unsigned-reg rcx-offset)
+(define-assembly-routine (generic-eql (:return-style :none)
+                                      (:export eql-ratio))
+    ((:temp rcx unsigned-reg rcx-offset)  ; callee-saved
+     (:temp rax unsigned-reg rax-offset)  ; vop temps
      (:temp rsi unsigned-reg rsi-offset)
      (:temp rdi unsigned-reg rdi-offset)
      (:temp r11 unsigned-reg r11-offset))
@@ -429,21 +436,28 @@
   EQL-BIGNUM
   (inst mov rax (ea (- other-pointer-lowtag) rdi))
   (inst xor rax (ea (- other-pointer-lowtag) rsi))
-  ;; kill the GC mark bit by shifting out (as if we'd actually get fullcgc
-  ;; to concurrently mark the heap. Well, I can hope can't I?)
-  (inst shl rax 1)
   (inst jmp :ne done) ; not equal
-  ;; Preserve rcx and compute the header length in words.
-  ;; Maybe we should deem that bignums have at most (2^32-1) payload words
-  ;; so that I can use an unaligned 'movl'. Or, maybe I should put the length
-  ;; in the high 4 bytes of the header so that the same GC mark bit would work
-  ;; as for all other objects (in byte index 3 of the header)
+  ;; Preserve rcx and compute the length in words.
+  ;; MAXIMUM-BIGNUM-LENGTH is a 4-byte quantity. Probably better if this would use
+  ;; the high 4 bytes of the header to naturally align the load.
   (inst push rcx)
-  (inst mov rcx (ea (- other-pointer-lowtag) rdi))
-  (inst shl rcx 1)
-  (inst shr rcx (1+ n-widetag-bits))
-  (inst jmp :z epilogue) ; zero payload length, can this happen?
+  (inst mov :dword rcx (ea (- 1 other-pointer-lowtag) rdi))
+  #+bignum-assertions
+  (progn (inst mov r11 rcx)
+         (inst or r11 1)) ; align to start of ubsan bits
   compare-loop
+  #+bignum-assertions
+  (let ((ok1 (gen-label)) (ok2 (gen-label)))
+    (inst dec rcx)
+    (inst bt (ea (- n-word-bytes other-pointer-lowtag) rsi r11 8) rcx)
+    (inst jmp :nc ok1)
+    (inst break halt-trap)
+    (emit-label ok1)
+    (inst bt (ea (- n-word-bytes other-pointer-lowtag) rdi r11 8) rcx)
+    (inst jmp :nc ok2)
+    (inst break halt-trap)
+    (emit-label ok2)
+    (inst inc rcx))
   (inst mov rax (ea (- other-pointer-lowtag) rsi rcx 8))
   (inst cmp rax (ea (- other-pointer-lowtag) rdi rcx 8))
   (inst jmp :ne epilogue)
@@ -498,13 +512,14 @@
 ;; the same widetag, but not bignum-widetag, the behavior is undefined.
 ;;
 (define-assembly-routine (%eql/integer
-                          (:translate %eql/integer)
+                          (:translate eql)
                           ;; :safe would imply signaling an error
                           ;; if the args are not integer, which this doesn't.
                           (:policy :fast-safe)
                           (:conditional :e)
-                          (:cost 10))
-                         ((:arg x (descriptor-reg any-reg) rdx-offset)
+                          (:cost 10)
+                          (:arg-types (:or integer bignum) *))
+                         ((:arg x (descriptor-reg) rdx-offset)
                           (:arg y (descriptor-reg any-reg) rdi-offset)
                           (:temp rcx unsigned-reg rcx-offset)
                           (:temp rax unsigned-reg rax-offset))
@@ -522,8 +537,6 @@
   (inst cmp rcx (ea (- other-pointer-lowtag) y))
   (inst jmp :ne done)
   (inst shr rcx n-widetag-bits)
-  ;; can you have 0 payload words? Probably not, but let's be safe here.
-  (inst jmp :z done)
   loop
   (inst mov rax (ea (- other-pointer-lowtag) x rcx 8))
   (inst cmp rax (ea (- other-pointer-lowtag) y rcx 8))
@@ -536,3 +549,9 @@
   (inst jmp :ne loop)
   ;; If the Z flag is set, the integers were EQL
   done)
+
+#-sb-assembling
+(define-vop (%eql/integer2 %eql/integer)
+  (:args (x :scs (descriptor-reg any-reg) :target x-arg-temp)
+         (y :scs (descriptor-reg) :target y-arg-temp))
+  (:arg-types * (:or integer bignum)))

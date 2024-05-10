@@ -9,14 +9,14 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-CFLAGS += -g -Wall -O2 -fdollars-in-identifiers
+CFLAGS += -g -Wall -fdollars-in-identifiers
 
 ifdef SBCL_MACOSX_VERSION_MIN
   CFLAGS += -mmacosx-version-min=$(SBCL_MACOSX_VERSION_MIN)
   LINKFLAGS += -mmacosx-version-min=$(SBCL_MACOSX_VERSION_MIN)
 else
-  CFLAGS += -mmacosx-version-min=10.6
-  LINKFLAGS += -mmacosx-version-min=10.6
+  CFLAGS += -mmacosx-version-min=10.9
+  LINKFLAGS += -mmacosx-version-min=10.9
 endif
 ifdef LISP_FEATURE_INODE64
 CFLAGS += -D_DARWIN_USE_64_BIT_INODE
@@ -29,7 +29,7 @@ ifdef LISP_FEATURE_SB_THREAD
   OS_LIBS += -lpthread
 endif
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-  OS_LIBS += -lz
+  OS_LIBS += -lzstd
 endif
 ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
   LIBSBCL = libsbcl.a
@@ -46,10 +46,8 @@ DISABLE_PIE=no
 
 ifdef LISP_FEATURE_IMMOBILE_SPACE
   GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c
+else ifdef LISP_FEATURE_MARK_REGION_GC
+  GC_SRC = fullcgc.c pmrgc.c traceroot.c mark-region.c incremental-compact.c gc-thread-pool.c
 else
   GC_SRC = fullcgc.c gencgc.c traceroot.c
 endif
-
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:

@@ -64,11 +64,12 @@
 
 (defpackage #:sb-aprof
   (:use #:cl #:sb-ext #:sb-alien #:sb-sys #:sb-int #:sb-kernel)
-  (:export #:aprof-run #:aprof-show)
-  (:import-from #:sb-di #:valid-lisp-pointer-p)
-  (:import-from #:sb-vm #:rbp-offset)
+  (:export #:aprof-run #:aprof-show #:aprof-reset
+           #:aprof-start #:aprof-stop #:patch-all-code)
+  (:import-from #:sb-di #:valid-tagged-pointer-p)
+  (:import-from #:sb-vm #:thread-reg)
   (:import-from #:sb-x86-64-asm
-                #:get-gpr #:reg #:reg-num
+                #:register-p #:get-gpr #:reg #:reg-num
                 #:machine-ea #:machine-ea-p
                 #:machine-ea-disp #:machine-ea-base #:machine-ea-index
                 #:inc #:add #:mov))
@@ -80,47 +81,126 @@
   bytes count type pc)
 (declaim (freeze-type alloc))
 
-(defvar *allocation-profile-metadata* nil)
-
-(defvar *allocation-fixups-installed*
-  (make-hash-table :test 'eq :weakness :key :synchronized t))
+(defglobal *allocation-profile-metadata* nil)
 
 (define-alien-variable alloc-profile-buffer system-area-pointer)
 (defun aprof-reset ()
-  (alien-funcall (extern-alien "memset" (function void system-area-pointer int size-t))
-                 alloc-profile-buffer
-                 0
-                 (* (/ (length *allocation-profile-metadata*) 2)
-                    sb-vm:n-word-bytes)))
+  (let ((buffer alloc-profile-buffer))
+    (unless (= (sap-int buffer) 0)
+      (alien-funcall (extern-alien "memset" (function void system-area-pointer int size-t))
+                     alloc-profile-buffer
+                     0
+                     (* (/ (length *allocation-profile-metadata*) 2)
+                        sb-vm:n-word-bytes)))))
 
-(defun patch-fixups ()
-  (let ((n-fixups 0)
-        (n-patched 0)
-        (from-ht sb-c::*allocation-point-fixups*)
-        (to-ht *allocation-fixups-installed*))
-    (when (plusp (hash-table-count from-ht))
-      (dohash ((code fixups) from-ht)
-        (do-packed-varints (loc fixups)
-          (incf n-fixups)
-          (let ((byte (sap-ref-8 (code-instructions code) loc)))
-            (when (eql byte #xEB)
-              (setf (sap-ref-8 (code-instructions code) loc) #x74) ; JEQ
-              (incf n-patched))))
-        (setf (gethash code to-ht) fixups)
-        (remhash code from-ht)))
-    (values n-fixups n-patched)))
+(defun patch-code (code locs enable &aux (n 0) (n-patched 0))
+  (let ((enable-counted (sb-fasl:get-asm-routine 'sb-vm::enable-alloc-counter))
+        (enable-sized (sb-fasl:get-asm-routine 'sb-vm::enable-sized-alloc-counter))
+        (enable-counted-indirect
+         (sb-fasl:get-asm-routine 'sb-vm::enable-alloc-counter t))
+        (enable-sized-indirect
+         (sb-fasl:get-asm-routine 'sb-vm::enable-sized-alloc-counter t))
+        (stack (make-array 1 :element-type 'sb-vm:word))
+        (insts (code-instructions code)))
+    (declare (dynamic-extent stack))
+    (with-alien ((allocation-tracker-counted (function void system-area-pointer) :extern)
+                 (allocation-tracker-sized (function void system-area-pointer) :extern))
+      (do-packed-varints (loc locs)
+        (incf n)
+        (let ((byte (sap-ref-8 insts loc)))
+          (when (eql byte #xEB)
+            (setf (sap-ref-8 insts loc) #x74) ; JEQ
+            (when enable
+              (let* ((next-pc (+ loc 2))
+                     (aligned-next-pc (align-up next-pc 8))
+                     (opcode (sap-ref-8 insts aligned-next-pc)))
+                (case opcode
+                  (#xE8 ; CALL rel32
+                   (let* ((rel32 (signed-sap-ref-32 insts (1+ aligned-next-pc)))
+                          (return-pc (sap+ insts (+ aligned-next-pc 5)))
+                          (target (sap+ return-pc rel32)))
+                     ;; The C rountine looks at the return address to see where
+                     ;; to patch in the new instructions, and it gets the return address
+                     ;; from the stack, the pointer to which is supplied as the arg.
+                     ;; So STACK is the simulated stack containing the return PC.
+                     (setf (aref stack 0) (sap-int return-pc))
+                     (cond ((= (sap-int target) enable-counted)
+                            (alien-funcall allocation-tracker-counted (vector-sap stack)))
+                           ((= (sap-int target) enable-sized)
+                            (alien-funcall allocation-tracker-sized (vector-sap stack)))
+                           ;; Dynamic-space code can't encode call32 to an asm routine. Instead
+                           ;; might see CALL to a JMP within the code blob so that we don't
+                           ;; produce one absolute fixup per allocation site.
+                           ((and (sap>= target insts)
+                                 (sap< target (sap+ insts (%code-text-size code)))
+                                 (= (sap-ref-8 target 0) #xFF)
+                                 (= (sap-ref-8 target 1) #x24)
+                                 (= (sap-ref-8 target 2) #x25))
+                            (let ((ea (sap-ref-32 target 3)))
+                              (cond ((= ea enable-counted-indirect)
+                                     (alien-funcall allocation-tracker-counted (vector-sap stack)))
+                                    ((= ea enable-sized-indirect)
+                                     (alien-funcall allocation-tracker-sized (vector-sap stack)))
+                                    (t
+                                     (error "Unrecognized CALL [EA] at patch site in ~A @ ~X"
+                                            code loc)))))
+                           (t
+                            (error "Unrecognized CALL at patch site in ~A @ ~X"
+                                   code loc)))))
+                  (t
+                   (error "Unrecognized opcode at patch site in ~A @ ~X"
+                          code loc)))))
+            (incf n-patched)))))
+    (values n n-patched)))
+
+;; Fixed-size allocations consume 1 entry (hit count).
+;; Variable-size consume 2 (hit count and total bytes).
+;; Counters 0 and 1 are reserved for variable-size allocations
+;; (hit count and total size) that overflow the maximum counter index.
+;; Counter 2 is reserved for fixed-size allocations.
+(define-load-time-global *n-profile-sites* 3)
 
 (defun aprof-start ()
-  (let ((v *allocation-profile-metadata*))
-    (unless v
-      (setq v (make-array 100000) *allocation-profile-metadata* v)
-      (with-pinned-objects (v)
-        (setf (extern-alien "alloc_profile_data" unsigned)
-              (sb-kernel:get-lisp-obj-address v)))))
+  (with-alien ((alloc-profile-data unsigned :extern))
+    (when (zerop alloc-profile-data) ; raw data buffer not made yet
+      (let ((v *allocation-profile-metadata*))
+        ;; Lisp metadata may or may not exist depending on whether you saved a core image
+        ;; with the metadata baked in.
+        (unless v
+          (setq v (make-array 300000)
+                *allocation-profile-metadata* v))
+        (with-pinned-objects (v)
+          (setf alloc-profile-data (get-lisp-obj-address v))))))
   (alien-funcall (extern-alien "allocation_profiler_start" (function void))))
 
 (defun aprof-stop ()
   (alien-funcall (extern-alien "allocation_profiler_stop" (function void))))
+
+;;; Passing ENABLE presumes that you want to later use the profiler
+;;; without relying on self-modifying code. Everything can be patched now
+;;; and then the image dumped. This plays more nicely with some sandboxed
+;;; environments that forbid executable text segments, which is
+;;; predominantly a concern for ELFinated cores.
+(defun patch-all-code (&optional enable)
+  (when enable
+    ;; Somewhat un-obviously, we have to "start" the profiler so that the C
+    ;; support figures out how many alloc site indices it can utilize
+    ;; based on the size of the profile data vector passed from lisp.
+    (aprof-start)
+    ;; Then stop, because we don't actually want to profile anything now.
+    (aprof-stop))
+  (let ((total-n-patch-points 0)
+        (total-n-patched 0)
+        (ht sb-c::*allocation-patch-points*))
+    (dohash ((code locs) ht)
+      (remhash code ht)
+      (multiple-value-bind (n-patch-points n-patched)
+          ;; just being pedantic about pinning here for documentation
+          (with-pinned-objects (code)
+            (patch-code code locs enable))
+        (incf total-n-patch-points n-patch-points)
+        (incf total-n-patched n-patched)))
+    (values total-n-patch-points total-n-patched)))
 
 (defglobal *tag-to-type*
   (map 'vector
@@ -134,36 +214,15 @@
        sb-vm::*room-info*))
 
 (defun layout-name (ptr)
-  (if (eql (valid-lisp-pointer-p (int-sap ptr)) 0)
+  (if (eql (valid-tagged-pointer-p (int-sap ptr)) 0)
       'structure
       (layout-classoid-name (make-lisp-obj ptr))))
 
 ;;; These EAs are s-expressions, not instances of EA or MACHINE-EA.
+#-sb-safepoint
 (defconstant-eqx p-a-flag `(ea ,(ash sb-vm::thread-pseudo-atomic-bits-slot sb-vm:word-shift)
-                               ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn)))
+                               ,(get-gpr :qword sb-vm::thread-reg))
   #'equal)
-(defconstant-eqx region-ptr
-    `(ea ,(ash sb-vm::thread-alloc-region-slot sb-vm:word-shift)
-         ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn)))
-  #'equal)
-(defconstant-eqx region-end
-    `(ea ,(ash (1+ sb-vm::thread-alloc-region-slot) sb-vm:word-shift)
-         ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn)))
-  #'equal)
-
-(defun header-word-store-p (inst bindings)
-  ;; a byte-sized or word-sized store at displacement 8 through 10 is OK
-  (let ((ea (caddr inst))
-        (freeptr (cdr (assoc '$free bindings))))
-    (and (eq (car inst) 'mov)
-         (typep ea 'machine-ea)
-         (typep freeptr 'reg)
-         (eql (reg-num freeptr) (machine-ea-base ea))
-         (or (and (member (cadr inst) '(:byte :word))
-                  (typep (machine-ea-disp ea) '(integer 8 10)))
-             (and (eq (cadr inst) :qword)
-                  (eql (machine-ea-disp ea) 8)
-                  (typep (cadddr inst) 'reg))))))
 
 ;;; Templates to try in order.  The one for unknown headered objects should be last
 ;;; so that we try to match a store to the header word if possible.
@@ -173,47 +232,95 @@
 ;;; "don't know how to dump R13 (default MAKE-LOAD-FORM method called)."
 #-sb-show
 (setq *allocation-templates*
-      `((array ;; also array-header
-               (xadd $free $size)
-               (cmp :qword $free ,region-end)
-               (jmp :nbe $_)
-               (mov :qword ,region-ptr $free)
-               (mov $_ (ea 0 $size) $header); after XADD, size is the old free ptr
-               (:optional (mov $_ (ea 8 $size) $vector-len))
-               (:or (or $size ,sb-vm:other-pointer-lowtag)
-                    (lea :qword $result (ea ,sb-vm:other-pointer-lowtag $size))))
+      `((fixed+header
+         (add ?end ?nbytes)
+         (cmp :qword ?end :tlab-limit)
+         (jmp :a ?_)
+         (mov :qword :tlab-freeptr ?end)
+         (:or (add ?end ?bias) (dec ?end))
+         (mov ?_ (ea ?_ ?end) ?header))
 
-        (any (:or (lea :qword $end (ea $nbytes $free $nbytes-var))
+        (var-array
+         (add ?end ?nbytes)
+         (cmp :qword ?end :tlab-limit)
+         (jmp :a ?_)
+         (mov :qword :tlab-freeptr ?end)
+         (sub ?end ?nbytes)
+         (mov ?_ (ea ?_ ?end) ?header)
+         (mov ?_ (ea ?_ ?end) ?vector-len))
+
+        (var-xadd
+               ;; after the xadd, SIZE holds the original value of free-ptr
+               ;; and free-ptr points to the end of the putative data block.
+               (xadd ?free ?size)
+               (cmp :qword ?free :tlab-limit)
+               (jmp :a ?_)
+               (mov :qword :tlab-freeptr ?free)
+               ;; Could have one or two stores prior to ORing in a lowtag.
+               (:optional (mov ?_ (ea 0 ?size) ?header))
+               (:optional (mov ?_ (ea 8 ?size) ?vector-len))
+               (:or (or ?size ?lowtag)
+                    (lea :qword ?result (ea ?lowtag ?size))))
+
+        (any (:or (lea :qword ?end (ea ?nbytes ?free ?nbytes-var))
                   ;; LEA with scale=1 can have base and index swapped
-                  (lea :qword $end (ea 0 $nbytes-var $free))
-                  (add $end $free)) ; $end originally holds the size in bytes
-             (cmp :qword $end ,region-end)
-             (jmp :nbe $_)
-             (mov :qword ,region-ptr $end)
-             (mov $_ (ea 0 $free) $header)
-             (:optional (:if header-word-store-p (mov $_ (ea $_ $free) $vector-len)))
-             (:or (or $free $lowtag)
-                  (lea :qword $result (ea $lowtag $free))))
+                  (lea :qword ?end (ea 0 ?nbytes-var ?free))
+                  (add ?end ?free)) ; ?end originally holds the size in bytes
+             (cmp :qword ?end :tlab-limit)
+             (jmp :a ?_)
+             (mov :qword :tlab-freeptr ?end)
+             (mov ?_ (ea 0 ?free) ?header)
+             (:optional (mov ?_ (ea ?_ ?free) ?vector-len))
+             (:or (or ?free ?lowtag)
+                  (lea :qword ?result (ea ?lowtag ?free))))
+
+        ;; LISTIFY-REST-ARG computes a tagged pointer to the _last_ cons in the memory block,
+        ;; not the first cons.
+        (list (lea :qword ?end (ea 0 ?nbytes ?free))
+              (cmp :qword ?end :tlab-limit)
+              (jmp :a ?_)
+              (mov :qword :tlab-freeptr ?end)
+              (lea :qword ?free (ea ,(- sb-vm:list-pointer-lowtag
+                                        (* sb-vm:cons-size sb-vm:n-word-bytes))
+                                    ?free ?nbytes))
+              (shr ?nbytes 4))
+
+        (acons (lea :qword ?end (ea 32 ?free))
+               (cmp :qword ?end :tlab-limit)
+               (jmp :a ?_)
+               (mov :qword :tlab-freeptr ?end)
+               (:repeat (mov . ignore))
+               (lea :qword ?result (ea #.(+ 16 sb-vm:list-pointer-lowtag) ?free)))
 
         ;; either non-headered object (cons) or unknown header or unknown nbytes
-        (unknown-header (:or (lea :qword $end (ea $nbytes $free $nbytes-var))
-                             (lea :qword $end (ea 0 $nbytes-var $free))
-                             (add $end $free))
-                        (cmp :qword $end ,region-end)
-                        (jmp :nbe $_)
-                        (mov :qword ,region-ptr $end)
+        (unknown-header (:or (lea :qword ?end (ea ?nbytes ?free ?nbytes-var))
+                             (lea :qword ?end (ea 0 ?nbytes-var ?free))
+                             (add ?end ?free))
+                        (cmp :qword ?end :tlab-limit)
+                        (jmp :a ?_)
+                        (mov :qword :tlab-freeptr ?end)
                         (:repeat (:or (mov . ignore) (lea . ignore)))
-                        (:or (or $free $lowtag)
-                             (lea :qword $result (ea $lowtag $free))))))
+                        (:or (or ?free ?lowtag)
+                             (lea :qword ?result (ea ?lowtag ?free))))))
 
 (defglobal *allocation-templates-large* nil)
 (setq *allocation-templates-large*
-      `((array (push $nbytes)
+      `((array (push ?nbytes)
                (call . ignore)
-               (pop $result)
-               (mov $_ (ea 0 $result) $header)
-               (mov $_ (ea $_ $result) $vector-len)
-               (or $result $lowtag))))
+               (pop ?result)
+               (mov ?_ (ea 0 ?result) ?header)
+               (mov ?_ (ea ?_ ?result) ?vector-len)
+               (or ?result ?lowtag))
+        ;; not really "large" but same as preceding
+        (funinstance (push ?nbytes)
+                     (call . ignore)
+                     (pop ?result)
+                     (mov ?_ (ea 0 ?result) ?header)
+                     (or ?result ?lowtag))
+        (list (push ?nbytes)
+              (call . ignore)
+              (pop ?result)
+              (or ?result ?lowtag))))
 
 (defun iterator-begin (iterator pc code)
   (let ((segment (sb-disassem:make-code-segment
@@ -233,15 +340,34 @@
           ;; FIXME: this drops any LOCK prefix, but that seems to be ok
           (do ((tail (cdr inst) (cdr tail)))
               ((null tail))
+            ;; This takes an instruction expressed thusly:
+            ;;   (MOV (#S(MACHINE-EA :DISP n :BASE n) . :QWORD) RDX)
+            ;; and turns it into:
+            ;;   (MOV :QWORD #S(MACHINE-EA :DISP n :BASE n) RDX)
             (when (typep (car tail) '(cons machine-ea))
-              (setf inst (list* (car inst) (cdar tail) (cdr inst))
-                    (car tail) (caar tail))
+              (let ((ea (caar tail)))
+                (setf inst (list* (car inst) (cdar tail) (cdr inst))) ; insert the :size)
+                (when (eq (machine-ea-base ea) sb-vm::thread-reg)
+                  ;; Figure out if we're looking at an allocation buffer
+                  (let ((disp (ash (machine-ea-disp ea) (- sb-vm:word-shift))))
+                    (awhen (case disp
+                            ((#.sb-vm::thread-sys-mixed-tlab-slot
+                              #.sb-vm::thread-sys-cons-tlab-slot
+                              #.sb-vm::thread-mixed-tlab-slot
+                              #.sb-vm::thread-cons-tlab-slot) :tlab-freeptr)
+                            ((#.(1+ sb-vm::thread-sys-mixed-tlab-slot)
+                              #.(1+ sb-vm::thread-sys-cons-tlab-slot)
+                              #.(1+ sb-vm::thread-mixed-tlab-slot)
+                              #.(1+ sb-vm::thread-cons-tlab-slot)) :tlab-limit))
+                      (setq ea it))))
+                (setf (car tail) ea)) ; change the EA
+              ;; There can be at most one EA per instruction, so we're done
               (return)))
           (vector-push-extend inst vector)
           inst))))
 
 (defparameter *debug-deduce-type* nil)
-(eval-when (:compile-toplevel)
+(eval-when (:compile-toplevel :execute)
   (defmacro note (&rest args)
     `(when *debug-deduce-type*
        (let ((*print-pretty* nil))
@@ -272,8 +398,8 @@
                (note "   match-atom ~s ~s ~s ~s~%" pattern input ea-reg-p bindings)
                (when (and (integerp input) ea-reg-p)
                  (setq input (get-gpr :qword input)))
-               (cond ((eq pattern '$_) t) ; match and ignore anything
-                     ((and (symbolp pattern) (char= (char (string pattern) 0) #\$))
+               (cond ((eq pattern '?_) t) ; match and ignore anything
+                     ((and (symbolp pattern) (char= (char (string pattern) 0) #\?))
                       ;; free variable binds to input, otherwise binding must match
                       (let* ((cell (assq pattern bindings))
                              (binding (cdr cell)))
@@ -288,7 +414,7 @@
                      (t (eql pattern input))))
              (ok-binding (pattern input)
                (case pattern
-                ($lowtag
+                (?lowtag
                  (memq input `(,sb-vm:instance-pointer-lowtag ,sb-vm:list-pointer-lowtag
                                ,sb-vm:fun-pointer-lowtag ,sb-vm:other-pointer-lowtag)))
                 (t t))))
@@ -326,33 +452,40 @@
     (loop (when (endp template) (return bindings))
           (let ((pattern (pop template)))
             (case (car pattern)
-             ((:optional :repeat)
-              (let ((count (if (eq (car pattern) :repeat) most-positive-fixnum 1)))
-                ;; :REPEAT matches zero or more instructions, but as few as possible.
-                ;; :OPTIONAL matches zero or one, similarly.
+             (:optional
+              ;; :OPTIONAL is greedy, preferring to match if it can,
+              ;; but if the rest of the template fails, we'll backtrack
+              ;; and skip this pattern.
+              (when (inst-matchp input (cadr pattern))
+                (let ((bindings (matchp input template bindings)))
+                  (cond ((eq bindings :fail)
+                         (setf (car input) start)) ; don't match
+                        (t
+                         (return bindings))))))
+             (:repeat
+              ;; :REPEAT matches zero or more instructions, as few as possible.
                 (let ((next-pattern (pop template)))
                   (loop (when (inst-matchp input next-pattern) (return))
-                        (unless (and (>= (decf count) 0)
-                                     (inst-matchp input (cadr pattern)))
-                          (fail))))))
+                        (unless (inst-matchp input (cadr pattern))
+                          (fail)))))
              (t
               (unless (inst-matchp input pattern)
                 (fail))))))))
 
 (defun deduce-layout (iterator bindings)
-  (unless (assq '$result bindings)
-    (push `($result . ,(cdr (assq '$free bindings))) bindings))
-  (let ((bindings
-         (matchp iterator
-                 (load-time-value
-                  `((xor :qword ,p-a-flag ,(get-gpr :qword rbp-offset))
-                    (jmp :eq $_)
-                    (break . ignore)
-                    (mov :dword (ea 1 $result) $layout)) t)
-                 bindings)))
-    (if (eq bindings :fail)
-        'instance
-        (layout-name (cdr (assq '$layout bindings))))))
+  (unless (assq '?result bindings)
+    (push `(?result . ,(cdr (assq '?free bindings))) bindings))
+  (when (eql (cdr (assq '?lowtag bindings)) sb-vm:instance-pointer-lowtag)
+    (destructuring-bind (pos vector . dstate) iterator
+      (let ((inst (aref vector (1- pos))))
+        (aver (eq (car inst) 'or))
+        (let* ((iterator (list* (- pos 2) vector dstate))
+               (bindings (matchp iterator
+                                 (load-time-value `((mov :dword (ea 4 ?result) ?layout)) t)
+                                 bindings)))
+          (if (eq bindings :fail)
+              'instance
+              (layout-name (cdr (assq '?layout bindings)))))))))
 
 (defun deduce-fun-subtype (iterator bindings)
   (declare (ignorable iterator bindings))
@@ -361,14 +494,14 @@
   (let* ((bindings
           (matchp iterator
                   (load-time-value
-                   `((mov $scratch $header)
-                     (or :qword $scratch
+                   `((mov ?scratch ?header)
+                     (or :qword ?scratch
                          (ea ,(ash sb-vm::thread-function-layout-slot sb-vm:word-shift)
-                             ,(get-gpr :qword (sb-c:tn-offset sb-vm::thread-base-tn))))
-                     (mov :qword (ea ,(- sb-vm:fun-pointer-lowtag) $result) $scratch))
+                             ,(get-gpr :qword sb-vm::thread-reg)))
+                     (mov :qword (ea ,(- sb-vm:fun-pointer-lowtag) ?result) ?scratch))
                    t)
                   bindings))
-         (header (and (listp bindings) (cdr (assoc '$header bindings)))))
+         (header (and (listp bindings) (cdr (assoc '?header bindings)))))
     (if (and (integerp header) (eq (logand header #xFF) sb-vm:closure-widetag))
         'closure
         'function)))
@@ -381,36 +514,30 @@
     ;; Expect an increment of the allocation point hit counter
     (let* ((inst (get-instruction iterator))
            (ea (third inst))) ; (INC :qword EA)
-      (when (and (eq (car inst) 'inc)
-                 (eql (machine-ea-base ea) (sb-c:tn-offset sb-vm::temp-reg-tn))
-                 (null (machine-ea-index ea)))
+      (when (and (eq (car inst) 'inc) (machine-ea-base ea) (null (machine-ea-index ea)))
         (incf (car iterator))
-        (let ((profiler-index (machine-ea-disp ea)))
+        (let ((profiler-base (machine-ea-base ea))
+              (profiler-index (machine-ea-disp ea)))
           ;; Optional: the total number of bytes at the allocation point
           (let* ((inst (get-instruction iterator))
                  (ea (third inst)))
             (when (and (eq (car inst) 'add)
                        (machine-ea-p ea)
-                       (eql (machine-ea-base ea) (sb-c:tn-offset sb-vm::temp-reg-tn))
+                       (eql (machine-ea-base ea) profiler-base)
                        (null (machine-ea-index ea))
                        (eql (machine-ea-disp ea) (+ profiler-index sb-vm:n-word-bytes)))
               (incf (car iterator)))))))
 
     ;; Expect a store to the pseudo-atomic flag
+    #-sb-safepoint
     (when (eq (matchp iterator
-                      (load-time-value `((mov :qword ,p-a-flag ,(get-gpr :qword rbp-offset))) t)
+                      (load-time-value `((mov :qword ,p-a-flag ,(get-gpr :qword thread-reg))) t)
                       nil) :fail)
       (return-from deduce-type (values nil nil)))
 
     (let* ((type)
            (bindings
-            (matchp iterator
-                    ;; compiler bug? If expressed with "`" then the compiler tries to
-                    ;; refer to the undumpable constant REGION-PTR by its value, not by its
-                    ;; name, then complaining that it can't be dumped.
-                    ;; Why is ",P-A-FLAG" acceptable but this not?
-                    (load-time-value (list (list 'mov :qword '$free region-ptr)) t)
-                    nil))
+            (matchp iterator `((mov :qword ?free :tlab-freeptr)) nil))
            (templates
             (cond (template-name
                    (list (find template-name *allocation-templates* :key 'car)))
@@ -428,22 +555,26 @@
             (return))))
       (if (eq bindings :fail)
           (values nil nil)
-          (let ((nbytes (cdr (assoc '$nbytes bindings)))
-                (header (cdr (assoc '$header bindings)))
-                (lowtag (cdr (assoc '$lowtag bindings))))
-            ;; The low bit might signify something to the allocator. Clear it.
-            (when (integerp nbytes)
-              (setq nbytes (logandc2 nbytes 1)))
+          (let ((nbytes (cdr (assoc '?nbytes bindings)))
+                (header (cdr (assoc '?header bindings)))
+                (lowtag (cdr (assoc '?lowtag bindings))))
             ;; matchp converts NIL in a machine-ea to 0.  The disassembler uses
             ;; NIL to signify that there was no displacement, which makes sense
             ;; when register indirect mode is used without a SIB byte.
             (when (eq nbytes 0)
               (setq nbytes nil))
-            (cond ((and (member type '(array any))
+            (cond ((and (member type '(fixed+header var-array var-xadd any))
                         (typep header '(or sb-vm:word sb-vm:signed-word)))
                    (setq type (aref *tag-to-type* (logand header #xFF)))
+                   (when (register-p nbytes)
+                     (setq nbytes nil))
                    (when (eq type 'instance)
                      (setq type (deduce-layout iterator bindings))))
+                  ((eq type 'list) ; listify-rest-arg
+                   (unless (integerp nbytes)
+                     (setq nbytes nil)))
+                  ((eq type 'acons)
+                   (setq type 'list nbytes (* 2 sb-vm:cons-size sb-vm:n-word-bytes)))
                   ((member type '(any unknown-header))
                    (setq type (case lowtag
                                 (#.sb-vm:list-pointer-lowtag 'list)
@@ -453,29 +584,23 @@
                                 (t '#:|unknown|)))))
             (values type nbytes))))))
 
-;;; Return a name for PC-OFFS in CODE. PC-OFFSET is relative
-;;; to CODE-INSTRUCTIONS.
-(defun pc-offs-to-fun-name (pc-offs code &aux (di (%code-debug-info code)))
-  (if (hash-table-p di) ; assembler routines
+;;; Return a name for PC-OFFSET in CODE. PC-OFFSET is relative to
+;;; CODE-INSTRUCTIONS.
+(defun pc-offset-to-fun-name (pc-offset code)
+  (if (eq sb-vm::*assembler-routines* code)
       (block nil
-       (maphash (lambda (k v) ; FIXME: OAOO violation, at least twice over
-                  (when (<= (car v) pc-offs (cadr v))
-                    (return k)))
-                di))
-      (let* ((funmap (sb-c::compiled-debug-info-fun-map di)))
-        (unless (sb-c::compiled-debug-fun-next funmap)
-          (aver (typep funmap 'sb-c::compiled-debug-fun-toplevel))
-          (return-from pc-offs-to-fun-name :toplevel))
-        (loop for fun = funmap then next
-              for next = (sb-c::compiled-debug-fun-next fun)
-              when (or (not next)
-                       (< (sb-c::compiled-debug-fun-offset next) pc-offs))
-              return (sb-c::compiled-debug-fun-name fun)))))
+        (maphash (lambda (k v) ; FIXME: OAOO violation, at least twice over
+                   (when (<= (car v) pc-offset (cadr v))
+                     (return k)))
+                 (%code-debug-info code)))
+      (sb-c::compiled-debug-fun-name
+       (sb-di::compiled-debug-fun-compiler-debug-fun
+        (sb-di::debug-fun-from-pc code pc-offset)))))
 
 (defun aprof-collect (stream)
   (sb-disassem:get-inst-space) ; for effect
   (let* ((metadata *allocation-profile-metadata*)
-         (n-hit (extern-alien "alloc_profile_n_counters" int))
+         (n-hit *n-profile-sites*)
          (metadata-len (/ (length metadata) 2))
          (n-counters (min metadata-len n-hit))
          (sap (extern-alien "alloc_profile_buffer" system-area-pointer))
@@ -499,10 +624,10 @@
          (incf index (if total-bytes 2 1)) ; <count,bytes> or just a count
          (unless (eql count 0)
            (with-pinned-objects (code)
-            (let ((pc (+ (sb-kernel:get-lisp-obj-address code)
+            (let ((pc (+ (get-lisp-obj-address code)
                           (- sb-vm:other-pointer-lowtag)
                           pc-offset))
-                  (name (pc-offs-to-fun-name
+                  (name (pc-offset-to-fun-name
                          ;; Relativize to CODE-INSTRUCTIONS, not the base address
                          (- pc-offset (ash (code-header-words code) sb-vm:word-shift))
                          code)))
@@ -625,16 +750,20 @@
 ;;; cons profiling.
 ;;; STREAM is where to report, defaulting to *standard-output*.
 ;;; The convention is that of map-segment-instructions, meaning NIL is a sink.
-(defun aprof-run (fun &key (stream *standard-output*))
+(defun aprof-run (fun &key (report t) (stream *standard-output*) arguments)
   (aprof-reset)
-  (patch-fixups)
-  (let (nbytes)
-    (unwind-protect
-         (progn (aprof-start) (funcall fun))
-      (aprof-stop)
-      (setq nbytes (aprof-show :stream stream))
-      (when stream (terpri stream)))
-    nbytes))
+  (patch-all-code)
+  (dx-let ((arglist (cons arguments nil))) ; so no consing in here
+    (when (listp arguments)
+      (setq arglist (car arglist))) ; was already a list
+    (let (nbytes)
+      (unwind-protect
+           (progn (aprof-start) (apply fun arglist))
+        (aprof-stop))
+      (when report
+        (setq nbytes (aprof-show :stream stream))
+        (when stream (terpri stream)))
+      nbytes)))
 
 ;;;;
 

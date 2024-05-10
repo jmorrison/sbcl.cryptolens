@@ -9,17 +9,6 @@
 
 (in-package "SB-INTERPRETER")
 
-;;; True if the symbol is a special operator, indicating that it MAY
-;;; have an extra slot in the payload. Special operators defined after
-;;; initial build will set this bit, but not have an extra slot.
-(defconstant +special-op-symbol+  (ash 1 11))
-;;; True if the interpreter should handle this special operator even when
-;;; SB-EXT:*EVALUATOR-MODE* is :COMPILE. If true, the operator must preserve
-;;; a perfect correspondence between interpreter ENV instances and compiler
-;;; LEXENV instances so that if a subform is reached having a non-simple
-;;; operator, the compiler can be invoked in the equivalent environment.
-(defconstant +simple-special-op+  (ash 1 10))
-
 ;;; DEFSPECIAL name (destructuring-lambda-list)
 ;;;    [FORMS]*
 ;;;    :IMMEDIATE (ENV) FORMS+
@@ -42,8 +31,6 @@
   (let* ((specialized-code
           (member-if (lambda (form) (member form '(:immediate :deferred)))
                      body))
-         (simple-p (member name '(quote eval-when if progn setq
-                                  locally macrolet symbol-macrolet)))
          (common-code (ldiff body specialized-code))
          (immediate-code)
          (deferred-code))
@@ -78,20 +65,18 @@
                                       ,@body)))
                         (with-subforms ,macro-lambda-list ,form-var
                                        ,@body)))))))
-        `((lambda (name simple immediate deferred)
-            (setf (info :function :interpreter name) deferred)
-            (when immediate
-              (aver (symbol-extra-slot-p name))
-              (setf (symbol-extra name) immediate))
-            (set-header-data
-             name (logior +special-op-symbol+
-                          (if simple +simple-special-op+ 0)
-                          (get-header-data name))))
+        `((lambda (name immediate deferred)
+            (setf (info :function :definition name) (cons deferred immediate)))
           ',name
-          ',simple-p
           ,(when immediate-code
              (gen-code :immediate immediate-code))
           ,(gen-code :deferred deferred-code))))))
+
+(defmacro checking-progv (vars vals &body body)
+  `(locally
+       (declare (optimize (sb-c::type-check 3)))
+       (progv ,vars ,vals
+         (locally (declare (optimize (sb-c::type-check 1))) ,@body))))
 
 ;;; Create parallel bindings for LET or a LAMBDA's required args.
 ;;; Use of this macro is highly confined, so no bothering with ONCE-ONLY.
@@ -114,7 +99,7 @@
            ;; which would destroy the list for the LET*-like bindings.
            (dotimes (frame-index ,count
                      (if ,special-vals
-                         (progv ,specials ,special-vals ,@finally)
+                         (checking-progv ,specials ,special-vals ,@finally)
                          (progn ,@finally)))
              (let ((value ,value))
                (if ,specialp
@@ -145,7 +130,7 @@
                 ;; note by "manually" eliding half the logic :-(
                 ,@(if specialp
                       `((if ,specialp
-                            (progv ,specials (list value)
+                            (checking-progv ,specials (list value)
                               (let*-bind (setf ,count-place (1+ frame-index))
                                          end))
                             (progn

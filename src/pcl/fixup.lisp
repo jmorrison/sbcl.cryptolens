@@ -28,29 +28,48 @@
 (fmakunbound 'ensure-accessor)
 (defun ensure-accessor (fun-name) ; Make FUN-NAME exist as a GF if it doesn't
   (destructuring-bind (slot-name method) (cddr fun-name)
-    ;; FIXME: change SLOT-OBJECT here to T to get SLOT-MISSING
-    ;; behaviour for non-slot-objects too?
     (let ((reader-specializers (load-time-value (list (find-class 'slot-object)) t))
           (writer-specializers (load-time-value (list (find-class 't)
-                                                      (find-class 'slot-object)) t)))
-      (multiple-value-bind (lambda-list specializers method-class initargs doc)
+                                                      (find-class 'slot-object)) t))
+          (fallback-reader-specializers
+            (load-time-value (list (find-class 't)) t))
+          (fallback-writer-specializers
+            (load-time-value (list (find-class 't) (find-class 't)) t)))
+      (multiple-value-bind (lambda-list specializers method-class initargs doc
+                            fallback-initargs
+                            fallback-specializers)
           (ecase method
             (reader
              (values '(object) reader-specializers 'global-reader-method
                      (make-std-reader-method-function 'slot-object slot-name)
-                     "automatically-generated reader method"))
+                     "automatically-generated reader method"
+                     (make-fallback-reader-method-function slot-name)
+                     fallback-reader-specializers))
             (writer
              (values '(new-value object) writer-specializers
                      'global-writer-method
                      (make-std-writer-method-function 'slot-object slot-name)
-                     "automatically-generated writer method"))
+                     "automatically-generated writer method"
+                     (make-fallback-writer-method-function slot-name)
+                     fallback-writer-specializers))
             (boundp
              (values '(object) reader-specializers 'global-boundp-method
                      (make-std-boundp-method-function 'slot-object slot-name)
-                     "automatically-generated boundp method")))
+                     "automatically-generated boundp method"
+                     (make-fallback-boundp-method-function slot-name)
+                     fallback-reader-specializers))
+            (makunbound
+             (values '(object) reader-specializers 'global-makunbound-method
+                     (make-std-makunbound-method-function 'slot-object slot-name)
+                     "automatically-generated makunbound method"
+                     (make-fallback-makunbound-method-function slot-name)
+                     fallback-reader-specializers)))
         (let ((gf (ensure-generic-function fun-name :lambda-list lambda-list)))
-          (add-method gf (make-a-method method-class
-                                        () lambda-list specializers
+          (add-method gf (make-a-method method-class ()
+                                        lambda-list fallback-specializers
+                                        fallback-initargs doc :slot-name slot-name))
+          (add-method gf (make-a-method method-class ()
+                                        lambda-list specializers
                                         initargs doc :slot-name slot-name)))))))
 
 (dolist (gf-name *!temporary-ensure-accessor-functions*)
@@ -58,9 +77,10 @@
   (fmakunbound gf-name)
   (ensure-accessor gf-name))
 
+(setq sb-kernel::*defstruct-hooks* '(ensure-defstruct-class))
 (compute-standard-slot-locations)
 (dolist (s '(condition function structure-object))
-  (dohash ((k v) (classoid-subclasses (find-classoid s)))
+  (sb-kernel::do-subclassoids ((k v) (find-classoid s))
     (declare (ignore v))
     (find-class (classoid-name k))))
 (setq **boot-state** 'complete)
@@ -117,3 +137,14 @@
                   standard-writer-method update-dependent validate-superclass
                   writer-method-class))
   (sb-impl::deprecate-export *package* symbol :late "2.0.7"))
+
+(in-package "SB-KERNEL")
+(defun slot-object-p (x) (typep x '(or structure-object standard-object condition)))
+
+(flet ((set-predicate (classoid-name pred)
+         (let ((c (find-classoid classoid-name)))
+           (%instance-set c (get-dsd-index built-in-classoid predicate)
+                 pred))))
+  (set-predicate 't #'constantly-t)
+  (set-predicate 'random-class #'constantly-nil)
+  (set-predicate 'sb-pcl::slot-object #'slot-object-p))

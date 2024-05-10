@@ -2,15 +2,15 @@
 #include <stdio.h>
 #include <errno.h>
 
-#include "genesis/config.h"
-#include "genesis/constants.h"
+#include "genesis/sbcl.h"
 #include "globals.h"
 #include "os.h"
 #include "interr.h"
+#include "sys_mmap.inc"
 
 os_vm_address_t
-os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len,
-            int __attribute__((unused)) execute, int __attribute__((unused)) jit)
+os_alloc_gc_space(int __attribute__((unused)) space_id,
+                  int attributes, os_vm_address_t addr, os_vm_size_t len)
 {
     int protection = attributes & IS_GUARD_PAGE ? OS_VM_PROT_NONE : OS_VM_PROT_ALL;
     attributes &= ~IS_GUARD_PAGE;
@@ -21,9 +21,13 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len,
     if (attributes & ALLOCATE_LOW)
         flags |= MAP_32BIT;
 #endif
-    actual = mmap(addr, len, protection, flags, -1, 0);
+    actual = sbcl_mmap(addr, len, protection, flags, -1, 0);
     if (actual == MAP_FAILED) {
-        perror("mmap");
+        if (errno == ENOMEM)
+            fprintf(stderr, "os_alloc_gc_space(%d,%p,%zu) failed with ENOMEM\n",
+                    attributes, addr, len);
+        else
+            perror("mmap");
         return 0;               /* caller should check this */
     }
 
@@ -43,12 +47,4 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len,
     }
 
     return actual;
-}
-
-void
-os_invalidate(os_vm_address_t addr, os_vm_size_t len)
-{
-    if (munmap(addr,len) == -1) {
-        perror("munmap");
-    }
 }

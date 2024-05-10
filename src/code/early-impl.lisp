@@ -27,11 +27,9 @@
                   sb-unix::*unblock-deferrables-on-enabling-interrupts-p*
                   *interrupts-enabled*
                   *interrupt-pending*
-                  #+sb-thruption *thruption-pending*
+                  #+sb-safepoint *thruption-pending*
                   #+sb-safepoint *in-safepoint*
                   *free-interrupt-context-index*
-                  #-gencgc
-                  sb-vm::*allocation-pointer*
                   sb-vm::*binding-stack-pointer*
                   sb-pcl::*cache-miss-values-stack*
                   sb-pcl::*dfun-miss-gfs-on-stack*))
@@ -40,7 +38,7 @@
 ;;; and the symbol-global-value should never be used.
 ;;; (And in any case it is not really a special var)
 #+(and (or x86 x86-64) (not sb-thread))
-(defparameter *pseudo-atomic-bits* 0) ; initialized by genesis
+(defvar *pseudo-atomic-bits* 0)
 
 #+c-stack-is-control-stack
 (setf (info :variable :always-bound 'sb-c:*alien-stack-pointer*) :always-bound)
@@ -59,13 +57,13 @@
 ;;; comparisons. Unlikely, but the cost of using a cons instead is too
 ;;; small to measure. -- JES, 2007-09-30
 (declaim (type cons sb-kernel::*gc-epoch*))
-(!define-load-time-global sb-kernel::*gc-epoch* '(nil . nil))
+(define-load-time-global sb-kernel::*gc-epoch* '(nil . nil))
 
-;;; Default evaluator mode (interpeter / compiler)
+;;; Default evaluator mode (interpreter / compiler)
 
 (declaim (type (member :compile #+(or sb-eval sb-fasteval) :interpret)
                *evaluator-mode*))
-(defparameter *evaluator-mode* :compile ; initialized by genesis
+(defparameter *evaluator-mode* :compile
   "Toggle between different evaluator implementations. If set to :COMPILE,
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")

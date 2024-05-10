@@ -75,21 +75,21 @@
          #+(and sb-thread win32) (scratch-tn (pop scratch-tns))
          #+(and sb-thread win32) (swap-tn (pop scratch-tns))
          (free-pointer
-           ;; thread->alloc_region.free_pointer
+           ;; thread->mixed_tlab.free_pointer
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes thread-alloc-region-slot)
-                    #-sb-thread boxed-region))
+                    #+sb-thread (* n-word-bytes thread-mixed-tlab-slot)
+                    #-sb-thread (+ static-space-start mixed-region-offset)))
          (end-addr
-            ;; thread->alloc_region.end_addr
+            ;; thread->mixed_tlab.end_addr
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes (1+ thread-alloc-region-slot))
-                    #-sb-thread (+ boxed-region n-word-bytes))))
+                    #+sb-thread (* n-word-bytes (1+ thread-mixed-tlab-slot))
+                    #-sb-thread (+ static-space-start mixed-region-offset n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
     #+(and sb-thread win32)
@@ -168,7 +168,7 @@
      (allocation-inline type alloc-tn size))
     (t
      (allocation-notinline type alloc-tn size)))
-  (when (and lowtag (not dynamic-extent))
+  (when (and lowtag (/= lowtag 0) (not dynamic-extent))
     ;; This is dumb, it should be an ADD or an OR, but a better solution
     ;; would be to pass lowtag into the allocation-inline function so that
     ;; for a fixed size we don't emit code such as "SUB r, 8 ; ADD r, 3".
@@ -180,30 +180,23 @@
 ;;; RESULT-TN.
 (defun alloc-other (result-tn widetag size node &optional stack-allocate-p)
   (pseudo-atomic (:elide-if stack-allocate-p)
-      (allocation nil (pad-data-block size) other-pointer-lowtag
+      (allocation nil (* (pad-data-block size)
+                         #+bignum-assertions (if (eql widetag bignum-widetag) 2 1))
+                  other-pointer-lowtag
                   node stack-allocate-p result-tn)
       (storew (compute-object-header size widetag)
               result-tn 0 other-pointer-lowtag)))
 
 ;;;; CONS, LIST and LIST*
-(define-vop (list-or-list*)
-  (:args (things :more t))
+(define-vop (list)
+  (:args (things :more t :scs (descriptor-reg any-reg control-stack)))
   (:temporary (:sc unsigned-reg) ptr temp)
   (:temporary (:sc unsigned-reg :to (:result 0) :target result) res)
-  (:info num)
+  (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
-  (:variant-vars star)
-  (:policy :safe)
   (:node-var node)
   (:generator 0
-    (cond ((zerop num)
-           ;; (move result nil-value)
-           (inst mov result nil-value))
-          ((and star (= num 1))
-           (move result (tn-ref-tn things)))
-          (t
-           (macrolet
-               ((store-car (tn list &optional (slot cons-car-slot))
+    (macrolet ((store-car (tn list &optional (slot cons-car-slot))
                   `(let ((reg
                           (sc-case ,tn
                             ((any-reg descriptor-reg) ,tn)
@@ -211,9 +204,8 @@
                              (move temp ,tn)
                              temp))))
                      (storew reg ,list ,slot list-pointer-lowtag))))
-             (let ((cons-cells (if star (1- num) num))
-                   (stack-allocate-p (node-stack-allocate-p node)))
-               (pseudo-atomic (:elide-if stack-allocate-p)
+      (let ((stack-allocate-p (node-stack-allocate-p node)))
+        (pseudo-atomic (:elide-if stack-allocate-p)
                 (allocation 'list (* (pad-data-block cons-size) cons-cells)
                             list-pointer-lowtag node stack-allocate-p res)
                 (move ptr res)
@@ -231,13 +223,7 @@
                        (storew nil-value ptr cons-cdr-slot
                                list-pointer-lowtag)))
                 (aver (null (tn-ref-across things)))))
-             (move result res))))))
-
-(define-vop (list list-or-list*)
-  (:variant nil))
-
-(define-vop (list* list-or-list*)
-  (:variant t))
+      (move result res))))
 
 ;;;; special-purpose inline allocators
 
@@ -247,12 +233,18 @@
          (length :scs (any-reg immediate))
          (words :scs (any-reg immediate)))
   (:results (result :scs (descriptor-reg) :from :load))
-  (:arg-types positive-fixnum
-              positive-fixnum
-              positive-fixnum)
+  (:arg-types positive-fixnum positive-fixnum positive-fixnum)
   (:policy :fast-safe)
   (:node-var node)
   (:generator 100
+   (flet ((store-widetag (value ptr slot lowtag)
+             (inst mov (object-slot-ea
+                        ptr slot lowtag
+                        (typecase value
+                          ((unsigned-byte 8) :byte)
+                          ((unsigned-byte 16) :word)
+                          (t :dword)))
+                   value)))
     (let ((size (sc-case words
                   (immediate
                    (logandc2 (+ (fixnumize (tn-value words))
@@ -270,7 +262,6 @@
        (allocation nil size other-pointer-lowtag node nil result)
        (sc-case type
          (immediate
-          (aver (typep (tn-value type) '(unsigned-byte 9)))
           (store-widetag (tn-value type) result 0 other-pointer-lowtag))
          (t
           (storew type result 0 other-pointer-lowtag)))
@@ -285,7 +276,7 @@
                (storew fixnum-length result
                        vector-length-slot other-pointer-lowtag)))))
          (t
-          (storew length result vector-length-slot other-pointer-lowtag)))))))
+          (storew length result vector-length-slot other-pointer-lowtag))))))))
 
 (define-vop (allocate-vector-on-stack)
   (:args (type :scs (unsigned-reg immediate) :to :save)
@@ -294,20 +285,32 @@
   (:temporary (:sc any-reg :offset ecx-offset :from (:argument 2)) ecx)
   (:temporary (:sc any-reg :offset eax-offset :from :eval) zero)
   (:temporary (:sc any-reg :offset edi-offset) res)
+  (:node-var node)
+  (:vop-var vop)
   (:results (result :scs (descriptor-reg) :from :load))
   (:arg-types positive-fixnum
               positive-fixnum
               positive-fixnum)
-  (:translate allocate-vector)
   (:policy :fast-safe)
   (:generator 100
     (inst lea result (make-ea :byte :base words :disp
                               (+ (1- (ash 1 n-lowtag-bits))
                                  (* vector-data-offset n-word-bytes))))
     (inst and result (lognot lowtag-mask))
-    ;; FIXME: It would be good to check for stack overflow here.
     (move ecx words)
     (inst shr ecx n-fixnum-tag-bits)
+    (when (sb-c::make-vector-check-overflow-p node)
+      (let ((overflow (generate-error-code vop 'stack-allocated-object-overflows-stack-error result)))
+        (inst sub esp-tn result)
+        (inst cmp esp-tn
+              #-sb-thread
+              (make-ea-for-symbol-value *control-stack-start* :dword)
+              #+sb-thread
+              (make-ea :dword :disp (* 4 thread-control-stack-start-slot))
+              #+sb-thread :fs)
+        ;; avoid clearing condition codes
+        (inst lea esp-tn (make-ea :dword :base esp-tn :index result))
+        (inst jmp :be overflow)))
     (stack-allocation result result other-pointer-lowtag)
     (inst cld)
     (inst lea res
@@ -316,7 +319,7 @@
     (sc-case type
       (immediate
        (aver (typep (tn-value type) '(unsigned-byte 8)))
-       (store-widetag (tn-value type) result 0 other-pointer-lowtag))
+       (storew (tn-value type) result 0 other-pointer-lowtag))
       (t
        (storew type result 0 other-pointer-lowtag)))
     (storew length result vector-length-slot other-pointer-lowtag)
@@ -375,46 +378,17 @@
   (:generator 1
     (inst mov result unbound-marker-widetag)))
 
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
-
 (define-vop (fixed-alloc)
-  (:args)
   (:info name words type lowtag stack-allocate-p)
   (:ignore name)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 50
-    ;; We special case the allocation of conses, because they're
-    ;; extremely common and because the pseudo-atomic sequence on x86
-    ;; is relatively heavyweight.  However, if the user asks for top
-    ;; speed, we accomodate him.  The primary reason that we don't
-    ;; also check for (< SPEED SPACE) is because we want the space
-    ;; savings that these out-of-line allocation routines bring whilst
-    ;; compiling SBCL itself.  --njf, 2006-07-08
-    (if (and (not stack-allocate-p)
-             (= lowtag list-pointer-lowtag) (policy node (< speed 3)))
-        (let ((dst
-               ;; FIXME: out-of-line dx-allocation
-               #.(loop for offset in *dword-regs*
-                    collect `(,offset
-                              ',(intern (format nil "ALLOCATE-CONS-TO-~A"
-                                                (svref +dword-register-names+
-                                                       offset)))) into cases
-                    finally (return `(case (tn-offset result)
-                                       ,@cases)))))
-          (aver (null type))
-          (inst call (make-fixup dst :assembly-routine)))
-        (pseudo-atomic (:elide-if stack-allocate-p)
-         (allocation nil (pad-data-block words) lowtag node stack-allocate-p result)
-         (when type
-           (storew (compute-object-header words type)
-                   result
-                   0
-                   lowtag))))))
+    (pseudo-atomic (:elide-if stack-allocate-p)
+      (let ((nbytes (* (pad-data-block words)
+                       #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
+        (allocation nil nbytes lowtag node stack-allocate-p result))
+      (storew (compute-object-header words type) result 0 lowtag))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
@@ -434,6 +408,7 @@
           (make-ea :dword :base header
                           :disp (+ (ash -2 (length-field-shift type)) type)))
     (inst and bytes (lognot lowtag-mask))
+    #+bignum-assertions (when (eql type bignum-widetag) (inst shl bytes 1)) ; use 2x space
     (pseudo-atomic (:elide-if stack-allocate-p)
      (allocation nil bytes lowtag node stack-allocate-p result)
      (storew header result 0 lowtag))))

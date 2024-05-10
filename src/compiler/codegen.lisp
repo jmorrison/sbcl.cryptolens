@@ -16,26 +16,25 @@
 
 ;;;; utilities used during code generation
 
-;;; the number of bytes used by the code object header
-
-#-sb-xc-host
-(defun component-header-length (&optional
-                                (component *component-being-compiled*))
-  (let* ((2comp (component-info component))
-         (constants (ir2-component-constants 2comp)))
-    (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
-
 ;;; KLUDGE: the assembler can not emit backpatches comprising jump tables without
 ;;; knowing the boxed code header length. But there is no compiler IR2 metaobject,
 ;;; for SB-FASL:*ASSEMBLER-ROUTINES*. We have to return a fixed answer for that.
-#+sb-xc-host
+(defun asm-routines-boxed-header-nwords ()
+  (align-up (+ sb-vm:code-constants-offset
+               #+x86-64 1) ; KLUDGE: make room for 1 boxed constant
+            2))
+;;; the number of bytes used by the code object header
 (defun component-header-length ()
-  (if (boundp '*component-being-compiled*)
-      (let ((component *component-being-compiled*))
-        (let* ((2comp (component-info component))
-               (constants (ir2-component-constants 2comp)))
-          (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
-      (* sb-vm:n-word-bytes 4)))
+  (cond #+sb-xc-host ((not (boundp '*component-being-compiled*))
+                      (* sb-vm:n-word-bytes (asm-routines-boxed-header-nwords)))
+        (t
+         (let* ((2comp (component-info *component-being-compiled*))
+                (constants (ir2-component-constants 2comp)))
+           (ash (align-up (length constants) code-boxed-words-align)
+                sb-vm:word-shift)))))
+
+(defun component-n-jump-table-entries (&optional (component *component-being-compiled*))
+  (ir2-component-n-jump-table-entries (component-info component)))
 
 ;;; the size of the NAME'd SB in the currently compiled component.
 ;;; This is useful mainly for finding the size for allocating stack
@@ -45,27 +44,73 @@
 
 ;;; the TN that is used to hold the number stack frame-pointer in
 ;;; VOP's function, or NIL if no number stack frame was allocated
+#-c-stack-is-control-stack
 (defun current-nfp-tn (vop)
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
     (let ((block (ir2-block-block (vop-block vop))))
-    (when (ir2-physenv-number-stack-p
-           (physenv-info
-            (block-physenv block)))
-      (ir2-component-nfp (component-info (block-component block)))))))
+      (when (ir2-environment-number-stack-p
+             (environment-info
+              (block-environment block)))
+        (ir2-component-nfp (component-info (block-component block)))))))
 
 ;;; the TN that is used to hold the number stack frame-pointer in the
 ;;; function designated by 2ENV, or NIL if no number stack frame was
 ;;; allocated
+#-c-stack-is-control-stack
 (defun callee-nfp-tn (2env)
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
-    (when (ir2-physenv-number-stack-p 2env)
+    (when (ir2-environment-number-stack-p 2env)
       (ir2-component-nfp (component-info *component-being-compiled*)))))
 
 ;;; the TN used for passing the return PC in a local call to the function
 ;;; designated by 2ENV
 (defun callee-return-pc-tn (2env)
-  (ir2-physenv-return-pc-pass 2env))
+  (ir2-environment-return-pc-pass 2env))
 
+;;;; Fixups
+
+;;; a fixup of some kind
+(defstruct (fixup
+            (:constructor make-fixup (name flavor &optional offset))
+            (:copier nil))
+  ;; the name and flavor of the fixup. The assembler makes no
+  ;; assumptions about the contents of these fields; their semantics
+  ;; are imposed by the dumper.
+  (name nil :read-only t)
+  ;; FIXME: "-flavor" and "-kind" are completedly devoid of meaning.
+  ;; They former should probably be "fixup-referent-type" or "fixup-source"
+  ;; to indicate that it denotes a namespace for NAME, and latter should be
+  ;; "fixup-how" as it conveys a manner in which to modify encoded bytes.
+  (flavor nil :read-only t)
+  ;; OFFSET is an optional offset from whatever external label this
+  ;; fixup refers to. Or in the case of the :CODE-OBJECT flavor of
+  ;; fixups on the :X86 architecture, NAME is always NIL, so this
+  ;; fixup doesn't refer to an external label, and OFFSET is an offset
+  ;; from the beginning of the current code block.
+  ;; A LABEL can also be used for ppc or ppc64 in which case the value
+  ;; of the fixup will be the displacement to the label from CODE-TN.
+  (offset 0 :type (or sb-vm:signed-word label)
+            :read-only t))
+
+;;; A FIXUP-NOTE tells you where the assembly patch is to be performed
+(defstruct (fixup-note
+            (:constructor make-fixup-note (kind fixup position))
+            (:copier nil))
+  ;; KIND is architecture-dependent (see the various 'vm' files)
+  (kind nil :type symbol)
+  (fixup (missing-arg) :type fixup)
+  (position 0 :type fixnum))
+(declaim (freeze-type fixup fixup-note))
+
+;;; Record a FIXUP of KIND occurring at the current position in SEGMENT
+(defun note-fixup (segment kind fixup)
+  (emit-back-patch
+   segment 0
+   (lambda (segment posn)
+     (push (make-fixup-note kind fixup
+                            (- posn (segment-header-skew segment)))
+           (sb-assem::segment-fixup-notes segment)))))
+
 ;;;; noise to emit an instruction trace
 
 (defun trace-instruction (section vop inst args state
@@ -125,7 +170,7 @@
 ;;; to get handles (as returned by sb-vm:inline-constant-value) from constant
 ;;; descriptors.
 ;;;
-#+(or arm arm64 mips ppc ppc64 x86 x86-64)
+#+(or arm64 mips ppc ppc64 x86 x86-64)
 (defun register-inline-constant (&rest constant-descriptor)
   ;; N.B.: Please do not think yourself so clever as to declare DYNAMIC-EXTENT on
   ;; CONSTANT-DESCRIPTOR. Giving the list indefinite extent allows backends to simply
@@ -141,13 +186,13 @@
         (vector-push-extend (cons constant label)
                             (asmstream-constant-vector asmstream))
         value)))))
-#-(or arm arm64 mips ppc ppc64 x86 x86-64)
+#-(or arm64 mips ppc ppc64 x86 x86-64)
 (progn (defun sb-vm:sort-inline-constants (constants) constants)
        (defun sb-vm:emit-inline-constant (&rest args)
          (error "EMIT-INLINE-CONSTANT called with ~S" args)))
 ;;; Emit the subset of inline constants which represent jump tables
 ;;; and remove those constants so that they don't get emitted again.
-(defun emit-jump-tables ()
+(defun emit-jump-tables (ir2-component)
   ;; Other backends will probably need relative jump tables instead
   ;; of absolute tables because of the problem of needing to load
   ;; the LIP register prior to loading an arbitrary PC.
@@ -171,6 +216,7 @@
       ;; is a jump table. I don't think that's worth the trouble.
       (emit section `(.lispword ,(1+ nwords)))
       (when (plusp nwords)
+        (setf (ir2-component-n-jump-table-entries ir2-component) nwords)
         (dolist (constant (jump-tables))
           (sb-vm:emit-inline-constant section (car constant) (cdr constant)))
         (let ((nremaining (length (other))))
@@ -186,124 +232,27 @@
       (dovector (constant (sb-vm:sort-inline-constants constants) t)
         (sb-vm:emit-inline-constant section (car constant) (cdr constant))))))
 
-;;; If a constant is already loaded into a register use that register.
-(defun optimize-constant-loads (component)
-  (let* ((register-sb (sb-or-lose 'sb-vm::registers))
-         (loaded-constants
-           (make-array (sb-size register-sb)
-                       :initial-element nil)))
-    (do-ir2-blocks (block component)
-      (fill loaded-constants nil)
-      (do ((vop (ir2-block-start-vop block) (vop-next vop)))
-          ((null vop))
-        (labels ((register-p (tn)
-                   (and (tn-p tn)
-                        (not (eq (tn-kind tn) :unused))
-                        (eq (sc-sb (tn-sc tn)) register-sb)))
-                 (constant-eql-p (a b)
-                   (or (eq a b)
-                       (and (eq (sc-name (tn-sc a)) 'constant)
-                            (eq (tn-sc a) (tn-sc b))
-                            (eql (tn-offset a) (tn-offset b)))))
-                 (remove-constant (tn)
-                   (when (register-p tn)
-                     (setf (svref loaded-constants (tn-offset tn)) nil)))
-                 (remove-written-tns ()
-                   (cond ((memq (vop-info-save-p (vop-info vop))
-                                '(t :force-to-stack))
-                          (fill loaded-constants nil))
-                         (t
-                          (do ((ref (vop-results vop) (tn-ref-across ref)))
-                              ((null ref))
-                            (remove-constant (tn-ref-tn ref))
-                            (remove-constant (tn-ref-load-tn ref)))
-                          (do ((ref (vop-temps vop) (tn-ref-across ref)))
-                              ((null ref))
-                            (remove-constant (tn-ref-tn ref)))
-                          (do ((ref (vop-args vop) (tn-ref-across ref)))
-                              ((null ref))
-                            (remove-constant (tn-ref-load-tn ref))))))
-                 (compatible-scs-p (a b)
-                   (or (eql a b)
-                       (and (eq (sc-name a) 'sb-vm::control-stack)
-                            (eq (sc-name b) 'sb-vm::descriptor-reg))
-                       (and (eq (sc-name b) 'sb-vm::control-stack)
-                            (eq (sc-name a) 'sb-vm::descriptor-reg))))
-                 (find-constant-tn (constant sc)
-                   (loop for (saved-constant . tn) across loaded-constants
-                         when (and saved-constant
-                                   (constant-eql-p saved-constant constant)
-                                   (compatible-scs-p (tn-sc tn) sc))
-                         return tn)))
-          (case (vop-name vop)
-            ((move sb-vm::move-arg)
-             (let* ((args (vop-args vop))
-                    (x (tn-ref-tn args))
-                    (y (tn-ref-tn (vop-results vop)))
-                    constant)
-               (cond ((or (eq (sc-name (tn-sc x)) 'null)
-                          (not (eq (tn-kind x) :constant)))
-                      (remove-written-tns))
-                     ((setf constant (find-constant-tn x (tn-sc y)))
-                      (when (register-p y)
-                        (setf (svref loaded-constants (tn-offset y))
-                              (cons x y)))
-                      ;; XOR is more compact on x86oids and many
-                      ;; RISCs have a zero register
-                      (unless (and (constant-p (tn-leaf x))
-                                   (eql (tn-value x) 0)
-                                   (register-p y))
-                        (setf (tn-ref-tn args) constant)
-                        (setf (tn-ref-load-tn args) nil)))
-                     ((register-p y)
-                      (setf (svref loaded-constants (tn-offset y))
-                            (cons x y)))
-                     (t
-                      (remove-written-tns)))))
-            (t
-             (remove-written-tns))))))))
-
 ;; Collect "static" count of number of times each vop is employed.
 ;; (as opposed to "dynamic" - how many times its code is hit at runtime)
 (defglobal *static-vop-usage-counts* nil)
 (defparameter *do-instcombine-pass* t)
 
-(defun generate-code (component)
+(defun generate-code (component &aux (ir2-component (component-info component)))
+  (declare (type ir2-component ir2-component))
   (when *compiler-trace-output*
-    (format *compiler-trace-output*
-            "~|~%assembly code for ~S~2%"
-            component))
+    (let ((*print-pretty* nil)) ; force 1 line
+      (format *compiler-trace-output* "~|~%assembly code for ~S~2%" component)))
   (let* ((prev-env nil)
+         (sb-vm::*adjustable-vectors* nil)
          ;; The first function's alignment word is zero-filled, but subsequent
          ;; ones can use a NOP which helps the disassembler not lose sync.
          (filler-pattern 0)
          (asmstream (make-asmstream))
-         (coverage-map)
          (*asmstream* asmstream))
+    (declare (special sb-vm::*adjustable-vectors*))
 
-    (declare (ignorable coverage-map))
     (emit (asmstream-elsewhere-section asmstream)
           (asmstream-elsewhere-label asmstream))
-
-    #-(or x86 x86-64)
-    (let ((path->index (make-hash-table :test 'equal)))
-      ;; Pre-scan for MARK-COVERED vops and collect the set of
-      ;; distinct source paths that occur. Delay adding the coverage map to
-      ;; the boxed constant vector until all vop generators have run, because
-      ;; they can use EMIT-CONSTANT to add more constants,
-      ;; while the coverage map has to be the very last entry in the vector.
-      (do-ir2-blocks (block component)
-        (do ((vop (ir2-block-start-vop block) (vop-next vop)))
-            ((null vop))
-          (when (eq (vop-name vop) 'mark-covered)
-            (setf (vop-codegen-info vop)
-                  (list (ensure-gethash (car (vop-codegen-info vop))
-                                        path->index
-                                        (hash-table-count path->index)))))))
-      (when (plusp (hash-table-count path->index))
-        (setf coverage-map (make-array (hash-table-count path->index)))
-        (maphash (lambda (path index) (setf (aref coverage-map index) path))
-                 path->index)))
 
     (do-ir2-blocks (block component)
       (let ((1block (ir2-block-block block)))
@@ -329,10 +278,10 @@
                                  (ir2-block-%trampoline-label block)
                                  (ir2-block-dropped-thru-to block)
                                  alignp)))
-          (let ((env (block-physenv 1block)))
+          (let ((env (block-environment 1block)))
             (unless (eq env prev-env)
-              (let ((lab (gen-label "physenv elsewhere start")))
-                (setf (ir2-physenv-elsewhere-start (physenv-info env))
+              (let ((lab (gen-label "environment elsewhere start")))
+                (setf (ir2-environment-elsewhere-start (environment-info env))
                       lab)
                 (emit (asmstream-elsewhere-section asmstream) lab))
               (setq prev-env env)))))
@@ -358,48 +307,48 @@
                    (funcall gen vop)))))))
 
     (when *do-instcombine-pass*
-      #+x86-64
+      #+(or arm64 x86-64)
       (sb-assem::combine-instructions (asmstream-code-section asmstream)))
 
+    (emit (asmstream-data-section asmstream)
+          (sb-assem::asmstream-data-origin-label asmstream))
     ;; Jump tables precede the coverage mark bytes to simplify locating
     ;; them in trans_code().
-    (emit-jump-tables)
-    ;; Todo: can we implement the flow-based aspect of coverage mark compression
-    ;; in IR2 instead of waiting until assembly generation?
-    #+(or x86 x86-64) (coverage-mark-lowering-pass component asmstream)
-    #-(or x86 x86-64)
-    (when coverage-map
-      #+darwin-jit
-      (vector-push-extend (make-constant (make-array (length coverage-map)
-                                                     :element-type '(unsigned-byte 8)
-                                                     :initial-element #xFF))
-                          (ir2-component-constants (component-info component)))
-      (vector-push-extend (make-constant (cons 'coverage-map coverage-map))
-                          (ir2-component-constants (component-info component)))
-      ;; The mark vop can store the low byte from either ZERO-TN or NULLL-TN
-      ;; to avoid loading a constant. Either one won't match #xff.
-      #-darwin-jit
-      (emit (asmstream-data-section asmstream)
-            `(.skip ,(length coverage-map) #xff)))
+    (emit-jump-tables ir2-component)
+    (let ((coverage-map (ir2-component-coverage-map ir2-component)))
+      (unless (zerop (length coverage-map))
+        ;; Nothing depends on the length of the constant vector at this
+        ;; phase (codegen has not made use of component-header-length),
+        ;; so extending can be done with impunity.
+        #+arm64
+        (vector-push-extend (list :coverage-marks (length coverage-map))
+                            (ir2-component-constants ir2-component))
+        (vector-push-extend
+         (make-constant (cons 'coverage-map
+                              (map-into coverage-map #'car coverage-map)))
+         (ir2-component-constants ir2-component))
+        ;; Allocate space in the data section for coverage marks.
+        #-arm64
+        (emit (asmstream-data-section asmstream)
+              `(.skip ,(length coverage-map) #-(or x86 x86-64) #xff))))
 
     (emit-inline-constants)
 
-    (let* ((info (component-info component))
-           (simple-fun-labels
-            (mapcar #'entry-info-offset (ir2-component-entries info)))
-           (n-boxed (length (ir2-component-constants info)))
+    (let* ((n-boxed (length (ir2-component-constants ir2-component)))
            ;; Skew is either 0 or N-WORD-BYTES depending on whether the boxed
            ;; header length is even or odd
            (skew (if (and (= code-boxed-words-align 1) (oddp n-boxed))
                      sb-vm:n-word-bytes
                      0)))
       (multiple-value-bind (segment text-length fixup-notes fun-table)
-          (assemble-sections asmstream
-                             simple-fun-labels
-                             (make-segment :header-skew skew
-                                           :run-scheduler (default-segment-run-scheduler)))
+          (assemble-sections
+           asmstream
+           (ir2-component-entries ir2-component)
+           (make-segment :header-skew skew
+                         :run-scheduler (default-segment-run-scheduler)))
         (values segment text-length fun-table
-                (asmstream-elsewhere-label asmstream) fixup-notes)))))
+                (asmstream-elsewhere-label asmstream) fixup-notes
+                (sb-assem::get-allocation-points asmstream))))))
 
 (defun label-elsewhere-p (label-or-posn kind)
   (let ((elsewhere (label-position *elsewhere-label*))
@@ -414,60 +363,3 @@
         ;; We're interested in what precedes the return, not after
         (< elsewhere label)
         (<= elsewhere label))))
-
-;;; Translate .COVERAGE-MARK pseudo-op into machine assembly language,
-;;; combining any number of consecutive operations with no intervening
-;;; control flow into a single operation.
-;;; FIXME: this pass runs even if no coverage instrumentation was generated.
-(defun coverage-mark-lowering-pass (component asmstream)
-  (declare (ignorable component asmstream))
-  #+(or x86-64 x86)
-  (let ((label (gen-label))
-        ;; vector of lists of original source paths covered
-        (src-paths (make-array 10 :fill-pointer 0))
-        (previous-mark))
-    (do ((statement (stmt-next (section-start (asmstream-code-section asmstream)))
-                    (stmt-next statement)))
-        ((null statement))
-      (dolist (item (ensure-list (stmt-labels statement)))
-        (when (label-usedp item) ; control can transfer to here
-          (setq previous-mark nil)))
-      (let ((mnemonic (stmt-mnemonic statement)))
-        (typecase mnemonic
-         (function ; this can do anything, who knows
-          (setq previous-mark nil))
-         (string) ; a comment can be ignored
-         (t
-          (cond ((branch-opcode-p mnemonic) ; control flow kills mark combining
-                 (setq previous-mark nil))
-                ((eq mnemonic '.coverage-mark)
-                 (let ((path (car (stmt-operands statement))))
-                   (cond ((not previous-mark) ; record a new path
-                          (let ((mark-index
-                                 (vector-push-extend (list path) src-paths)))
-                            ;; have the backend lower it into a real instruction
-                            (replace-coverage-instruction statement label mark-index))
-                            (setq previous-mark statement))
-                           (t ; record that the already-emitted mark pertains
-                            ;; to an additional source path
-                            (push path (elt src-paths (1- (fill-pointer src-paths))))
-                            ;; Clobber this statement. Do not try to remove it and
-                            ;; combine its labels into the previous statement.
-                            ;; Doing that could move a label into an earlier IR2 block
-                            ;; which crashes when dumping locations.
-                            (setf (stmt-mnemonic statement) nil
-                                  (stmt-operands statement) nil))))))))))
-
-    ;; Allocate space in the data section for coverage marks
-    (let ((mark-index (length src-paths)))
-      (when (plusp mark-index)
-        (setf (label-usedp label) t)
-        (let ((v (ir2-component-constants (component-info component))))
-          ;; Nothing depends on the length of the constant vector at this
-          ;; phase (codegen has not made use of component-header-length),
-          ;; so extending can be done with impunity.
-          (vector-push-extend
-           (make-constant (cons 'coverage-map
-                                (coerce src-paths 'simple-vector)))
-           v))
-        (emit (asmstream-data-section asmstream) label `(.skip ,mark-index))))))

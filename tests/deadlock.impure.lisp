@@ -1,4 +1,5 @@
-#-sb-thread (sb-ext:exit :code 104)
+#-sb-thread (invoke-restart 'run-tests::skip-file)
+#+ultrafutex (invoke-restart 'run-tests::skip-file)
 
 (import '(sb-thread:join-thread
           sb-thread:make-mutex
@@ -8,6 +9,9 @@
           sb-thread:thread-deadlock
           sb-thread:wait-on-semaphore
           sb-thread:with-mutex))
+
+(when (sb-sys:find-dynamic-foreign-symbol-address "show_gc_generation_throughput")
+  (setf (extern-alien "show_gc_generation_throughput" int) 0))
 
 (with-test (:name :deadlock-detection.1)
   (loop
@@ -72,7 +76,8 @@
        (assert (stringp err)))
     (assert (eq :ok (join-thread t1)))))
 
-(with-test (:name :deadlock-detection.3)
+(with-test (:name :deadlock-detection.3
+                  :broken-on (and :darwin :gc-stress))
   (let* ((m1 (make-mutex :name "M1"))
          (m2 (make-mutex :name "M2"))
          (s1 (make-semaphore :name "S1"))
@@ -159,18 +164,13 @@
                      (sb-thread:join-thread t2))))
       (assert (equal '(:ok :ok) res)))))
 
-(defun clock-gettime ()
-  (sb-int:dx-let ((a (make-array 2 :element-type 'sb-ext:word)))
-    (alien-funcall (extern-alien "clock_gettime" (function void int system-area-pointer))
-                   0 (sb-sys:vector-sap a))
-    (values (aref a 0) (aref a 1))))
-
+#+deadlock-test-timing
+(progn
+(defun clock-gettime () (sb-unix:clock-gettime sb-unix:clock-realtime))
 (defun seconds-since (start_sec start_nsec)
-  (sb-int:dx-let ((a (make-array 2 :element-type 'sb-ext:word)))
-    (alien-funcall (extern-alien "clock_gettime" (function void int system-area-pointer))
-                   0 (sb-sys:vector-sap a))
-    (+ (/ (coerce (- (aref a 1) start_nsec) 'double-float) 1000000000)
-       (- (aref a 0) start_sec))))
+  (multiple-value-bind (stop_sec stop_nsec) (clock-gettime)
+    (+ (/ (coerce (- stop_nsec start_nsec) 'double-float) 1000000000)
+       (- stop_sec start_sec)))))
 
 (defglobal *max-avl-tree-total* 0)
 (defglobal *max-avl-tree-born* 0)
@@ -188,8 +188,6 @@
   (let ((born 0)
         (running 0)
         (died 0))
-    #-pauseless-thread-start (setq running (sb-thread::avl-count tree))
-    #+pauseless-thread-start
     (sb-int:dx-flet ((mapfun (node)
                        (ecase (sb-thread::thread-%visible (sb-thread::avlnode-data node))
                          (0 (incf born)) ; "can't happen" ?
@@ -273,6 +271,9 @@
   (let* ((data (cons control args))
          (index (atomic-incf *message-in-counter*)))
     (setf (aref *messages* index) data)))
+
+#+darwin
+(test-util::disable-profiling)
 
 ;;; This encounters the "backing off for retry" error if attempting
 ;;; to start too many threads.

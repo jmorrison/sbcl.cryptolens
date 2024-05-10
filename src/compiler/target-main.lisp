@@ -15,6 +15,83 @@
 
 ;;;; CL:COMPILE
 
+(defun ir1-toplevel-for-compile (form name)
+  (let* ((component (make-empty-component))
+         (*current-component* component)
+         (debug-name-tail (or name (name-lambdalike form)))
+         (source-name (or name '.anonymous.)))
+    (setf (component-name component) (debug-name 'initial-component debug-name-tail)
+          (component-kind component) :initial)
+    (let* ((fun (let ((*allow-instrumenting* t))
+                  (ir1-convert-lambdalike form
+                                          :source-name source-name)))
+           ;; Convert the XEP using the policy of the real function. Otherwise
+           ;; the wrong policy will be used for deciding whether to type-check
+           ;; the parameters of the real function (via CONVERT-CALL /
+           ;; PROPAGATE-TO-ARGS). -- JES, 2007-02-27
+           (*lexenv* (make-lexenv :policy (lexenv-policy (functional-lexenv fun))))
+           (xep (ir1-convert-lambda (make-xep-lambda-expression fun)
+                                    :source-name source-name
+                                    :debug-name (debug-name 'tl-xep debug-name-tail))))
+      (when name
+        (assert-new-definition xep fun))
+      (setf (functional-kind xep) (functional-kind-attributes external)
+            (functional-entry-fun xep) fun
+            (functional-entry-fun fun) xep
+            (component-reanalyze component) t
+            (functional-has-external-references-p xep) t)
+      (reoptimize-component component :maybe)
+      (locall-analyze-xep-entry-point fun)
+      ;; Any leftover REFs to FUN outside local calls get replaced with the
+      ;; XEP.
+      (substitute-leaf-if (lambda (ref)
+                            (let* ((lvar (ref-lvar ref))
+                                   (dest (when lvar (lvar-dest lvar)))
+                                   (kind (when (basic-combination-p dest)
+                                           (basic-combination-kind dest))))
+                              (neq :local kind)))
+                          xep
+                          fun)
+      xep)))
+
+;;; Compile LAMBDA-EXPRESSION and return the compiled FUNCTION value.
+;;;
+;;; If NAME is provided, then we try to use it as the name of the
+;;; function for debugging/diagnostic information.
+(defun %compile (form ephemeral name)
+  (when name
+    (legal-fun-name-or-type-error name))
+  (with-ir1-namespace
+    (let* ((*lexenv* (make-lexenv
+                      :policy *policy*
+                      :handled-conditions *handled-conditions*
+                      :disabled-package-locks *disabled-package-locks*))
+           (*compile-object* (make-core-object ephemeral))
+           (lambda (ir1-toplevel-for-compile form name)))
+
+      ;; FIXME: The compile-it code from here on is sort of a
+      ;; twisted version of the code in COMPILE-TOPLEVEL. It'd be
+      ;; better to find a way to share the code there; or
+      ;; alternatively, to use this code to replace the code there.
+      ;; (The second alternative might be pretty easy if we used
+      ;; the :LOCALL-ONLY option to IR1-FOR-LAMBDA. Then maybe the
+      ;; whole FUNCTIONAL-KIND=:TOPLEVEL case could go away..)
+
+      (locall-analyze-clambdas-until-done (list lambda))
+
+      (dolist (component (find-initial-dfo (list lambda)))
+        (compile-component component))
+
+      (let ((object *compile-object*))
+        (multiple-value-bind (res found-p)
+            (gethash (leaf-info lambda) (core-object-entry-table object))
+          (aver found-p)
+          (fix-core-source-info *source-info* object
+                                (and (policy (lambda-bind lambda)
+                                         (> store-source-form 0))
+                                     res))
+          res)))))
+
 ;;; Handle the following:
 ;;;  - CL:COMPILE when the argument is not already a compiled function.
 ;;;  - %SIMPLE-EVAL in "pretend we don't have an interpreter" mode
@@ -49,7 +126,6 @@
                     (and (member :msan *features*)
                          (find-dynamic-foreign-symbol-address "__msan_unpoison"))
                     :block-compile nil))
-                  (*current-path* nil)
                   (*last-message-count* (list* 0 nil nil))
                   (*last-error-context* nil)
                   (*gensym-counter* 0)
@@ -82,19 +158,21 @@
                   ;; using the outer compiler error context.
                   (*compiler-error-context* nil)
                   (oops nil))
-             (handler-bind (((satisfies handle-condition-p) #'handle-condition-handler))
+             (handler-bind (((satisfies handle-condition-p) 'handle-condition-handler))
                (unless source-paths
                  (find-source-paths form tlf))
-               (let ((*compiler-error-bailout*
+               (let ((*current-path* (or (get-source-path form)
+                                         (cons form (or (and (boundp '*current-path*)
+                                                             *current-path*)
+                                                        `(original-source-start 0 ,tlf)))))
+                     (*compiler-error-bailout*
                        (lambda (e)
                          (setf oops e)
                          ;; Unwind the compiler frames: users want the know where
                          ;; the error came from, not how the compiler got there.
                          (go :error))))
                  (return
-                     (%compile form (make-core-object ephemeral)
-                               :name name
-                               :path `(original-source-start 0 ,tlf)))))
+                   (%compile form ephemeral name))))
            :error
              ;; Either signal the error right away, or return a function that
              ;; will signal the corresponding COMPILED-PROGRAM-ERROR. This is so
@@ -114,6 +192,22 @@
                        (error 'compiled-program-error
                               :message message
                               :source source)))))))))))
+
+;;; NOTE: COMPILE may be slightly nonconforming regarding generic functions,
+;;; but no more nonconforming than it was prior to the redefinition of
+;;; COMPILED-FUNCTION to exclude GENERIC-FUNCTION.
+;;; The concern stems from http://www.lispworks.com/documentation/HyperSpec/Issues/iss064_w.htm
+;;; which says "(4) Clarify that COMPILE must produce an object of type COMPILED-FUNCTION."
+;;;
+;;; In the case where DEFINITION is given, we're fine: the compiler can only return
+;;; a compiled function. But if only NAME is given, and it is fboundp to a generic-function,
+;;; we don't do anything at all - we don't touch the GF's dispatch function (which is a closure
+;;; over compiled code) and we don't touch the methods. But COMPILE doesn't return a function
+;;; in that case, so it's not wrong that COMPILED-FUNCTION-P is false of the result,
+;;; because the result is a symbol, not a function.
+
+;;; Also note that we lack good regression tests setting expectations around what's supposed
+;;; to happen when DEFINITION is supplied as a generic function. (Does it even make sense?)
 
 (defun compile (name &optional (definition (or (and (symbolp name)
                                                     (macro-function name))
@@ -136,24 +230,33 @@ WARNING occur during the compilation, and NIL otherwise.
 Tertiary value is true if any conditions of type ERROR, or WARNING that are
 not STYLE-WARNINGs occur during compilation, and NIL otherwise.
 "
-  (multiple-value-bind (compiled-definition warnings-p failure-p)
-      ;; TODO: generic functions with any interpreted methods
-      ;; should compile the methods and reinstall them.
-      (if (compiled-function-p definition)
-          (values definition nil nil)
+  (binding*
+     (((start-sec start-nsec) (get-thread-virtual-time))
+      ((compiled-definition warnings-p failure-p)
+      (if (or (compiled-function-p definition)
+              (sb-pcl::generic-function-p definition))
+          ;; We're not invoking COMPILE. This is a minor bug if this is
+          ;; a GENERIC-FUNCTION whose methods are interpreted.
+          (values (make-unbound-marker) nil nil)
           (multiple-value-bind (sexpr lexenv)
               (if (not (typep definition 'interpreted-function))
                   (values (the cons definition) (make-null-lexenv))
                   #+(or sb-eval sb-fasteval)
                   (prepare-for-compile definition))
-            (compile-in-lexenv sexpr lexenv name nil nil nil nil)))
+            (sb-vm:without-arena "compile"
+              (compile-in-lexenv sexpr lexenv name nil nil nil nil))))))
+    (accumulate-compiler-time '*compile-elapsed-time* start-sec start-nsec)
     (values (cond (name
-                   (if (and (symbolp name) (macro-function name))
-                       (setf (macro-function name) compiled-definition)
-                       (setf (fdefinition name) compiled-definition))
+                   ;; Do NOT assign anything into the symbol if we did not
+                   ;; actually invoke the compiler
+                   (unless (unbound-marker-p compiled-definition)
+                     (if (and (symbolp name) (macro-function name))
+                         (setf (macro-function name) compiled-definition)
+                         (setf (fdefinition name) compiled-definition)))
                    name)
-                  (t
-                   compiled-definition))
+                  ;; Didn't run the compiler
+                  ((unbound-marker-p compiled-definition) definition)
+                  (t compiled-definition))
             warnings-p
             failure-p)))
 
@@ -325,9 +428,6 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
     start-char))
 
 ;;;; Coverage helpers
-
-(defun record-code-coverage (namestring cc)
-  (setf (gethash namestring (car *code-coverage-info*)) cc))
 
 (defun clear-code-coverage ()
   (clrhash (car *code-coverage-info*))

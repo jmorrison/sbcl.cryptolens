@@ -13,28 +13,9 @@
 
 ;;;; DYNAMIC-USAGE and friends
 
-#+gencgc
-(define-alien-variable ("DYNAMIC_SPACE_START" sb-vm:dynamic-space-start) os-vm-size-t)
-(declaim (inline current-dynamic-space-start))
-(defun current-dynamic-space-start ()
-  #+gencgc sb-vm:dynamic-space-start
-  #-gencgc (extern-alien "current_dynamic_space" unsigned-long))
-
-#+(or x86 x86-64)
-(progn
-  (declaim (inline dynamic-space-free-pointer))
-  (defun dynamic-space-free-pointer ()
-    (extern-alien "dynamic_space_free_pointer" system-area-pointer)))
-
 (declaim (inline dynamic-usage))
-#+gencgc
 (defun dynamic-usage ()
   (extern-alien "bytes_allocated" os-vm-size-t))
-#-gencgc
-(defun dynamic-usage ()
-  (truly-the word
-             (- (sap-int (sb-c::dynamic-space-free-pointer))
-                (current-dynamic-space-start))))
 
 (defun static-space-usage ()
   (- (sap-int sb-vm:*static-space-free-pointer*) sb-vm:static-space-start))
@@ -63,9 +44,15 @@
 (define-load-time-global *n-bytes-freed-or-purified* 0)
 (defun gc-reinit ()
   (setq *gc-inhibit* nil)
+  ;; This GC looks utterly unnecessary, but when I tried removing it,
+  ;; I got heap exhaustions sooner than when I left it in.
+  ;; I think the reason is that we never set the auto-trigger at all
+  ;; unless a GC happens. Maybe what we mean here is "set auto trigger"
+  ;; and we need a function in C to do that.
   (gc)
   (setf *n-bytes-freed-or-purified* 0
-        *gc-run-time* 0))
+        *gc-run-time* 0
+        *gc-real-time* 0))
 
 (declaim (ftype (sfunction () unsigned-byte) get-bytes-consed))
 (defun get-bytes-consed ()
@@ -77,10 +64,23 @@ SB-PROFILE package does), or to design a more microefficient interface
 and submit it as a patch."
   (+ (dynamic-usage)
      *n-bytes-freed-or-purified*))
+
+(defun primitive-object-size (object)
+  "Return number of bytes of heap or stack directly consumed by OBJECT"
+  (cond ((not (sb-vm:is-lisp-pointer (get-lisp-obj-address object))) 0)
+        ((eq object nil) (ash sb-vm::sizeof-nil-in-words sb-vm:word-shift))
+        ((simple-fun-p object) (code-object-size (fun-code-header object)))
+        #-(or x86 x86-64 arm64 riscv) ((lra-p object) 1)
+        (t
+         (with-alien ((sizer (function unsigned unsigned) :extern "primitive_object_size"))
+           (with-pinned-objects (object)
+             (alien-funcall sizer (get-lisp-obj-address object)))))))
 
 ;;;; GC hooks
 
-(!define-load-time-global *after-gc-hooks* nil
+;;; N.B.: hooks need to be sufficiently uncomplicated as to be harmless,
+;;; and should not expect any particular thread context.
+(define-load-time-global *after-gc-hooks* nil
   "Called after each garbage collection, except for garbage collections
 triggered during thread exits. In a multithreaded environment these hooks may
 run in any thread.")
@@ -88,47 +88,15 @@ run in any thread.")
 
 ;;;; internal GC
 
-(define-alien-routine collect-garbage int
-  (#+gencgc last-gen #-gencgc ignore int))
+(define-alien-routine collect-garbage int (last-gen int))
 
-#+(or sb-thread sb-safepoint)
-(progn
-  (define-alien-routine gc-stop-the-world void)
-  (define-alien-routine gc-start-the-world void))
-#-(or sb-thread sb-safepoint)
-(progn
-  (defun gc-stop-the-world ())
-  (defun gc-start-the-world ()))
-
-#+gencgc
-(progn
-  (define-alien-variable ("gc_logfile" %gc-logfile) (* char))
-  (defun (setf gc-logfile) (pathname)
-    (let ((new (when pathname
-                 (make-alien-string
-                  (native-namestring (translate-logical-pathname pathname)
-                                     :as-file t))))
-          (old %gc-logfile))
-      (setf %gc-logfile new)
-      (when old
-        (free-alien old))
-      pathname))
-  (defun gc-logfile ()
-    "Return the pathname used to log garbage collections. Can be SETF.
-Default is NIL, meaning collections are not logged. If non-null, the
-designated file is opened before and after each collection, and generation
-statistics are appended to it."
-    (let ((val (cast %gc-logfile c-string)))
-      (when val
-        (native-pathname val)))))
+(define-alien-routine gc-stop-the-world void)
+(define-alien-routine gc-start-the-world void)
 
 (declaim (inline dynamic-space-size))
 (defun dynamic-space-size ()
   "Size of the dynamic space in bytes."
   (extern-alien "dynamic_space_size" os-vm-size-t))
-#+gencgc
-(define-symbol-macro sb-vm:dynamic-space-end
-  (+ (dynamic-space-size) sb-vm:dynamic-space-start))
 
 ;;;; SUB-GC
 
@@ -155,21 +123,32 @@ statistics are appended to it."
      (alien-funcall (extern-alien "release_gc_lock" (function void)))
      t))
 
+(defmacro get-gc-real-time ()
+  ;; 64-bit is just a call to clock-gettime and some math that won't ever cons
+  #+64-bit '(get-internal-real-time)
+  ;; 32-bit memoizes the result to try to avoid bignum consing,
+  ;; which can fail during foreign thread creation.
+  #-64-bit 0)
+
 (defun sub-gc (gen)
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
          nil)
         (t
          (flet ((perform-gc ()
+                  (declare (sb-c::tlab :system)) ; for *gc-epoch*
                   ;; Called from WITHOUT-GCING and WITHOUT-INTERRUPTS
                   ;; after the world has been stopped, but it's an
                   ;; awkwardly long piece of code to nest so deeply.
                   (let ((old-usage (dynamic-usage))
                         (new-usage 0)
-                        (start-time (get-internal-run-time)))
+                        (start-time (get-internal-run-time))
+                        (start-real-time (get-gc-real-time)))
                     (collect-garbage gen)
                     (setf *gc-epoch* (cons 0 0))
-                    (let ((run-time (- (get-internal-run-time) start-time)))
+                    (let ((run-time (- (get-internal-run-time) start-time))
+                          (real-time (- (get-gc-real-time) start-real-time)))
+                      (incf *gc-real-time* real-time)
                       ;; KLUDGE: Sometimes we see the second getrusage() call
                       ;; return a smaller value than the first, which can
                       ;; lead to *GC-RUN-TIME* to going negative, which in
@@ -245,13 +224,9 @@ statistics are appended to it."
 
 #+sb-thread
 (defun post-gc ()
-  (sb-impl::finalizer-thread-notify)
+  (sb-impl::finalizer-thread-notify 1) ; Tell it to perform post-GC hooks
   (alien-funcall (extern-alien "empty_thread_recyclebin" (function void)))
-  ;; Post-GC actions are invoked synchronously by the GCing thread,
-  ;; which is an arbitrary one. If those actions aquire any locks, or are sensitive
-  ;; to the state of *ALLOW-WITH-INTERRUPTS*, any deadlocks of what-have-you
-  ;; are user error. Hooks need to be sufficiently uncomplicated as to be harmless.
-  (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))
+  nil)
 
 #-sb-thread
 (defun post-gc ()
@@ -299,47 +274,32 @@ statistics are appended to it."
     ;; interrupts, which is precisely the thing we need to NOT do if already
     ;; in post-GC code of any kind (be it finalizer or other).
   (when (and *allow-with-interrupts*
-               (or (and (sb-impl::hash-table-culled-values
-                         (sb-impl::finalizer-id-map sb-impl::**finalizer-store**))
+               (or (and sb-impl::*finalizers-triggered*
                         (not sb-impl::*in-a-finalizer*))
                    *after-gc-hooks*))
       (sb-thread::without-thread-waiting-for ()
         (with-interrupts
           (run-pending-finalizers)
-          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))
+          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))
+  nil)
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
-  #+gencgc
   "Initiate a garbage collection.
 
 The default is to initiate a nursery collection, which may in turn
 trigger a collection of one or more older generations as well. If FULL
 is true, all generations are collected. If GEN is provided, it can be
-used to specify the oldest generation guaranteed to be collected.
-
-On CheneyGC platforms arguments FULL and GEN take no effect: a full
-collection is always performed."
-  #-gencgc
-  "Initiate a garbage collection.
-
-The collection is always a full collection.
-
-Arguments FULL and GEN can be used for compatibility with GENCGC
-platforms: there the default is to initiate a nursery collection,
-which may in turn trigger a collection of one or more older
-generations as well. If FULL is true, all generations are collected.
-If GEN is provided, it can be used to specify the oldest generation
-guaranteed to be collected."
-  #-gencgc (declare (ignore full))
-  (let (#+gencgc (gen (if full sb-vm:+pseudo-static-generation+ gen)))
+used to specify the oldest generation guaranteed to be collected."
+  (let ((gen (if full sb-vm:+pseudo-static-generation+ gen)))
     (when (eq t (sub-gc gen))
       (post-gc))))
 
 (define-alien-routine scrub-control-stack void)
 
+(defglobal sb-unicode::*name->char-buffers* nil)
 (defun unsafe-clear-roots (gen)
-  #-gencgc (declare (ignore gen))
+  (declare (ignorable gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
   ;; as having these cons more than we have space left leads to huge
   ;; badness.
@@ -347,19 +307,17 @@ guaranteed to be collected."
   ;; Power cache of the bignum printer: drops overly large bignums and
   ;; removes duplicate entries.
   (scrub-power-cache)
+  (setf sb-unicode::*name->char-buffers* nil)
+  (setf sb-c::*phash-lambda-cache* nil)
   ;; Clear caches depending on the generation being collected.
-  #+gencgc
   (cond ((eql 0 gen)
          ;; Drop strings because the hash is pointer-hash
          ;; but there is no automatic cache rehashing after GC.
          (sb-format::tokenize-control-string-cache-clear))
         ((eql 1 gen)
-         (sb-format::tokenize-control-string-cache-clear)
-         (ctype-of-cache-clear))
+         (sb-format::tokenize-control-string-cache-clear))
         (t
-         (drop-all-hash-caches)))
-  #-gencgc
-  (drop-all-hash-caches))
+         (drop-all-hash-caches))))
 
 ;;;; auxiliary functions
 
@@ -374,9 +332,12 @@ Note: currently changes to this value are lost when saving core."
   (extern-alien "bytes_consed_between_gcs" os-vm-size-t))
 
 (defun (setf bytes-consed-between-gcs) (val)
-  (declare (type index val))
-  (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t)
-        val))
+  (declare (type (and fixnum unsigned-byte) val))
+  #+(or gencgc mark-region-gc)
+  (let ((current (extern-alien "bytes_consed_between_gcs" os-vm-size-t)))
+    (when (< val current)
+      (decf (extern-alien "auto_gc_trigger" os-vm-size-t) (- current val))))
+  (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t) val))
 
 (declaim (inline maybe-handle-pending-gc))
 (defun maybe-handle-pending-gc ()
@@ -387,16 +348,33 @@ Note: currently changes to this value are lost when saving core."
 
 ;;;; GENCGC specifics
 ;;;;
-;;;; For documentation convenience, these have stubs on non-GENCGC platforms
-;;;; as well.
-#+gencgc
+(define-alien-variable ("gc_logfile" %gc-logfile) (* char))
+
+(defun (setf gc-logfile) (pathname)
+  (let ((new (when pathname
+               (make-alien-string
+                (native-namestring (translate-logical-pathname pathname)
+                                   :as-file t))))
+        (old %gc-logfile))
+    (setf %gc-logfile new)
+    (when old
+      (free-alien old))
+    pathname))
+(defun gc-logfile ()
+    "Return the pathname used to log garbage collections. Can be SETF.
+Default is NIL, meaning collections are not logged. If non-null, the
+designated file is opened before and after each collection, and generation
+statistics are appended to it."
+  (let ((val (cast %gc-logfile c-string)))
+    (when val
+      (native-pathname val))))
+
 (deftype generation-index ()
   `(integer 0 ,sb-vm:+pseudo-static-generation+))
 
 ;;; FIXME: GENERATION (and PAGE, as seen in room.lisp) should probably be
 ;;; defined in Lisp, and written to header files by genesis, instead of this
 ;;; OAOOMiness -- this duplicates the struct definition in gencgc.c.
-#+gencgc
 (define-alien-type generation
     (struct generation
             (bytes-allocated os-vm-size-t)
@@ -407,34 +385,98 @@ Note: currently changes to this value are lost when saving core."
             (cum-sum-bytes-allocated os-vm-size-t)
             (minimum-age-before-gc double)))
 
-#+gencgc
 (define-alien-variable generations
     (array generation #.(1+ sb-vm:+pseudo-static-generation+)))
 
-(macrolet ((def (slot doc &optional setfp)
+;;; Why is PAGE-INDEX-T in SB-KERNEL but PAGE and the page table are in SB-VM?
+(define-alien-type nil
+    (struct sb-vm::page
+            ;; To cut down the size of the page table, the scan_start_offset
+            ;; - a/k/a "start" - is measured in 4-byte integers regardless
+            ;; of word size. This is fine for 32-bit address space,
+            ;; but if 64-bit then we have to scale the value. Additionally
+            ;; there is a fallback for when even the scaled value is too big.
+            (sb-vm::start #+64-bit (unsigned 32) #-64-bit signed)
+            ;; Caution: The low bit of WORDS-USED* is a flag bit
+            (sb-vm::words-used* (unsigned 16)) ; (* in the name is a memory aid)
+            (sb-vm::flags (unsigned 8)) ; this named 'type' in C
+            (sb-vm::gen (signed 8))))
+(define-alien-variable ("page_table" sb-vm:page-table) (* (struct sb-vm::page)))
+
+(declaim (ftype (sfunction (t) (integer -1 #.(floor most-positive-word sb-vm:gencgc-page-bytes)))
+                sb-vm:find-page-index)
+         (inline sb-vm:find-page-index))
+(defun sb-vm:find-page-index (address)
+  (with-alien ((find-page-index (function page-index-t unsigned) :extern "ext_find_page_index"))
+    (truly-the (integer -1 #.(floor most-positive-word sb-vm:gencgc-page-bytes))
+               (alien-funcall find-page-index address))))
+
+(defun pages-allocated ()
+  (loop for n below (extern-alien "next_free_page" signed)
+        count (not (zerop (slot (deref sb-vm:page-table n) 'sb-vm::flags)))))
+
+#-mark-region-gc
+(defun generation-of (object)
+  (with-pinned-objects (object)
+    (let* ((addr (get-lisp-obj-address object))
+           (page (sb-vm:find-page-index addr)))
+      (cond ((>= page 0) (slot (deref sb-vm:page-table page) 'sb-vm::gen))
+            #+immobile-space
+            ((immobile-space-addr-p addr)
+             ;; SIMPLE-FUNs don't contain a generation byte
+             (when (simple-fun-p object)
+               (setq addr (get-lisp-obj-address (fun-code-header object))))
+             (let ((sap (int-sap (logandc2 addr sb-vm:lowtag-mask))))
+               (logand (if (fdefn-p object) (sap-ref-8 sap 1) (sap-ref-8 sap 3))
+                       #xF)))))))
+
+#+mark-region-gc
+(defun generation-of (object)
+  (with-alien ((gc-gen-of (function char unsigned int) :extern))
+    (let ((result (with-pinned-objects (object)
+                    (alien-funcall gc-gen-of
+                                   (get-lisp-obj-address object) 127))))
+      (unless (= result 127) result))))
+
+(export 'page-protected-p)
+(macrolet ((addr->mark (addr)
+             `(sap-ref-8 (extern-alien "gc_card_mark" system-area-pointer)
+                         (logand (ash ,addr (- (integer-length (1- sb-vm:gencgc-card-bytes))))
+                                 (extern-alien "gc_card_table_mask" int))))
+           (markedp (val)
+             #+soft-card-marks `(eql ,val 0)
+             ;; With physical protection there are 2 single-bit fields packed in the mark byte.
+             ;; The 0 bit is the card mark bit (inverse of protected-p)
+             #-soft-card-marks `(oddp ,val)))
+  (defun page-protected-p (object) ; OBJECT must be pinned by caller
+    (not (markedp (addr->mark (get-lisp-obj-address object)))))
+  (defun object-card-marks (obj)
+    (aver (eq (heap-allocated-p obj) :dynamic))
+    ;; Return a bit-vector with a 1 for each marked card the object is on
+    ;; and a 0 for each unmarked card.
+    (with-pinned-objects (obj)
+      (let* ((base (logandc2 (get-lisp-obj-address obj) sb-vm:lowtag-mask))
+             (last (+ base (1- (primitive-object-size obj))))
+             (aligned-base (logandc2 base (1- sb-vm:gencgc-card-bytes)))
+             (aligned-last (logandc2 last (1- sb-vm:gencgc-card-bytes)))
+             (result (make-array (1+ (truncate (- aligned-last aligned-base)
+                                               sb-vm:gencgc-card-bytes))
+                                 :element-type 'bit)))
+        (loop for addr from aligned-base to aligned-last by sb-vm:gencgc-card-bytes
+              for i from 0
+              do (setf (aref result i) (if (markedp (addr->mark addr)) 1 0)))
+        result))))
+
+(macrolet ((def (slot doc &optional adjustable)
              `(progn
                 (defun ,(symbolicate "GENERATION-" slot) (generation)
                   ,doc
-                  #+gencgc
                   (declare (generation-index generation))
-                  #-gencgc
-                  (declare (ignore generation))
-                  #-gencgc
-                  (error "~S is a GENCGC only function and unavailable in this build"
-                         ',slot)
-                  #+gencgc
                   (slot (deref generations generation) ',slot))
-                ,@(when setfp
-                        `((defun (setf ,(symbolicate "GENERATION-" slot)) (value generation)
-                            #+gencgc
-                            (declare (generation-index generation))
-                            #-gencgc
-                            (declare (ignore value generation))
-                            #-gencgc
-                            (error "(SETF ~S) is a GENCGC only function and unavailable in this build"
-                                   ',slot)
-                            #+gencgc
-                            (setf (slot (deref generations generation) ',slot) value)))))))
+                ,@(when adjustable
+                    `((defun (setf ,(symbolicate "GENERATION-" slot)) (value generation)
+                        (declare (generation-index generation))
+                        (setf (slot (deref generations generation) ',slot) value)))))))
   (def bytes-consed-between-gcs
       "Number of bytes that can be allocated to GENERATION before that
 generation is considered for garbage collection. This value is meaningless for
@@ -468,51 +510,58 @@ Experimental: interface subject to change.")
       "Number of times garbage collection has been done on GENERATION without
 promotion. Available on GENCGC platforms only.
 
-Experimental: interface subject to change."))
+Experimental: interface subject to change.")
   (defun generation-average-age (generation)
     "Average age of memory allocated to GENERATION: average number of times
 objects allocated to the generation have seen younger objects promoted to it.
 Available on GENCGC platforms only.
 
 Experimental: interface subject to change."
-    #+gencgc
     (declare (generation-index generation))
-    #-gencgc (declare (ignore generation))
-    #-gencgc
-    (error "~S is a GENCGC only function and unavailable in this build."
-           'generation-average-age)
-    #+gencgc
     (alien-funcall (extern-alien "generation_average_age"
                                  (function double generation-index-t))
-                   generation))
+                   generation)))
 
 (macrolet ((cases ()
-             `(cond ((< (current-dynamic-space-start) addr
+             `(cond ((< sb-vm:dynamic-space-start addr
                         (sap-int (dynamic-space-free-pointer)))
                      :dynamic)
                     ((immobile-space-addr-p addr) :immobile)
                     ((< sb-vm:read-only-space-start addr
                         (sap-int sb-vm:*read-only-space-free-pointer*))
                      :read-only)
+                    ;; Without immobile-space, the text range is
+                    ;; more-or-less an extension of static space.
+                    #-immobile-space
+                    ((< sb-vm:text-space-start addr
+                        (sap-int sb-vm:*text-space-free-pointer*))
+                     :static)
                     ((< sb-vm:static-space-start addr
                         (sap-int sb-vm:*static-space-free-pointer*))
                      :static))))
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)
-;;; This assumes a single contiguous dynamic space, which is of course a
-;;; bad assumption, but nonetheless one that has been true for, say, ~20 years.
-;;; Also note, we don't have to pin X - an object can not move between spaces,
-;;; so a non-nil answer is the definite answer. As to whether the object could
-;;; have moved, or worse, died - by say reusing the same register as held X for
-;;; the value that is (get-lisp-obj-address X), with no surrounding pin or even
-;;; reference to X - then that's your problem.
-;;; If you wanted the object not to die or move, you should have held on tighter!
+;;; There's a microscopic window of time in which next_free_page for dynamic space
+;;; could _decrease_ after calculating the address of X, so we'll pin X
+;;; to ensure that can't happen.
 (defun heap-allocated-p (x)
-  (let ((addr (get-lisp-obj-address x)))
-    (and (sb-vm:is-lisp-pointer addr)
-         (cases))))
+  (with-pinned-objects (x)
+    (let ((addr (get-lisp-obj-address x)))
+      (and (sb-vm:is-lisp-pointer addr)
+           (cases)))))
 
 ;;; Internal use only. FIXME: I think this duplicates code that exists
 ;;; somewhere else which I could not find.
 (defun lisp-space-p (sap &aux (addr (sap-int sap))) (cases))
 ) ; end MACROLET
+
+(define-condition memory-fault-error (system-condition error) ()
+  (:report
+   (lambda (condition stream)
+     (let* ((faultaddr (system-condition-address condition))
+            (string (if (<= sb-vm:read-only-space-start
+                            faultaddr
+                            (sap-int (sap+ sb-vm:*read-only-space-free-pointer* -1)))
+                        "Attempt to modify a read-only object at #x~X."
+                        "Unhandled memory fault at #x~X.")))
+       (format stream string faultaddr)))))
